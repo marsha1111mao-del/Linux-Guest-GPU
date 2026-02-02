@@ -614,7 +614,8 @@ static int panthor_mmu_as_enable(struct panthor_device *ptdev, u32 as_nr,
 				 u64 transtab, u64 transcfg, u64 memattr)
 {
 	int ret;
-
+	pr_info("[MZH]panthor_mmu_as_enable:as_nr=%lx\ttranstab=%llx\ttranscfg=%llx\tmemattr=%llx\t",
+		as_nr, transtab, transcfg, memattr);
 	ret = mmu_hw_do_operation_locked(ptdev, as_nr, 0, ~0ULL,
 					 AS_COMMAND_FLUSH_MEM);
 	if (ret)
@@ -868,6 +869,15 @@ int panthor_vm_as(struct panthor_vm *vm)
 {
 	return vm->as.id;
 }
+//固定返回 SZ_4K 和对应数量的cunt
+static size_t SZ_4K_get_pgsize(u64 addr, size_t size, size_t *count)
+{
+	*count = size / SZ_4K;
+	if (*count == 0 && size > 0) {
+		*count = 1;
+	}
+	return SZ_4K;
+}
 
 static size_t get_pgsize(u64 addr, size_t size, size_t *count)
 {
@@ -930,8 +940,10 @@ static int panthor_vm_unmap_pages(struct panthor_vm *vm, u64 iova, u64 size)
 
 	while (offset < size) {
 		size_t unmapped_sz = 0, pgcount;
-		size_t pgsize =
-			get_pgsize(iova + offset, size - offset, &pgcount);
+		// size_t pgsize =
+		// 	get_pgsize(iova + offset, size - offset, &pgcount);
+		size_t pgsize = SZ_4K_get_pgsize(iova + offset, size - offset,
+						 &pgcount);
 
 		unmapped_sz = ops->unmap_pages(ops, iova + offset, pgsize,
 					       pgcount, NULL);
@@ -985,7 +997,8 @@ static int panthor_vm_map_pages(struct panthor_vm *vm, u64 iova, int prot,
 
 		while (len) {
 			size_t pgcount, mapped = 0;
-			size_t pgsize = get_pgsize(iova | paddr, len, &pgcount);
+			size_t pgsize =
+				SZ_4K_get_pgsize(iova | paddr, len, &pgcount);
 
 			ret = ops->map_pages(ops, iova, paddr, pgsize, pgcount,
 					     prot, GFP_KERNEL, &mapped);
@@ -1316,9 +1329,9 @@ static int panthor_vm_prepare_map_op_ctx(struct panthor_vm_op_ctx *op_ctx,
 		 30) +
 		((ALIGN(va + size, 1ull << 21) - ALIGN_DOWN(va, 1ull << 21)) >>
 		 21);
-
 	op_ctx->rsvd_page_tables.pages = kcalloc(
 		pt_count, sizeof(*op_ctx->rsvd_page_tables.pages), GFP_KERNEL);
+	// pr_info("[MZH] alloc op_ctx->rsvd_page_tables.pages");
 	if (!op_ctx->rsvd_page_tables.pages) {
 		ret = -ENOMEM;
 		goto err_cleanup;

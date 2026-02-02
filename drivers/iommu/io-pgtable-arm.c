@@ -19,7 +19,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/arm-smccc.h>
 #include <asm/barrier.h>
-
+#include <linux/hashtable.h>
 #include "io-pgtable-arm.h"
 #include "iommu-pages.h"
 
@@ -147,6 +147,12 @@
 #define iopte_set_writeable_clean(ptep) \
 	set_bit(ARM_LPAE_PTE_AP_RDONLY_BIT, (unsigned long *)(ptep))
 
+//hash from hpa->gva
+struct panthor_table_pte_mapping {
+	u64 hpa;
+	u64 gva;
+	struct hlist_node node;
+};
 struct arm_lpae_io_pgtable {
 	struct io_pgtable iop;
 
@@ -155,9 +161,46 @@ struct arm_lpae_io_pgtable {
 	int bits_per_level;
 
 	void *pgd;
+	DECLARE_HASHTABLE(panthor_table_pte_map, 10);
 };
 
 typedef u64 arm_lpae_iopte;
+
+static int store_mapping(struct arm_lpae_io_pgtable *data, u64 hpa, u64 gva)
+{
+	struct panthor_table_pte_mapping *entry;
+
+	entry = kmalloc(sizeof(*entry), GFP_KERNEL);
+	if (!entry)
+		return -ENOMEM;
+
+	entry->gva = gva;
+	entry->hpa = hpa;
+
+	hash_add(data->panthor_table_pte_map, &entry->node, hpa);
+	return 0;
+}
+
+static u64 lookup_mapping(struct arm_lpae_io_pgtable *data, u64 hpa)
+{
+	struct panthor_table_pte_mapping *entry;
+
+	hash_for_each_possible(data->panthor_table_pte_map, entry, node, hpa) {
+		if (entry->hpa == hpa)
+			return entry->gva;
+	}
+
+	return 0;
+}
+static long kvm_hypercall_gpa_to_hpa_batch(u64 addr_array, u64 count)
+{
+	struct arm_smccc_res res;
+
+	arm_smccc_1_1_invoke(ARM_SMCCC_VENDOR_HYP_GPA_TO_HPA_FUNC_ID,
+			     addr_array, count, &res);
+
+	return res.a0; // 返回状态码
+}
 
 static inline bool iopte_leaf(arm_lpae_iopte pte, int lvl,
 			      enum io_pgtable_fmt fmt)
@@ -269,7 +312,6 @@ static void __arm_lpae_sync_pte(arm_lpae_iopte *ptep, int num_entries,
 	dma_sync_single_for_device(cfg->iommu_dev, __arm_lpae_dma_addr(ptep),
 				   sizeof(*ptep) * num_entries, DMA_TO_DEVICE);
 }
-
 static void __arm_lpae_clear_pte(arm_lpae_iopte *ptep,
 				 struct io_pgtable_cfg *cfg, int num_entries)
 {
@@ -284,6 +326,47 @@ static size_t __arm_lpae_unmap(struct arm_lpae_io_pgtable *data,
 			       struct iommu_iotlb_gather *gather,
 			       unsigned long iova, size_t size, size_t pgcount,
 			       int lvl, arm_lpae_iopte *ptep);
+
+static void __arm_panthor_lpae_init_pte(struct arm_lpae_io_pgtable *data,
+					phys_addr_t paddr, arm_lpae_iopte prot,
+					int lvl, int num_entries,
+					arm_lpae_iopte *ptep)
+{
+	//panthor init pte
+	int i;
+	size_t sz = ARM_LPAE_BLOCK_SIZE(lvl, data);
+	arm_lpae_iopte pte = prot;
+	struct io_pgtable_cfg *cfg = &data->iop.cfg;
+	phys_addr_t new_gpa_addr;
+	u64 *p;
+	u64 *tmp_p;
+	struct page *page;
+	phys_addr_t array_pa;
+	if (data->iop.fmt != ARM_MALI_LPAE && lvl == ARM_LPAE_MAX_LEVELS - 1)
+		pte |= ARM_LPAE_PTE_TYPE_PAGE;
+	else
+		pte |= ARM_LPAE_PTE_TYPE_BLOCK;
+	// GPA->HPA,一次性转化num_entries个gpa到hpa
+	page = alloc_page(GFP_KERNEL);
+	p = page_address(page);
+	tmp_p = page_address(page);
+	for (i = 0; i < num_entries; i++) {
+		new_gpa_addr = paddr + i * sz;
+		*tmp_p = new_gpa_addr;
+		tmp_p++;
+	}
+	array_pa = page_to_phys(page);
+	wmb();
+	kvm_hypercall_gpa_to_hpa_batch(array_pa, num_entries);
+	rmb();
+	for (i = 0; i < num_entries; i++) {
+		ptep[i] = pte | paddr_to_iopte(*p, data);
+		p++;
+	}
+	__free_page(page);
+	if (!cfg->coherent_walk)
+		__arm_lpae_sync_pte(ptep, num_entries, cfg);
+}
 
 static void __arm_lpae_init_pte(struct arm_lpae_io_pgtable *data,
 				phys_addr_t paddr, arm_lpae_iopte prot, int lvl,
@@ -304,6 +387,38 @@ static void __arm_lpae_init_pte(struct arm_lpae_io_pgtable *data,
 
 	if (!cfg->coherent_walk)
 		__arm_lpae_sync_pte(ptep, num_entries, cfg);
+}
+
+static int arm_panthor_lpae_init_pte(struct arm_lpae_io_pgtable *data,
+				     unsigned long iova, phys_addr_t paddr,
+				     arm_lpae_iopte prot, int lvl,
+				     int num_entries, arm_lpae_iopte *ptep)
+{
+	int i;
+
+	for (i = 0; i < num_entries; i++)
+		if (iopte_leaf(ptep[i], lvl, data->iop.fmt)) {
+			/* We require an unmap first */
+			WARN_ON(!selftest_running);
+			return -EEXIST;
+		} else if (iopte_type(ptep[i]) == ARM_LPAE_PTE_TYPE_TABLE) {
+			/*
+			 * We need to unmap and free the old table before
+			 * overwriting it with a block entry.
+			 */
+			arm_lpae_iopte *tblp;
+			size_t sz = ARM_LPAE_BLOCK_SIZE(lvl, data);
+
+			tblp = ptep - ARM_LPAE_LVL_IDX(iova, lvl, data);
+			if (__arm_lpae_unmap(data, NULL, iova + i * sz, sz, 1,
+					     lvl, tblp) != sz) {
+				WARN_ON(1);
+				return -EINVAL;
+			}
+		}
+
+	__arm_panthor_lpae_init_pte(data, paddr, prot, lvl, num_entries, ptep);
+	return 0;
 }
 
 static int arm_lpae_init_pte(struct arm_lpae_io_pgtable *data,
@@ -345,7 +460,6 @@ static arm_lpae_iopte arm_lpae_install_table(arm_lpae_iopte *table,
 {
 	arm_lpae_iopte old, new;
 	struct io_pgtable_cfg *cfg = &data->iop.cfg;
-
 	new = paddr_to_iopte(__pa(table), data) | ARM_LPAE_PTE_TYPE_TABLE;
 	if (cfg->quirks & IO_PGTABLE_QUIRK_ARM_NS)
 		new |= ARM_LPAE_PTE_NSTABLE;
@@ -368,6 +482,46 @@ static arm_lpae_iopte arm_lpae_install_table(arm_lpae_iopte *table,
 		WRITE_ONCE(*ptep, new | ARM_LPAE_PTE_SW_SYNC);
 
 	return old;
+}
+
+static arm_lpae_iopte
+arm_panthor_lpae_install_table(arm_lpae_iopte *table, arm_lpae_iopte *ptep,
+			       arm_lpae_iopte curr,
+			       struct arm_lpae_io_pgtable *data)
+{
+	//panthor install table
+	//L1HPA=HVC(L1GPA)
+	struct io_pgtable_cfg *cfg = &data->iop.cfg;
+	arm_lpae_iopte panthor_old, panthor_new;
+	phys_addr_t gpa = __pa(table);
+	struct page *panthor_page = alloc_page(GFP_KERNEL);
+	u64 *panthor_p = page_address(panthor_page);
+	*panthor_p = gpa;
+	phys_addr_t panthor_array_pa = page_to_phys(panthor_page);
+	kvm_hypercall_gpa_to_hpa_batch(panthor_array_pa, 1);
+	//gpa->gpa
+	//gva->(arm_lpae_iopte *)table
+	//hpa->(*panthor_p)
+	// u64 hpa = (*panthor_p);
+	//map hpa->gva
+
+	//build new pte
+	panthor_new = paddr_to_iopte(*panthor_p, data) |
+		      ARM_LPAE_PTE_TYPE_TABLE;
+	if (cfg->quirks & IO_PGTABLE_QUIRK_ARM_NS)
+		panthor_new |= ARM_LPAE_PTE_NSTABLE;
+	dma_wmb();
+	store_mapping(data, panthor_new & ARM_LPAE_PTE_ADDR_MASK, (u64)table);
+	pr_info("[MZH][MEM]store_mapping hpa_pte:%llx,gva:%llx",
+		panthor_new & ARM_LPAE_PTE_ADDR_MASK, (u64)table);
+	//cptep=L0[ptep]
+	panthor_old = cmpxchg64_relaxed(ptep, curr, panthor_new);
+	if (cfg->coherent_walk || (panthor_old & ARM_LPAE_PTE_SW_SYNC))
+		return panthor_old;
+	__arm_lpae_sync_pte(ptep, 1, cfg);
+	if (panthor_old == curr)
+		WRITE_ONCE(*ptep, panthor_new | ARM_LPAE_PTE_SW_SYNC);
+	return panthor_old;
 }
 
 static int __arm_lpae_map(struct arm_lpae_io_pgtable *data, unsigned long iova,
@@ -428,6 +582,73 @@ static int __arm_lpae_map(struct arm_lpae_io_pgtable *data, unsigned long iova,
 	/* Rinse, repeat */
 	return __arm_lpae_map(data, iova, paddr, size, pgcount, prot, lvl + 1,
 			      cptep, gfp, mapped);
+}
+
+static int __arm_panthor_lpae_map(struct arm_lpae_io_pgtable *data,
+				  unsigned long iova, phys_addr_t paddr,
+				  size_t size, size_t pgcount,
+				  arm_lpae_iopte prot, int lvl,
+				  arm_lpae_iopte *ptep, gfp_t gfp,
+				  size_t *mapped)
+{
+	arm_lpae_iopte *cptep, pte;
+	size_t block_size = ARM_LPAE_BLOCK_SIZE(lvl, data);
+	size_t tblsz = ARM_LPAE_GRANULE(data);
+	struct io_pgtable_cfg *cfg = &data->iop.cfg;
+	int ret = 0, num_entries, max_entries, map_idx_start;
+	u64 hpa;
+	/* Find our entry at the current level */
+	map_idx_start = ARM_LPAE_LVL_IDX(iova, lvl, data);
+	ptep += map_idx_start;
+	/* If we can install a leaf entry at this level, then do so */
+	if (size == block_size) {
+		max_entries = ARM_LPAE_PTES_PER_TABLE(data) - map_idx_start;
+		num_entries = min_t(int, pgcount, max_entries);
+		ret = arm_panthor_lpae_init_pte(data, iova, paddr, prot, lvl,
+						num_entries, ptep);
+		if (!ret)
+			*mapped += num_entries * size;
+
+		return ret;
+	}
+
+	/* We can't allocate tables at the final level */
+	if (WARN_ON(lvl >= ARM_LPAE_MAX_LEVELS - 1))
+		return -EINVAL;
+
+	/* Grab a pointer to the next level */
+	pte = READ_ONCE(*ptep);
+	if (!pte) {
+		cptep = __arm_lpae_alloc_pages(tblsz, gfp, cfg,
+					       data->iop.cookie);
+		pr_info("[MZH][MEM]alloc table pte which gva:%llx", (u64)cptep);
+		if (!cptep)
+			return -ENOMEM;
+		pte = arm_panthor_lpae_install_table(cptep, ptep, 0, data);
+		if (pte) {
+			__arm_lpae_free_pages(cptep, tblsz, cfg,
+					      data->iop.cookie);
+		}
+	} else if (!cfg->coherent_walk && !(pte & ARM_LPAE_PTE_SW_SYNC)) {
+		__arm_lpae_sync_pte(ptep, 1, cfg);
+	}
+
+	if (pte && !iopte_leaf(pte, lvl, data->iop.fmt)) {
+		// hpa = iopte_to_paddr(pte, data);
+		cptep = (arm_lpae_iopte *)lookup_mapping(
+			data, pte & ARM_LPAE_PTE_ADDR_MASK);
+		pr_info("[MZH][MEM]look for pte:%llx",
+			pte & ARM_LPAE_PTE_ADDR_MASK);
+		pr_info("[MZH][MEM]lookoutvalue gva:%llx", (u64)cptep);
+	} else if (pte) {
+		/* We require an unmap first */
+		WARN_ON(!selftest_running);
+		return -EEXIST;
+	}
+
+	/* Rinse, repeat */
+	return __arm_panthor_lpae_map(data, iova, paddr, size, pgcount, prot,
+				      lvl + 1, cptep, gfp, mapped);
 }
 
 static arm_lpae_iopte arm_lpae_prot_to_pte(struct arm_lpae_io_pgtable *data,
@@ -495,15 +716,6 @@ static arm_lpae_iopte arm_lpae_prot_to_pte(struct arm_lpae_io_pgtable *data,
 
 	return pte;
 }
-long kvm_hypercall_gpa_to_hpa_batch(u64 addr_array, u64 count)
-{
-	struct arm_smccc_res res;
-
-	arm_smccc_1_1_invoke(ARM_SMCCC_VENDOR_HYP_GPA_TO_HPA_FUNC_ID,
-			     addr_array, count, &res);
-
-	return res.a0; // 返回状态码
-}
 
 static int arm_panthor_lpae_map_pages(struct io_pgtable_ops *ops,
 				      unsigned long iova, phys_addr_t paddr,
@@ -529,46 +741,14 @@ static int arm_panthor_lpae_map_pages(struct io_pgtable_ops *ops,
 		return -EINVAL;
 
 	prot = arm_lpae_prot_to_pte(data, iommu_prot);
-	size_t size = pgcount * sizeof(u64);
-	unsigned int order = get_order(size);
-	struct page *pages;
-	pages = alloc_pages(GFP_KERNEL, order);
-	if (!pages)
-		return -ENOMEM;
-	void *pages_virt = page_address(pages);
-	if (!pages_virt) {
-		// 高端内存：临时映射
-		pages_virt = kmap(pages);
-		if (!pages_virt) {
-			ret = -ENOMEM;
-			goto free_pages;
-		}
-	}
-	// u64 *pages_buffer = kmalloc_array(pgcount, sizeof(u64), GFP_KERNEL);
-	u64 *gpa_array = (u64 *)pages_virt;
-	for (size_t i = 0; i < pgcount; i++) {
-		gpa_array[i] = paddr + (i * pgsize);
-	}
-
-	phys_addr_t pages_phys = page_to_phys(pages);
-	ret = kvm_hypercall_gpa_to_hpa_batch(pages_phys, pgcount);
-	if (ret != 0) {
-		ret = -EFAULT;
-		goto unmap_page;
-	}
-	for (size_t i = 0; i < pgcount; i++) {
-		phys_addr_t hpa = gpa_array[i];
-		unsigned long current_iova = iova + (i * pgsize);
-		__arm_lpae_map(data, current_iova, hpa, pgsize, 1, prot, lvl,
-			       ptep, gfp, mapped);
-	}
+	ret = __arm_panthor_lpae_map(data, iova, paddr, pgsize, pgcount, prot,
+				     lvl, ptep, gfp, mapped);
+	/*
+	 * Synchronise all PTE updates for the new mapping before there's
+	 * a chance for anything to kick off a table walk for the new iova.
+	 */
 	wmb();
-unmap_page:
-	if (pages_virt && !page_address(pages)) {
-		kunmap(pages);
-	}
-free_pages:
-	__free_pages(pages, order);
+
 	return ret;
 }
 
@@ -1126,15 +1306,14 @@ arm_64_panthor_lpae_alloc_pgtable_s1(struct io_pgtable_cfg *cfg, void *cookie)
 		return NULL;
 
 	data = arm_lpae_alloc_pgtable(cfg);
+	if (!data)
+		return NULL;
 	data->iop.ops = (struct io_pgtable_ops){
 		.map_pages = arm_panthor_lpae_map_pages,
 		.unmap_pages = arm_lpae_unmap_pages,
 		.iova_to_phys = arm_lpae_iova_to_phys,
 		.read_and_clear_dirty = arm_lpae_read_and_clear_dirty,
 	};
-	if (!data)
-		return NULL;
-
 	/* TCR */
 	if (cfg->coherent_walk) {
 		tcr->sh = ARM_LPAE_TCR_SH_IS;
@@ -1203,13 +1382,12 @@ arm_64_panthor_lpae_alloc_pgtable_s1(struct io_pgtable_cfg *cfg, void *cookie)
 	       << ARM_LPAE_MAIR_ATTR_SHIFT(ARM_LPAE_MAIR_ATTR_IDX_INC_OCACHE));
 
 	cfg->arm_lpae_s1_cfg.mair = reg;
-
+	hash_init(data->panthor_table_pte_map);
 	/* Looking good; allocate a pgd */
 	data->pgd = __arm_lpae_alloc_pages(ARM_LPAE_PGD_SIZE(data), GFP_KERNEL,
 					   cfg, cookie);
 	if (!data->pgd)
 		goto out_free_data;
-
 	/* Ensure the empty pgd is visible before any actual TTBR write */
 	wmb();
 
