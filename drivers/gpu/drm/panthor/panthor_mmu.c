@@ -614,7 +614,7 @@ static int panthor_mmu_as_enable(struct panthor_device *ptdev, u32 as_nr,
 				 u64 transtab, u64 transcfg, u64 memattr)
 {
 	int ret;
-	pr_info("[MZH]panthor_mmu_as_enable:as_nr=%lx\ttranstab=%llx\ttranscfg=%llx\tmemattr=%llx\t",
+	pr_info("[MZH][enable as]:as_nr=%x\ttranstab=%llx\ttranscfg=%llx\tmemattr=%llx\t",
 		as_nr, transtab, transcfg, memattr);
 	ret = mmu_hw_do_operation_locked(ptdev, as_nr, 0, ~0ULL,
 					 AS_COMMAND_FLUSH_MEM);
@@ -636,7 +636,7 @@ static int panthor_mmu_as_enable(struct panthor_device *ptdev, u32 as_nr,
 static int panthor_mmu_as_disable(struct panthor_device *ptdev, u32 as_nr)
 {
 	int ret;
-
+	pr_info("[MZH][disable as]:as_nr=%x\t", as_nr);
 	ret = mmu_hw_do_operation_locked(ptdev, as_nr, 0, ~0ULL,
 					 AS_COMMAND_FLUSH_MEM);
 	if (ret)
@@ -770,6 +770,7 @@ int panthor_vm_active(struct panthor_vm *vm)
 
 	/* Assign the free or reclaimed AS to the FD */
 	vm->as.id = as;
+	pr_info("[MZH][panthor_vm_active]vm->as.id=%d", vm->as.id);
 	set_bit(as, &ptdev->mmu->as.alloc_mask);
 	ptdev->mmu->as.slots[as].vm = vm;
 
@@ -991,15 +992,14 @@ static int panthor_vm_map_pages(struct panthor_vm *vm, u64 iova, int prot,
 		len = min_t(size_t, len, size);
 		size -= len;
 
-		drm_dbg(&ptdev->base,
-			"map: as=%d, iova=%llx, paddr=%pad, len=%zx", vm->as.id,
-			iova, &paddr, len);
-
+		pr_info("[MZH][panthor_vm_map_pages]:iova=%llx, paddr=%p, len=%zx,prot=%llx",
+			iova, &paddr, len, prot);
 		while (len) {
 			size_t pgcount, mapped = 0;
 			size_t pgsize =
 				SZ_4K_get_pgsize(iova | paddr, len, &pgcount);
-
+			pr_info("[MZH][panthor_vm_while][iova]:%llx\t[paddr]:%llx[pgsize]:%lx[pgcount]:%lx",
+				iova, paddr, pgsize, pgcount);
 			ret = ops->map_pages(ops, iova, paddr, pgsize, pgcount,
 					     prot, GFP_KERNEL, &mapped);
 			iova += mapped;
@@ -1723,7 +1723,7 @@ static void panthor_mmu_irq_handler(struct panthor_device *ptdev, u32 status)
 		u64 tap_addr;
 		tap_addr = gpu_read(ptdev, AS_TRANSTAB_LO(as));
 		tap_addr |= ((u64)gpu_read(ptdev, AS_TRANSTAB_HI(as)) << 32);
-		pr_err("[MZH] gpu_tap_addr:%llx", tap_addr);
+		pr_err("[MZH][gpu_tap_addr from hwreg]:%llx", tap_addr);
 		/* decode the fault status */
 		exception_type = fault_status & 0xFF;
 		access_type = (fault_status >> 8) & 0x3;
@@ -1736,20 +1736,17 @@ static void panthor_mmu_irq_handler(struct panthor_device *ptdev, u32 status)
 			ptdev, ~ptdev->mmu->as.faulty_mask);
 
 		/* terminal fault, print info about the fault */
-		drm_err(&ptdev->base,
-			"Unhandled Page fault in AS%d at VA 0x%016llX\n",
-			"raw fault status: 0x%X\n"
-			"decoded fault status: %s\n"
-			"exception type 0x%X: %s\n"
-			"access type 0x%X: %s\n"
-			"source id 0x%X\n",
-			as, addr, fault_status,
-			(fault_status & (1 << 10) ? "DECODER FAULT" :
-						    "SLAVE FAULT"),
-			exception_type,
-			panthor_exception_name(ptdev, exception_type),
-			access_type, access_type_name(ptdev, fault_status),
-			source_id);
+		pr_err("Unhandled Page fault in AS%d at VA 0x%016llX\n", as,
+		       addr);
+		pr_err("raw fault status: 0x%X\n", fault_status);
+		pr_err("decoded fault status: %s\n",
+		       (fault_status & (1 << 10)) ? "DECODER FAULT" :
+						    "SLAVE FAULT");
+		pr_err("exception type 0x%X: %s\n", exception_type,
+		       panthor_exception_name(ptdev, exception_type));
+		pr_err("access type 0x%X: %s\n", access_type,
+		       access_type_name(ptdev, fault_status));
+		pr_err("source id 0x%X\n", source_id);
 
 		/* Ignore MMU interrupts on this AS until it's been
 		 * re-enabled.
