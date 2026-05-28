@@ -743,6 +743,7 @@ kernel/drivers/gpu/drm/drm_kms_helper.ko
 kernel/drivers/gpu/drm/drm_mipi_dsi.ko
 kernel/drivers/gpu/drm/scheduler/gpu-sched.ko
 kernel/drivers/gpu/drm/panthor/panthor.ko
+kernel/drivers/gpu/drm/panthor-proxy/panthor-proxy.ko
 kernel/drivers/base/firmware_loader/firmware_class.ko
 kernel/drivers/base/regmap/regmap-i2c.ko
 kernel/drivers/base/regmap/regmap-spi.ko
@@ -1279,7 +1280,6 @@ kernel/drivers/interconnect/qcom/qnoc-x1e80100.ko
 kernel/drivers/interconnect/qcom/icc-smd-rpm.ko
 kernel/drivers/interconnect/icc-clk.ko
 kernel/drivers/hte/hte-tegra194.ko
-kernel/drivers/vanthor/vanthor.ko
 kernel/sound/soundcore.ko
 kernel/sound/core/snd.ko
 kernel/sound/core/snd-timer.ko

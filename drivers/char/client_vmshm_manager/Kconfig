@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: GPL-2.0
+
+config CLIENT_VMSHM_MANAGER
+	bool "client vmshm manager shared memory character device"
+	depends on ARM64 && OF
+	depends on CLIENT_VMSHM_COMM
+	default n
+	help
+	  Client-side view of the vmshm object manager. This driver maps the
+	  same shared memory window in a client VM, but it does not allocate,
+	  free, or otherwise control the backing memory. It can request object
+	  descriptors from the proxy VM over client_vmshm_comm and exposes
+	  helpers for other client-side drivers to translate returned offsets
+	  into kernel virtual addresses.
+
+	  The device tree node must have:
+	    compatible = "client-vmshm-manager";
+	    reg = <gpa_base size>;
+
+	  If unsure, say N.

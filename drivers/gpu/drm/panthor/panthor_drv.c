@@ -7,6 +7,7 @@
 #include <linux/module.h>
 #include <linux/of_platform.h>
 #include <linux/pagemap.h>
+#include <linux/panthor_vmshm.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 
@@ -28,6 +29,9 @@
 #include "panthor_mmu.h"
 #include "panthor_regs.h"
 #include "panthor_sched.h"
+
+static DEFINE_MUTEX(panthor_vmshm_lock);
+static struct panthor_device *panthor_vmshm_ptdev;
 
 /**
  * DOC: user <-> kernel object copy helpers.
@@ -789,6 +793,95 @@ static int panthor_ioctl_dev_query(struct drm_device *ddev, void *data,
 	}
 }
 
+static int
+panthor_vmshm_fill_dev_query(struct panthor_device *ptdev,
+			     const struct panthor_vmshm_dev_query_req *req,
+			     struct panthor_vmshm_dev_query_rsp *rsp)
+{
+	const void *info;
+	u32 info_size, min_size;
+
+	if (req->flags & ~PANTHOR_VMSHM_DEV_QUERY_F_DATA)
+		return -EINVAL;
+
+	memset(rsp, 0, sizeof(*rsp));
+	rsp->type = req->type;
+
+	switch (req->type) {
+	case DRM_PANTHOR_DEV_QUERY_GPU_INFO:
+		info = &ptdev->gpu_info;
+		info_size = sizeof(ptdev->gpu_info);
+		min_size = PANTHOR_UOBJ_MIN_SIZE(ptdev->gpu_info);
+		break;
+
+	case DRM_PANTHOR_DEV_QUERY_CSIF_INFO:
+		info = &ptdev->csif_info;
+		info_size = sizeof(ptdev->csif_info);
+		min_size = PANTHOR_UOBJ_MIN_SIZE(ptdev->csif_info);
+		break;
+
+	default:
+		return -EINVAL;
+	}
+
+	rsp->size = info_size;
+	if (!(req->flags & PANTHOR_VMSHM_DEV_QUERY_F_DATA))
+		return 0;
+
+	if (req->size < min_size)
+		return -EINVAL;
+	if (info_size > sizeof(rsp->data))
+		return -EOVERFLOW;
+
+	rsp->data_len = min(req->size, info_size);
+	memcpy(rsp->data, info, rsp->data_len);
+	return 0;
+}
+
+int panthor_vmshm_dev_query(const struct panthor_vmshm_dev_query_req *req,
+			    struct panthor_vmshm_dev_query_rsp *rsp)
+{
+	struct panthor_device *ptdev;
+	int cookie, ret;
+
+	if (!req || !rsp)
+		return -EINVAL;
+
+	mutex_lock(&panthor_vmshm_lock);
+	ptdev = panthor_vmshm_ptdev;
+	if (ptdev)
+		drm_dev_get(&ptdev->base);
+	mutex_unlock(&panthor_vmshm_lock);
+
+	if (!ptdev) {
+		memset(rsp, 0, sizeof(*rsp));
+		rsp->type = req->type;
+		rsp->ret = -ENODEV;
+		return 0;
+	}
+
+	if (!drm_dev_enter(&ptdev->base, &cookie)) {
+		ret = -ENODEV;
+		goto out_put;
+	}
+
+	ret = panthor_vmshm_fill_dev_query(ptdev, req, rsp);
+	drm_dev_exit(cookie);
+
+out_put:
+	drm_dev_put(&ptdev->base);
+	if (ret) {
+		memset(rsp, 0, sizeof(*rsp));
+		rsp->type = req->type;
+		rsp->ret = ret;
+	} else {
+		rsp->ret = 0;
+	}
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(panthor_vmshm_dev_query);
+
 #define PANTHOR_VM_CREATE_FLAGS 0
 
 static int panthor_ioctl_vm_create(struct drm_device *ddev, void *data,
@@ -1427,6 +1520,7 @@ static int panthor_probe(struct platform_device *pdev)
 {
 	pr_info("[MZH]panthor_probe");
 	struct panthor_device *ptdev;
+	int ret;
 
 	ptdev = devm_drm_dev_alloc(&pdev->dev, &panthor_drm_driver,
 				   struct panthor_device, base);
@@ -1435,12 +1529,24 @@ static int panthor_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, ptdev);
 
-	return panthor_device_init(ptdev);
+	ret = panthor_device_init(ptdev);
+	if (ret)
+		return ret;
+
+	mutex_lock(&panthor_vmshm_lock);
+	panthor_vmshm_ptdev = ptdev;
+	mutex_unlock(&panthor_vmshm_lock);
+	return 0;
 }
 
 static void panthor_remove(struct platform_device *pdev)
 {
 	struct panthor_device *ptdev = platform_get_drvdata(pdev);
+
+	mutex_lock(&panthor_vmshm_lock);
+	if (panthor_vmshm_ptdev == ptdev)
+		panthor_vmshm_ptdev = NULL;
+	mutex_unlock(&panthor_vmshm_lock);
 
 	panthor_device_unplug(ptdev);
 }

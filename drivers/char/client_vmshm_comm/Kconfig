@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: GPL-2.0
+
+config CLIENT_VMSHM_COMM
+	bool "client_comm_vmshm communication device"
+	depends on ARM64 && OF
+	default n
+	help
+	  This driver is the client/frontend side of the proxy_comm_vmshm
+	  transport. It maps one shared memory region provided by the VMM and
+	  waits for the proxy side to initialize the shared protocol layout.
+
+	  The device tree node must have:
+	    compatible = "client_comm_vmshm";
+	    reg = <gpa_base size>;
+
+	  If the node also provides an interrupt and vmshm-doorbell-reg, the
+	  driver uses irq notify instead of polling for RPC responses.
+
+	  If unsure, say N.
+
+config CLIENT_VMSHM_COMM_HELLO_SELFTEST
+	bool "Send client_comm_vmshm hello-world self-test request"
+	depends on CLIENT_VMSHM_COMM
+	default n
+	help
+	  Send a "hello_world" request to the proxy side after the client comm
+	  driver attaches to the shared transport, then wait for the proxy ACK.
+
+	  Enable only for bring-up/debugging, together with
+	  PROXY_VMSHM_COMM_HELLO_SELFTEST in the proxy VM kernel.

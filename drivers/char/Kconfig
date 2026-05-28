@@ -422,4 +422,9 @@ config ADI
 	  and SSM (Silicon Secured Memory).  Intended consumers of this
 	  driver include crash and makedumpfile.
 
+source "drivers/char/proxy_vmshm_manager/Kconfig"
+source "drivers/char/client_vmshm_manager/Kconfig"
+source "drivers/char/proxy_vmshm_comm/Kconfig"
+source "drivers/char/client_vmshm_comm/Kconfig"
+
 endmenu

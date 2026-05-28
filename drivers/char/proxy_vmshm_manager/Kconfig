@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: GPL-2.0
+
+config PROXY_VMSHM_MANAGER
+	bool "proxy vmshm manager shared memory character device"
+	depends on ARM64 && OF
+	default n
+	help
+	  This driver manages a shared memory region described in the
+	  device tree as a "proxy-vmshm-manager" compatible node. The
+	  region is mapped via KVM memslot in Firecracker microVMs and
+	  backed by a host-side memfd.
+
+	  It provides a character device at /dev/proxy_vmshm_manager for
+	  user-space read/write/mmap access to the shared memory region.
+
+	  The device tree node must have:
+	    compatible = "proxy-vmshm-manager";
+	    reg = <gpa_base size>;
+
+	  If unsure, say N.
+
+config PROXY_VMSHM_MANAGER_SELFTEST
+	bool "Run proxy vmshm manager self-tests at probe"
+	depends on PROXY_VMSHM_MANAGER
+	default n
+	help
+	  Enable a small in-kernel self-test for the proxy vmshm manager.
+	  The test allocates objects, checks handle/generation validation,
+	  grant lookup, pin/free/unpin lifetime handling, and repeated
+	  allocation/free through the public manager API.
+
+	  If unsure, say N.

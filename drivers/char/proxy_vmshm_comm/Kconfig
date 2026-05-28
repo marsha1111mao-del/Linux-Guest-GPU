@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: GPL-2.0
+
+config PROXY_VMSHM_COMM
+	bool "proxy_comm_vmshm communication device"
+	depends on ARM64 && OF
+	default n
+	help
+	  This driver maps a separate shared memory region described by a
+	  "proxy_comm_vmshm" compatible node. It is the proxy/backend side of a
+	  virtqueue-like shared-memory control channel between guest VMs. The
+	  proxy side owns protocol layout initialization for each shared window.
+
+	  The device tree node must have:
+	    compatible = "proxy_comm_vmshm";
+	    reg = <gpa_base size>;
+
+	  If the node also provides an interrupt and vmshm-doorbell-reg, the
+	  driver drains requests from an IRQ worker instead of a polling thread.
+
+	  If unsure, say N.
+
+config PROXY_VMSHM_COMM_HELLO_SELFTEST
+	bool "Register proxy_comm_vmshm hello-world self-test handler"
+	depends on PROXY_VMSHM_COMM
+	default n
+	help
+	  Register a small in-kernel handler that waits for the client side to
+	  send the string "hello_world" over the vmshm control channel, then
+	  prints the received string to the kernel log and replies with an ACK.
+
+	  Enable only for bring-up/debugging.

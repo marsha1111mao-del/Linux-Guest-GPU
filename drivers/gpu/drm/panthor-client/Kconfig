@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: GPL-2.0 or MIT
+
+config DRM_PANTHOR_CLIENT
+	tristate "Panthor client VM DRM frontend"
+	depends on DRM && ARM64
+	depends on CLIENT_VMSHM_COMM
+	depends on DRM_PANTHOR = n
+	help
+	  DRM render-node frontend for a client VM. It exposes the Panthor
+	  DEV_QUERY ioctl and forwards those queries to the proxy VM through
+	  the client_vmshm_comm transport.
+
+	  This is intentionally a small discovery-only frontend for now. Say N
+	  unless this kernel runs inside the client VM.
+
+config DRM_PANTHOR_CLIENT_DEV_QUERY_SELFTEST
+	bool "Run Panthor client DEV_QUERY self-test at boot"
+	depends on DRM_PANTHOR_CLIENT
+	default n
+	help
+	  Run a small in-kernel startup test that sends Panthor DEV_QUERY
+	  requests through the client/proxy vmshm path and prints the returned
+	  GPU and CSIF information to the kernel log.
+
+	  Enable only for bring-up/debugging.

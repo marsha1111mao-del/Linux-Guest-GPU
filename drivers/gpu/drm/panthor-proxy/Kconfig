@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: GPL-2.0 or MIT
+
+config DRM_PANTHOR_PROXY
+	tristate "Panthor proxy VM vmshm bridge"
+	depends on DRM && ARM64
+	depends on PROXY_VMSHM_COMM
+	depends on DRM_PANTHOR
+	help
+	  Proxy-side bridge for Panthor client VM queries. It receives Panthor
+	  DEV_QUERY requests over proxy_vmshm_comm and answers them using the
+	  real Panthor DRM driver running in the proxy VM.
+
+	  Say N unless this kernel runs inside the proxy VM that owns the GPU.
