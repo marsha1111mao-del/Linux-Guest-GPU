@@ -1,7 +1,0 @@
-config VANTHOR
-	bool "VANTHOR minimal Mali stub driver"
-	depends on OF && ARM64
-	help
-	  Minimal stub driver for Mali Valhall (CSF).
-	  Only matches DT nodes and parses resources.
-	  Does not bind or control hardware.

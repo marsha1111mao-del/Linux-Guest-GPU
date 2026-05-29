@@ -1,1 +1,0 @@
-obj-$(CONFIG_VANTHOR) += vanthor.o
