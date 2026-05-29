@@ -1,126 +1,185 @@
-# 内核编译产物
-*.o
-*.ko
-*.mod
-*.mod.c
-*.mod.o
-*.symvers
-*.order
-*.cmd
-.tmp_versions/
-modules.order
-Module.symvers
-*.dwo
-*.su
-*.i
-*.lst
-*.s
-*.asm
-*.elf
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# NOTE! Don't add files that are generated in specific
+# subdirectories here. Add them in the ".gitignore" file
+# in that subdirectory instead.
+#
+# NOTE! Please use 'git ls-files -i -c --exclude-per-directory=.gitignore'
+# command after changing this file, to see if there are
+# any tracked files which get ignored after the change.
+#
+# Normal rules (sorted alphabetically)
+#
+.*
+*.a
+*.asn1.[ch]
 *.bin
-*.gz
 *.bz2
-*.xz
+*.c.[012]*.*
+*.dt.yaml
+*.dtb
+*.dtbo
+*.dtb.S
+*.dtbo.S
+*.dwo
+*.elf
+*.gcno
+*.gcda
+*.gz
+*.i
+*.ko
+*.lex.c
+*.ll
+*.lst
+*.lz4
 *.lzma
 *.lzo
-*.lz4
-*.zst
-
-# 构建目录
-build/
-dist/
-output/
-target/
-obj/
-*.obj
-*.so
-*.a
-*.la
-*.lo
-.libs/
-.deps/
-
-# 内核特定
-vmlinux*
-System.map
-.config*
-.config.old
-*.deb
+*.mod
+*.mod.c
+*.o
+*.o.*
+*.patch
+*.rmeta
 *.rpm
-*.tar.*
-*.tgz
-*.zip
-
-# 临时文件
-*.swp
-*.swo
-*~
-*.bak
-*.backup
-*.tmp
-*.temp
-*.orig
-*.rej
-
-# 调试文件
-*.log
-*.log.*
-*.pid
-*.pid.*
-*.lock
-*.lock.*
-
-# IDE
-.vscode/
-.idea/
-*.code-workspace
-
-# 其他
-.tmp_vmlinux*
-vmlinux
-vmlinux.lds
-vmlinux.o
-vmlinux.bin
-System.map
+*.rsi
+*.s
+*.so
+*.so.dbg
+*.su
+*.symtypes
+*.tab.[ch]
+*.tar
+*.xz
+*.zst
 Module.symvers
+dtbs-list
 modules.order
-.DS_Store
-Thumbs.db
-__pycache__/
-*.pyc
-*.pyo
-.tmp_vmlinux1.kallsyms.S
-.tmp_vmlinux1
-.tmp_vmlinux1.syms
-.tmp_vmlinux2
-.tmp_vmlinux2.kallsyms.S
-.tmp_vmlinux2.syms
-.version
-include/config/kernel.release
-include/generated/utsrelease.h
-include/generated/utsversion.h
 
-.tmp_vmlinux*
-*.syms
-
-.version
-include/config/kernel.release
-include/generated/compile.h
-include/generated/utsrelease.h
-include/generated/utsversion.h
-
-include/config/auto.conf
-include/generated/autoconf.h
-include/generated/rustc_cfg
-
-arch/arm64/kernel/vdso/vdso.so.dbg
-
-# Local kernel build output
+#
+# Top-level generic files
+#
+/linux
 /out/
-/.vmlinux.export.c
-/.vmlinux.export.o
-*.cmd
-/arch/arm64/boot/Image
+/modules-only.symvers
+/vmlinux
+/vmlinux.32
+/vmlinux.map
+/vmlinux.symvers
+/vmlinux-gdb.py
+/vmlinuz
+/System.map
+/Module.markers
+/modules.builtin
+/modules.builtin.modinfo
+/modules.builtin.ranges
+/modules.nsdeps
+
+#
+# RPM spec file (make rpm-pkg)
+#
+/rpmbuild/
+
+#
+# Debian directory (make deb-pkg)
+#
+/debian/
+
+#
+# Snap directory (make snap-pkg)
+#
+/snap/
+
+#
+# tar directory (make tar*-pkg)
+#
+/tar-install/
+
+#
+# pacman files (make pacman-pkg)
+#
+/PKGBUILD
+/pacman/
+
+#
+# We don't want to ignore the following even if they are dot-files
+#
+!.clang-format
+!.cocciconfig
+!.editorconfig
+!.get_maintainer.ignore
+!.gitattributes
+!.gitignore
+!.github/
+!.github/**
+!.kunitconfig
+!.mailmap
+!.rustfmt.toml
+!.gitlab-ci.yml
+
+#
+# Generated include files
+#
 /include/config/
 /include/generated/
 /arch/*/include/generated/
+
+# stgit generated dirs
+patches-*
+
+# quilt's files
+patches
+series
+
+# ctags files
+tags
+!tools/testing/selftests/arm64/tags/
+!tools/testing/selftests/arm64/tags/**
+TAGS
+
+# cscope files
+cscope.*
+ncscope.*
+
+# gnu global files
+GPATH
+GRTAGS
+GSYMS
+GTAGS
+
+# id-utils files
+ID
+
+*~
+\#*#
+
+#
+# Leavings from module signing
+#
+extra_certificates
+signing_key.pem
+signing_key.priv
+signing_key.x509
+x509.genkey
+
+# Kconfig presets
+/all.config
+/alldef.config
+/allmod.config
+/allno.config
+/allrandom.config
+/allyes.config
+
+# Kconfig savedefconfig output
+/defconfig
+
+# Kdevelop4
+*.kdev4
+
+# Clang's compilation database file
+/compile_commands.json
+
+# Documentation toolchain
+sphinx_*/
+
+# Rust analyzer configuration
+/rust-project.json
