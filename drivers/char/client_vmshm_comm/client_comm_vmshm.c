@@ -16,8 +16,10 @@
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/ioctl.h>
+#include <linux/ktime.h>
 #include <linux/list.h>
 #include <linux/log2.h>
+#include <linux/math64.h>
 #include <linux/mm.h>
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
@@ -53,6 +55,9 @@
 #define CLIENT_COMM_VMSHM_RPC_WAIT_US	1000
 #define CLIENT_COMM_VMSHM_RPC_RETRIES	1000
 #define CLIENT_COMM_VMSHM_RPC_TIMEOUT_MS	1000
+#define CLIENT_COMM_VMSHM_PERF_RTT_ITERS	1000
+#define CLIENT_COMM_VMSHM_PERF_BURST_ITERS	1024
+#define CLIENT_COMM_VMSHM_PERF_BURST_DEPTH	64
 
 enum proxy_comm_vmshm_status {
 	PROXY_COMM_VMSHM_STATUS_RESET = 0,
@@ -191,6 +196,11 @@ struct client_comm_vmshm_dev {
 	int irq;
 	bool irq_notify;
 	struct work_struct rx_work;
+	atomic64_t irq_last_ns;
+	u64 irq_work_samples;
+	u64 irq_work_min_ns;
+	u64 irq_work_total_ns;
+	u64 irq_work_max_ns;
 	spinlock_t waiters_lock;
 	struct list_head waiters;
 	dev_t devt;
@@ -502,6 +512,24 @@ static bool client_comm_vmshm_ready_locked(struct client_comm_vmshm_dev *d)
 		       PROXY_COMM_VMSHM_STATUS_READY;
 }
 
+static void
+client_comm_vmshm_record_irq_work_latency(struct client_comm_vmshm_dev *d)
+{
+	u64 irq_ns = (u64)atomic64_xchg(&d->irq_last_ns, 0);
+	u64 delta;
+
+	if (!irq_ns)
+		return;
+
+	delta = ktime_get_ns() - irq_ns;
+	if (!d->irq_work_samples || delta < d->irq_work_min_ns)
+		d->irq_work_min_ns = delta;
+	if (delta > d->irq_work_max_ns)
+		d->irq_work_max_ns = delta;
+	d->irq_work_total_ns += delta;
+	d->irq_work_samples++;
+}
+
 static void client_comm_vmshm_kick_proxy(struct client_comm_vmshm_dev *d)
 {
 	if (d->irq_notify && d->doorbell)
@@ -586,6 +614,8 @@ static void client_comm_vmshm_rx_work(struct work_struct *work)
 	struct client_comm_vmshm_waiter *waiter = NULL;
 	int ret;
 
+	client_comm_vmshm_record_irq_work_latency(d);
+
 	for (;;) {
 		memset(payload, 0, sizeof(payload));
 		ret = client_comm_vmshm_recv_from_proxy(&rx);
@@ -633,6 +663,7 @@ static irqreturn_t client_comm_vmshm_irq(int irq, void *data)
 {
 	struct client_comm_vmshm_dev *d = data;
 
+	atomic64_set(&d->irq_last_ns, ktime_get_ns());
 	schedule_work(&d->rx_work);
 	return IRQ_HANDLED;
 }
@@ -787,6 +818,200 @@ static int client_comm_vmshm_hello_selftest_run(void)
 }
 #else
 static int client_comm_vmshm_hello_selftest_run(void)
+{
+	return 0;
+}
+#endif
+
+#ifdef CONFIG_CLIENT_VMSHM_COMM_PERF_SELFTEST
+static int client_comm_vmshm_perf_noop_rtt(void)
+{
+	u64 min_ns = U64_MAX, max_ns = 0, total_ns = 0, elapsed_ns;
+	u32 iters = CLIENT_COMM_VMSHM_PERF_RTT_ITERS;
+	int ret, i;
+
+	for (i = 0; i < iters; i++) {
+		u64 start_ns = ktime_get_ns();
+
+		ret = client_comm_vmshm_call(VMSHM_COMM_PERF_NOOP_REQ, 0,
+					     NULL, 0,
+					     VMSHM_COMM_PERF_NOOP_RSP,
+					     NULL, 0, NULL);
+		if (ret) {
+			pr_warn("client_comm_vmshm: perf noop_rtt failed iter=%d ret=%d\n",
+				i, ret);
+			return ret;
+		}
+
+		elapsed_ns = ktime_get_ns() - start_ns;
+		if (elapsed_ns < min_ns)
+			min_ns = elapsed_ns;
+		if (elapsed_ns > max_ns)
+			max_ns = elapsed_ns;
+		total_ns += elapsed_ns;
+	}
+
+	pr_info("client_comm_vmshm: perf noop_rtt iters=%u min_ns=%llu avg_ns=%llu max_ns=%llu total_ns=%llu\n",
+		iters, min_ns, div64_u64(total_ns, iters), max_ns, total_ns);
+	return 0;
+}
+
+static void
+client_comm_vmshm_perf_waiter_remove(struct client_comm_vmshm_dev *d,
+				     struct client_comm_vmshm_waiter *waiter)
+{
+	spin_lock(&d->waiters_lock);
+	if (!list_empty(&waiter->node))
+		list_del_init(&waiter->node);
+	spin_unlock(&d->waiters_lock);
+}
+
+static int client_comm_vmshm_perf_burst_batch(struct client_comm_vmshm_dev *d,
+					      unsigned int depth)
+{
+	struct client_comm_vmshm_waiter *waiters;
+	struct vmshm_comm_tx tx = {
+		.type = VMSHM_COMM_PERF_NOOP_REQ,
+	};
+	unsigned long timeout;
+	unsigned int i, added = 0;
+	int ret = 0;
+
+	if (depth > CLIENT_COMM_VMSHM_PERF_BURST_DEPTH)
+		return -EINVAL;
+
+	waiters = kcalloc(depth, sizeof(*waiters), GFP_KERNEL);
+	if (!waiters)
+		return -ENOMEM;
+
+	for (i = 0; i < depth; i++) {
+		INIT_LIST_HEAD(&waiters[i].node);
+		init_completion(&waiters[i].done);
+		waiters[i].seq = (u64)atomic64_inc_return(&d->next_seq);
+		waiters[i].rsp_type = VMSHM_COMM_PERF_NOOP_RSP;
+		waiters[i].status = -ETIMEDOUT;
+
+		spin_lock(&d->waiters_lock);
+		list_add_tail(&waiters[i].node, &d->waiters);
+		spin_unlock(&d->waiters_lock);
+		added++;
+
+		tx.seq = waiters[i].seq;
+		ret = client_comm_vmshm_send_to_proxy(&tx);
+		if (ret)
+			goto out_remove;
+	}
+
+	timeout = msecs_to_jiffies(CLIENT_COMM_VMSHM_RPC_TIMEOUT_MS);
+	for (i = 0; i < depth; i++) {
+		if (!wait_for_completion_timeout(&waiters[i].done, timeout)) {
+			ret = -ETIMEDOUT;
+			goto out_remove;
+		}
+		if (waiters[i].status) {
+			ret = waiters[i].status;
+			goto out_remove;
+		}
+	}
+
+out_remove:
+	for (i = 0; i < added; i++)
+		client_comm_vmshm_perf_waiter_remove(d, &waiters[i]);
+	kfree(waiters);
+	return ret;
+}
+
+static int client_comm_vmshm_perf_burst(void)
+{
+	struct client_comm_vmshm_dev *d = &client_comm_vmshm_dev;
+	u32 iters = CLIENT_COMM_VMSHM_PERF_BURST_ITERS;
+	u32 depth = CLIENT_COMM_VMSHM_PERF_BURST_DEPTH;
+	u64 start_ns, elapsed_ns, rpc_per_sec;
+	u32 done = 0;
+	int ret;
+
+	start_ns = ktime_get_ns();
+	while (done < iters) {
+		u32 batch = min_t(u32, depth, iters - done);
+
+		ret = client_comm_vmshm_perf_burst_batch(d, batch);
+		if (ret) {
+			pr_warn("client_comm_vmshm: perf burst failed done=%u ret=%d\n",
+				done, ret);
+			return ret;
+		}
+		done += batch;
+	}
+	elapsed_ns = ktime_get_ns() - start_ns;
+	rpc_per_sec = elapsed_ns ? div64_u64((u64)iters * NSEC_PER_SEC,
+					     elapsed_ns) : 0;
+
+	pr_info("client_comm_vmshm: perf burst iters=%u depth=%u elapsed_ns=%llu rpc_per_sec=%llu\n",
+		iters, depth, elapsed_ns, rpc_per_sec);
+	return 0;
+}
+
+static void client_comm_vmshm_perf_print_irq_report(void)
+{
+	struct client_comm_vmshm_dev *d = &client_comm_vmshm_dev;
+	u64 avg_ns = 0;
+
+	if (d->irq_work_samples)
+		avg_ns = div64_u64(d->irq_work_total_ns, d->irq_work_samples);
+
+	pr_info("client_comm_vmshm: perf irq_to_work samples=%llu min_ns=%llu avg_ns=%llu max_ns=%llu\n",
+		d->irq_work_samples, d->irq_work_min_ns, avg_ns,
+		d->irq_work_max_ns);
+}
+
+static int client_comm_vmshm_perf_fetch_proxy_report(void)
+{
+	struct vmshm_comm_perf_report report;
+	struct vmshm_comm_rx rx;
+	int ret;
+
+	memset(&report, 0, sizeof(report));
+	ret = client_comm_vmshm_call(VMSHM_COMM_PERF_REPORT_REQ, 0,
+				     NULL, 0,
+				     VMSHM_COMM_PERF_REPORT_RSP,
+				     &report, sizeof(report), &rx);
+	if (ret) {
+		pr_warn("client_comm_vmshm: perf proxy report failed (%d)\n",
+			ret);
+		return ret;
+	}
+	if (rx.len != sizeof(report))
+		return -EPROTO;
+
+	pr_info("client_comm_vmshm: perf proxy_report noop_count=%llu irq_to_work_samples=%llu min_ns=%llu avg_ns=%llu max_ns=%llu\n",
+		report.noop_count, report.irq_to_work_samples,
+		report.irq_to_work_min_ns, report.irq_to_work_avg_ns,
+		report.irq_to_work_max_ns);
+	return 0;
+}
+
+static int client_comm_vmshm_perf_selftest_run(void)
+{
+	int ret;
+
+	ret = client_comm_vmshm_perf_noop_rtt();
+	if (ret)
+		return ret;
+
+	ret = client_comm_vmshm_perf_burst();
+	if (ret)
+		return ret;
+
+	client_comm_vmshm_perf_print_irq_report();
+	ret = client_comm_vmshm_perf_fetch_proxy_report();
+	if (ret)
+		return ret;
+
+	pr_info("client_comm_vmshm: perf selftest passed\n");
+	return 0;
+}
+#else
+static int client_comm_vmshm_perf_selftest_run(void)
 {
 	return 0;
 }
@@ -1031,6 +1256,10 @@ static int client_comm_vmshm_probe(struct platform_device *pdev)
 		 client_comm_vmshm_dev.hdr->heap_size);
 
 	ret = client_comm_vmshm_hello_selftest_run();
+	if (ret)
+		goto err_unmap;
+
+	ret = client_comm_vmshm_perf_selftest_run();
 	if (ret)
 		goto err_unmap;
 

@@ -2052,7 +2052,8 @@ out_unlock:
 EXPORT_SYMBOL_GPL(proxy_vmshm_grant_revoke);
 
 static int
-proxy_vmshm_manager_send_object_rsp(u64 reply_to,
+proxy_vmshm_manager_send_object_rsp(struct proxy_comm_vmshm_channel *channel,
+				    u64 reply_to,
 				    const struct vmshm_manager_get_object_rsp *rsp)
 {
 	struct vmshm_comm_tx tx = {
@@ -2065,7 +2066,7 @@ proxy_vmshm_manager_send_object_rsp(u64 reply_to,
 	int ret, i;
 
 	for (i = 0; i < PROXY_VMSHM_MANAGER_SEND_RETRIES; i++) {
-		ret = proxy_comm_vmshm_send_to_client(&tx);
+		ret = proxy_comm_vmshm_send_to_channel(channel, &tx);
 		if (ret != -EAGAIN)
 			return ret;
 
@@ -2144,7 +2145,8 @@ static int proxy_vmshm_manager_rx_handler(const struct vmshm_comm_rx *rx,
 	ret = proxy_vmshm_manager_handle_object_req(&req, &rsp);
 	rsp.ret = ret;
 
-	ret = proxy_vmshm_manager_send_object_rsp(rx->seq, &rsp);
+	ret = proxy_vmshm_manager_send_object_rsp(rx->proxy_channel, rx->seq,
+						 &rsp);
 	if (ret)
 		pr_warn_ratelimited("proxy_manager_vmshm: response send failed (%d)\n",
 				    ret);

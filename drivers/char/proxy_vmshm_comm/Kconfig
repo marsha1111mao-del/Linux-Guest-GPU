@@ -29,3 +29,13 @@ config PROXY_VMSHM_COMM_HELLO_SELFTEST
 	  prints the received string to the kernel log and replies with an ACK.
 
 	  Enable only for bring-up/debugging.
+
+config PROXY_VMSHM_COMM_PERF_SELFTEST
+	bool "Register proxy_comm_vmshm no-op performance self-test handlers"
+	depends on PROXY_VMSHM_COMM
+	default n
+	help
+	  Register no-op echo and performance-report handlers used by the
+	  client_comm_vmshm boot-time performance self-test.
+
+	  Enable only for bring-up/performance debugging.

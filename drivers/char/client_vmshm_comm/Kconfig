@@ -28,3 +28,15 @@ config CLIENT_VMSHM_COMM_HELLO_SELFTEST
 
 	  Enable only for bring-up/debugging, together with
 	  PROXY_VMSHM_COMM_HELLO_SELFTEST in the proxy VM kernel.
+
+config CLIENT_VMSHM_COMM_PERF_SELFTEST
+	bool "Run client_comm_vmshm no-op RPC performance self-test"
+	depends on CLIENT_VMSHM_COMM
+	default n
+	help
+	  Run a boot-time benchmark that sends no-op RPCs through the vmshm
+	  comm path, prints RTT and burst-throughput statistics, and reports
+	  IRQ-handler to worker-start latency observed by both guests.
+
+	  Enable only for bring-up/performance debugging, together with
+	  PROXY_VMSHM_COMM_PERF_SELFTEST in the proxy VM kernel.

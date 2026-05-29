@@ -115,4 +115,12 @@ include/generated/rustc_cfg
 
 arch/arm64/kernel/vdso/vdso.so.dbg
 
-cp-build.sh
+# Local kernel build output
+/out/
+/.vmlinux.export.c
+/.vmlinux.export.o
+*.cmd
+/arch/arm64/boot/Image
+/include/config/
+/include/generated/
+/arch/*/include/generated/

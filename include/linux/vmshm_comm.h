@@ -12,6 +12,8 @@
  * The comm layer does not define message semantics. @type, @flags and payload
  * are owned by the upper driver using the channel.
  */
+struct proxy_comm_vmshm_channel;
+
 struct vmshm_comm_tx {
 	u32 type;
 	u32 flags;
@@ -31,6 +33,7 @@ struct vmshm_comm_rx {
 	void *payload;
 	u32 payload_capacity;
 	u32 len;
+	struct proxy_comm_vmshm_channel *proxy_channel;
 };
 
 #define VMSHM_COMM_SELFTEST_HELLO_REQ	0x48454c4fU /* "HELO" */
@@ -38,14 +41,27 @@ struct vmshm_comm_rx {
 #define VMSHM_COMM_SELFTEST_HELLO_PAYLOAD	"hello_world"
 #define VMSHM_COMM_SELFTEST_ACK_PAYLOAD		"hello_ack"
 
+#define VMSHM_COMM_PERF_NOOP_REQ	0x50464e51U /* "PFNQ" */
+#define VMSHM_COMM_PERF_NOOP_RSP	0x50464e53U /* "PFNS" */
+#define VMSHM_COMM_PERF_REPORT_REQ	0x50465251U /* "PFRQ" */
+#define VMSHM_COMM_PERF_REPORT_RSP	0x50465253U /* "PFRS" */
+
+struct vmshm_comm_perf_report {
+	__u64 noop_count;
+	__u64 irq_to_work_samples;
+	__u64 irq_to_work_min_ns;
+	__u64 irq_to_work_avg_ns;
+	__u64 irq_to_work_max_ns;
+};
+
 typedef int (*proxy_comm_vmshm_rx_handler_t)(const struct vmshm_comm_rx *rx,
 					     void *priv);
 
 #if IS_ENABLED(CONFIG_PROXY_VMSHM_COMM)
-bool proxy_comm_vmshm_ready(void);
-u32 proxy_comm_vmshm_max_payload(void);
-int proxy_comm_vmshm_send_to_client(const struct vmshm_comm_tx *tx);
-int proxy_comm_vmshm_recv_from_client(struct vmshm_comm_rx *rx);
+bool proxy_comm_vmshm_channel_ready(struct proxy_comm_vmshm_channel *channel);
+u32 proxy_comm_vmshm_channel_max_payload(struct proxy_comm_vmshm_channel *channel);
+int proxy_comm_vmshm_send_to_channel(struct proxy_comm_vmshm_channel *channel,
+				     const struct vmshm_comm_tx *tx);
 int proxy_comm_vmshm_register_handler(u32 type,
 				      proxy_comm_vmshm_rx_handler_t handler,
 				      void *priv);
@@ -53,22 +69,21 @@ void proxy_comm_vmshm_unregister_handler(u32 type,
 					 proxy_comm_vmshm_rx_handler_t handler,
 					 void *priv);
 #else
-static inline bool proxy_comm_vmshm_ready(void)
+static inline bool
+proxy_comm_vmshm_channel_ready(struct proxy_comm_vmshm_channel *channel)
 {
 	return false;
 }
 
-static inline u32 proxy_comm_vmshm_max_payload(void)
+static inline u32
+proxy_comm_vmshm_channel_max_payload(struct proxy_comm_vmshm_channel *channel)
 {
 	return 0;
 }
 
-static inline int proxy_comm_vmshm_send_to_client(const struct vmshm_comm_tx *tx)
-{
-	return -ENODEV;
-}
-
-static inline int proxy_comm_vmshm_recv_from_client(struct vmshm_comm_rx *rx)
+static inline int
+proxy_comm_vmshm_send_to_channel(struct proxy_comm_vmshm_channel *channel,
+				 const struct vmshm_comm_tx *tx)
 {
 	return -ENODEV;
 }

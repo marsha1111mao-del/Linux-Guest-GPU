@@ -17,7 +17,8 @@
 #define PANTHOR_PROXY_SEND_WAIT_US	1000
 
 static int
-panthor_proxy_send_rsp(u64 reply_to,
+panthor_proxy_send_rsp(struct proxy_comm_vmshm_channel *channel,
+		       u64 reply_to,
 		       const struct panthor_vmshm_dev_query_rsp *rsp)
 {
 	struct vmshm_comm_tx tx = {
@@ -30,7 +31,7 @@ panthor_proxy_send_rsp(u64 reply_to,
 	int ret, i;
 
 	for (i = 0; i < PANTHOR_PROXY_SEND_RETRIES; i++) {
-		ret = proxy_comm_vmshm_send_to_client(&tx);
+		ret = proxy_comm_vmshm_send_to_channel(channel, &tx);
 		if (ret != -EAGAIN)
 			return ret;
 
@@ -42,7 +43,8 @@ panthor_proxy_send_rsp(u64 reply_to,
 }
 
 static void
-panthor_proxy_handle_dev_query(u64 seq,
+panthor_proxy_handle_dev_query(struct proxy_comm_vmshm_channel *channel,
+			       u64 seq,
 			       const struct panthor_vmshm_dev_query_req *req)
 {
 	struct panthor_vmshm_dev_query_rsp rsp;
@@ -56,7 +58,7 @@ panthor_proxy_handle_dev_query(u64 seq,
 		rsp.ret = ret;
 	}
 
-	ret = panthor_proxy_send_rsp(seq, &rsp);
+	ret = panthor_proxy_send_rsp(channel, seq, &rsp);
 	if (ret)
 		pr_warn_ratelimited("panthor-proxy: response send failed (%d)\n",
 				    ret);
@@ -70,7 +72,7 @@ static int panthor_proxy_rx_handler(const struct vmshm_comm_rx *rx, void *priv)
 		return -EPROTO;
 
 	memcpy(&req, rx->payload, sizeof(req));
-	panthor_proxy_handle_dev_query(rx->seq, &req);
+	panthor_proxy_handle_dev_query(rx->proxy_channel, rx->seq, &req);
 	return 0;
 }
 
