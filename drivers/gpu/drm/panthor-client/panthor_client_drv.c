@@ -11,6 +11,9 @@
 #include <linux/device.h>
 #include <linux/dma-mapping.h>
 #include <linux/fs.h>
+#include <linux/ktime.h>
+#include <linux/limits.h>
+#include <linux/math64.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
 #include <linux/slab.h>
@@ -29,6 +32,7 @@
 #define DRIVER_DATE	"20260528"
 #define DRIVER_MAJOR	1
 #define DRIVER_MINOR	0
+#define PANTHOR_CLIENT_DEV_QUERY_PERF_RTT_ITERS	1000
 
 struct panthor_client_device {
 	struct drm_device drm;
@@ -235,6 +239,57 @@ static int panthor_client_dev_query_selftest_run(void)
 }
 #endif
 
+#ifdef CONFIG_DRM_PANTHOR_CLIENT_DEV_QUERY_PERF_SELFTEST
+static int panthor_client_dev_query_perf_rtt(void)
+{
+	u64 min_ns = U64_MAX, max_ns = 0, total_ns = 0, elapsed_ns;
+	u32 iters = PANTHOR_CLIENT_DEV_QUERY_PERF_RTT_ITERS;
+	struct drm_panthor_gpu_info gpu_info;
+	u32 gpu_info_size;
+	int ret, i;
+
+	ret = panthor_client_selftest_query_size(DRM_PANTHOR_DEV_QUERY_GPU_INFO,
+						&gpu_info_size);
+	if (ret)
+		return ret;
+	if (gpu_info_size > sizeof(gpu_info))
+		return -EOVERFLOW;
+
+	for (i = 0; i < iters; i++) {
+		u64 start_ns;
+
+		memset(&gpu_info, 0, sizeof(gpu_info));
+		start_ns = ktime_get_ns();
+		ret = panthor_client_selftest_query_data(
+			DRM_PANTHOR_DEV_QUERY_GPU_INFO, gpu_info_size,
+			&gpu_info, sizeof(gpu_info));
+		if (ret) {
+			pr_warn("panthor-client: DEV_QUERY perf gpu_info_rtt failed iter=%d ret=%d\n",
+				i, ret);
+			return ret;
+		}
+
+		elapsed_ns = ktime_get_ns() - start_ns;
+		if (elapsed_ns < min_ns)
+			min_ns = elapsed_ns;
+		if (elapsed_ns > max_ns)
+			max_ns = elapsed_ns;
+		total_ns += elapsed_ns;
+	}
+
+	pr_info("panthor-client: DEV_QUERY perf gpu_info_rtt iters=%u size=%u min_ns=%llu avg_ns=%llu max_ns=%llu total_ns=%llu\n",
+		iters, gpu_info_size, min_ns, div64_u64(total_ns, iters),
+		max_ns, total_ns);
+	pr_info("panthor-client: DEV_QUERY perf selftest passed\n");
+	return 0;
+}
+#else
+static int panthor_client_dev_query_perf_rtt(void)
+{
+	return 0;
+}
+#endif
+
 static int panthor_client_chr_open(struct inode *inode, struct file *filp)
 {
 	if (!panthor_client)
@@ -394,6 +449,10 @@ static int __init panthor_client_init(void)
 	ret = panthor_client_dev_query_selftest_run();
 	if (ret)
 		pr_warn("panthor-client: DEV_QUERY selftest failed (%d)\n", ret);
+
+	ret = panthor_client_dev_query_perf_rtt();
+	if (ret)
+		pr_warn("panthor-client: DEV_QUERY perf selftest failed (%d)\n", ret);
 
 	pr_info("panthor-client: registered DRM frontend and /dev/%s\n",
 		DRIVER_NAME);

@@ -23,3 +23,14 @@ config DRM_PANTHOR_CLIENT_DEV_QUERY_SELFTEST
 	  GPU and CSIF information to the kernel log.
 
 	  Enable only for bring-up/debugging.
+
+config DRM_PANTHOR_CLIENT_DEV_QUERY_PERF_SELFTEST
+	bool "Run Panthor client DEV_QUERY RTT performance self-test"
+	depends on DRM_PANTHOR_CLIENT_DEV_QUERY_SELFTEST
+	default n
+	help
+	  Run a boot-time benchmark that repeatedly sends real Panthor
+	  DEV_QUERY GPU_INFO requests through the client/proxy vmshm path and
+	  prints RTT statistics to the kernel log.
+
+	  Enable only for bring-up/performance debugging.
