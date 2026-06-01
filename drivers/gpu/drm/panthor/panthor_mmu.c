@@ -980,26 +980,37 @@ static int panthor_vm_map_pages(struct panthor_vm *vm, u64 iova, int prot,
 
 	for_each_sgtable_dma_sg(sgt, sgl, count) {
 		dma_addr_t paddr = sg_dma_address(sgl);
+		phys_addr_t sg_paddr = sg_phys(sgl);
+		phys_addr_t page_paddr = page_to_phys(sg_page(sgl));
 		size_t len = sg_dma_len(sgl);
+		u64 sg_skip;
 
 		if (len <= offset) {
 			offset -= len;
 			continue;
 		}
 
-		paddr += offset;
-		len -= offset;
+		sg_skip = offset;
+		paddr += sg_skip;
+		sg_paddr += sg_skip;
+		page_paddr += sgl->offset + sg_skip;
+		len -= sg_skip;
 		len = min_t(size_t, len, size);
 		size -= len;
 
-		pr_info("[MZH][panthor_vm_map_pages]:iova=%llx, paddr=%p, len=%zx,prot=%llx",
-			iova, &paddr, len, prot);
+		if (paddr != sg_paddr || paddr != page_paddr)
+			pr_err("[MZH][panthor_vm_map_pages] dma/phys mismatch: iova=%llx, dma=%pad, sg_phys=%pa, page_phys=%pa, sg_off=%x, skip=%llx, len=%zx, prot=%x",
+			       iova, &paddr, &sg_paddr, &page_paddr,
+			       sgl->offset, sg_skip, len, prot);
+		else
+			pr_debug("[MZH][panthor_vm_map_pages]:iova=%llx, dma=%pad, len=%zx, prot=%x",
+				 iova, &paddr, len, prot);
 		while (len) {
 			size_t pgcount, mapped = 0;
 			size_t pgsize =
 				SZ_4K_get_pgsize(iova | paddr, len, &pgcount);
-			pr_info("[MZH][panthor_vm_while][iova]:%llx\t[paddr]:%llx[pgsize]:%lx[pgcount]:%lx",
-				iova, paddr, pgsize, pgcount);
+			pr_debug("[MZH][panthor_vm_while][iova]:%llx\t[paddr]:%llx[pgsize]:%lx[pgcount]:%lx",
+				 iova, paddr, pgsize, pgcount);
 			ret = ops->map_pages(ops, iova, paddr, pgsize, pgcount,
 					     prot, GFP_KERNEL, &mapped);
 			iova += mapped;

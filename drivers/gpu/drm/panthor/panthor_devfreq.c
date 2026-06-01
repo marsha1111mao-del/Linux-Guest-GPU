@@ -232,6 +232,9 @@ int panthor_devfreq_resume(struct panthor_device *ptdev)
 {
 	struct panthor_devfreq *pdevfreq = ptdev->devfreq;
 
+	if (!pdevfreq)
+		return 0;
+
 	if (!pdevfreq->devfreq)
 		return 0;
 
@@ -244,6 +247,9 @@ int panthor_devfreq_suspend(struct panthor_device *ptdev)
 {
 	struct panthor_devfreq *pdevfreq = ptdev->devfreq;
 
+	if (!pdevfreq)
+		return 0;
+
 	if (!pdevfreq->devfreq)
 		return 0;
 
@@ -254,6 +260,9 @@ void panthor_devfreq_record_busy(struct panthor_device *ptdev)
 {
 	struct panthor_devfreq *pdevfreq = ptdev->devfreq;
 	unsigned long irqflags;
+
+	if (!pdevfreq)
+		return;
 
 	if (!pdevfreq->devfreq)
 		return;
@@ -270,6 +279,9 @@ void panthor_devfreq_record_idle(struct panthor_device *ptdev)
 {
 	struct panthor_devfreq *pdevfreq = ptdev->devfreq;
 	unsigned long irqflags;
+
+	if (!pdevfreq)
+		return;
 
 	if (!pdevfreq->devfreq)
 		return;

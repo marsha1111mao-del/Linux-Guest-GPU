@@ -168,21 +168,21 @@ int panthor_device_init(struct panthor_device *ptdev)
 	if (ret)
 		return ret;
 
-	// ret = drmm_mutex_init(&ptdev->base, &ptdev->pm.mmio_lock);
-	// if (ret)
-	// 	return ret;
+	ret = drmm_mutex_init(&ptdev->base, &ptdev->pm.mmio_lock);
+	if (ret)
+		return ret;
 
-	// atomic_set(&ptdev->pm.state, PANTHOR_DEVICE_PM_STATE_SUSPENDED);
-	// p = alloc_page(GFP_KERNEL | __GFP_ZERO);
-	// if (!p)
-	// 	return -ENOMEM;
+	atomic_set(&ptdev->pm.state, PANTHOR_DEVICE_PM_STATE_ACTIVE);
+	p = alloc_page(GFP_KERNEL | __GFP_ZERO);
+	if (!p)
+		return -ENOMEM;
 
-	// ptdev->pm.dummy_latest_flush = p;
-	// dummy_page_virt = page_address(p);
-	// ret = drmm_add_action_or_reset(&ptdev->base, panthor_device_free_page,
-	// 			       ptdev->pm.dummy_latest_flush);
-	// if (ret)
-	// 	return ret;
+	ptdev->pm.dummy_latest_flush = p;
+	dummy_page_virt = page_address(p);
+	ret = drmm_add_action_or_reset(&ptdev->base, panthor_device_free_page,
+				       ptdev->pm.dummy_latest_flush);
+	if (ret)
+		return ret;
 
 	/*
 	 * Set the dummy page holding the latest flush to 1. This will cause the
@@ -190,7 +190,7 @@ int panthor_device_init(struct panthor_device *ptdev)
 	 * happens while the dummy page is mapped. Zero cannot be used because
 	 * that means 'always flush'.
 	 */
-	// *dummy_page_virt = 1;
+	*dummy_page_virt = 1;
 
 	INIT_WORK(&ptdev->reset.work, panthor_device_reset_work);
 	ptdev->reset.wq = alloc_ordered_workqueue("panthor-reset-wq", 0);
@@ -217,13 +217,16 @@ int panthor_device_init(struct panthor_device *ptdev)
 
 	ptdev->phys_addr = res->start;
 
-	// ret = devm_pm_runtime_enable(ptdev->base.dev);
-	// if (ret)
-	// 	return ret;
+	ret = pm_runtime_set_active(ptdev->base.dev);
+	if (ret)
+		return ret;
 
-	// ret = pm_runtime_resume_and_get(ptdev->base.dev);
-	// if (ret)
-	// 	return ret;
+	ret = devm_pm_runtime_enable(ptdev->base.dev);
+	if (ret)
+		return ret;
+
+	/* Keep passthrough guests active; host firmware owns real power state. */
+	pm_runtime_get_noresume(ptdev->base.dev);
 
 	/* If PM is disabled, we need to call panthor_device_resume() manually. */
 	// if (!IS_ENABLED(CONFIG_PM)) {
@@ -256,7 +259,6 @@ int panthor_device_init(struct panthor_device *ptdev)
 	if (ret)
 		goto err_disable_autosuspend;
 
-	pm_runtime_put_autosuspend(ptdev->base.dev);
 	return 0;
 
 err_disable_autosuspend:
