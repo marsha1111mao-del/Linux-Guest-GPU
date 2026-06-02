@@ -6,9 +6,6 @@
  * forwards the actual query to the proxy VM over client_vmshm_comm.
  */
 
-#include <linux/atomic.h>
-#include <linux/cdev.h>
-#include <linux/device.h>
 #include <linux/dma-mapping.h>
 #include <linux/fs.h>
 #include <linux/ktime.h>
@@ -33,18 +30,90 @@
 #define DRIVER_MAJOR	1
 #define DRIVER_MINOR	0
 #define PANTHOR_CLIENT_DEV_QUERY_PERF_RTT_ITERS	1000
+#define PANTHOR_CLIENT_DRIVER_FEATURES \
+	(DRIVER_RENDER | DRIVER_GEM | DRIVER_SYNCOBJ | \
+	 DRIVER_SYNCOBJ_TIMELINE | DRIVER_GEM_GPUVA)
 
 struct panthor_client_device {
 	struct drm_device drm;
 	struct platform_device *platform;
-	dev_t devt;
-	struct cdev cdev;
-	struct class *class;
-	struct device *chardev;
-	atomic_t open_cnt;
+};
+
+struct panthor_client_file {
+	u64 session_id;
 };
 
 static struct panthor_client_device *panthor_client;
+
+static int
+panthor_client_rpc_call(u32 req_type, const void *req, u32 req_len,
+			u32 rsp_type, void *rsp, u32 rsp_capacity,
+			u32 rsp_min_len, struct vmshm_comm_rx *rx_out)
+{
+	struct vmshm_comm_rx rx;
+	int ret;
+
+	ret = client_comm_vmshm_call(req_type, 0, req, req_len, rsp_type,
+				     rsp, rsp_capacity, &rx);
+	if (ret)
+		return ret;
+
+	if (rx.len < rsp_min_len || rx.len > rsp_capacity)
+		return -EPROTO;
+
+	if (rx_out)
+		*rx_out = rx;
+
+	return 0;
+}
+
+static int panthor_client_rpc_open_session(u64 *session_id)
+{
+	struct panthor_vmshm_open_session_req req = {
+		.version = PANTHOR_VMSHM_ABI_VERSION,
+	};
+	struct panthor_vmshm_open_session_rsp rsp;
+	int ret;
+
+	if (!session_id)
+		return -EINVAL;
+
+	ret = panthor_client_rpc_call(PANTHOR_VMSHM_MSG_OPEN_SESSION_REQ,
+				      &req, sizeof(req),
+				      PANTHOR_VMSHM_MSG_OPEN_SESSION_RSP,
+				      &rsp, sizeof(rsp), sizeof(rsp), NULL);
+	if (ret)
+		return ret;
+	if (rsp.ret)
+		return rsp.ret;
+	if (!rsp.session_id)
+		return -EPROTO;
+
+	*session_id = rsp.session_id;
+	pr_info("panthor-client: OPEN_SESSION session=%llu\n", *session_id);
+	return 0;
+}
+
+static int panthor_client_rpc_close_session(u64 session_id)
+{
+	struct panthor_vmshm_close_session_req req = {
+		.session_id = session_id,
+	};
+	struct panthor_vmshm_close_session_rsp rsp;
+	int ret;
+
+	if (!session_id)
+		return 0;
+
+	ret = panthor_client_rpc_call(PANTHOR_VMSHM_MSG_CLOSE_SESSION_REQ,
+				      &req, sizeof(req),
+				      PANTHOR_VMSHM_MSG_CLOSE_SESSION_RSP,
+				      &rsp, sizeof(rsp), sizeof(rsp), NULL);
+	if (ret)
+		return ret;
+
+	return rsp.ret;
+}
 
 static int
 panthor_client_rpc_dev_query(const struct panthor_vmshm_dev_query_req *req,
@@ -53,15 +122,17 @@ panthor_client_rpc_dev_query(const struct panthor_vmshm_dev_query_req *req,
 	struct vmshm_comm_rx rx;
 	int ret;
 
-	ret = client_comm_vmshm_call(PANTHOR_VMSHM_MSG_DEV_QUERY_REQ, 0,
-				     req, sizeof(*req),
-				     PANTHOR_VMSHM_MSG_DEV_QUERY_RSP,
-				     rsp, sizeof(*rsp), &rx);
+	ret = panthor_client_rpc_call(PANTHOR_VMSHM_MSG_DEV_QUERY_REQ,
+				      req, sizeof(*req),
+				      PANTHOR_VMSHM_MSG_DEV_QUERY_RSP,
+				      rsp, sizeof(*rsp),
+				      offsetof(struct panthor_vmshm_dev_query_rsp,
+					       data),
+				      &rx);
 	if (ret)
 		return ret;
 
-	if (rx.len < offsetof(struct panthor_vmshm_dev_query_rsp, data) ||
-	    rsp->data_len > sizeof(rsp->data) ||
+	if (rsp->data_len > sizeof(rsp->data) ||
 	    rsp->data_len >
 		    rx.len - offsetof(struct panthor_vmshm_dev_query_rsp, data))
 		return -EPROTO;
@@ -69,9 +140,31 @@ panthor_client_rpc_dev_query(const struct panthor_vmshm_dev_query_req *req,
 	return 0;
 }
 
-static int panthor_client_dev_query(struct drm_panthor_dev_query *args)
+static int
+panthor_client_rpc_vm_create(const struct panthor_vmshm_vm_create_req *req,
+			     struct panthor_vmshm_vm_create_rsp *rsp)
+{
+	return panthor_client_rpc_call(PANTHOR_VMSHM_MSG_VM_CREATE_REQ,
+				      req, sizeof(*req),
+				      PANTHOR_VMSHM_MSG_VM_CREATE_RSP,
+				      rsp, sizeof(*rsp), sizeof(*rsp), NULL);
+}
+
+static int
+panthor_client_rpc_vm_destroy(const struct panthor_vmshm_vm_destroy_req *req,
+			      struct panthor_vmshm_vm_destroy_rsp *rsp)
+{
+	return panthor_client_rpc_call(PANTHOR_VMSHM_MSG_VM_DESTROY_REQ,
+				      req, sizeof(*req),
+				      PANTHOR_VMSHM_MSG_VM_DESTROY_RSP,
+				      rsp, sizeof(*rsp), sizeof(*rsp), NULL);
+}
+
+static int panthor_client_dev_query(struct panthor_client_file *pcfile,
+				    struct drm_panthor_dev_query *args)
 {
 	struct panthor_vmshm_dev_query_req req = {
+		.session_id = pcfile ? pcfile->session_id : 0,
 		.type = args->type,
 		.size = args->size,
 		.flags = args->pointer ? PANTHOR_VMSHM_DEV_QUERY_F_DATA : 0,
@@ -91,6 +184,9 @@ static int panthor_client_dev_query(struct drm_panthor_dev_query *args)
 
 	if (!args->pointer) {
 		args->size = rsp.size;
+		if (pcfile)
+			pr_info("panthor-client: DEV_QUERY session=%llu type=%u size=%u data=0\n",
+				pcfile->session_id, args->type, rsp.size);
 		return 0;
 	}
 
@@ -103,17 +199,96 @@ static int panthor_client_dev_query(struct drm_panthor_dev_query *args)
 		       user_size - rsp.data_len))
 		return -EFAULT;
 
+	if (pcfile)
+		pr_info("panthor-client: DEV_QUERY session=%llu type=%u size=%u data=%u\n",
+			pcfile->session_id, args->type, rsp.size, rsp.data_len);
+	return 0;
+}
+
+static int panthor_client_vm_create(struct panthor_client_file *pcfile,
+				    struct drm_panthor_vm_create *args)
+{
+	struct panthor_vmshm_vm_create_req req;
+	struct panthor_vmshm_vm_create_rsp rsp;
+	int ret;
+
+	if (!pcfile)
+		return -EINVAL;
+	if (args->flags)
+		return -EINVAL;
+
+	memset(&req, 0, sizeof(req));
+	req.session_id = pcfile->session_id;
+	req.flags = args->flags;
+	req.user_va_range = args->user_va_range;
+
+	ret = panthor_client_rpc_vm_create(&req, &rsp);
+	if (ret)
+		return ret;
+	if (rsp.ret)
+		return rsp.ret;
+	if (!rsp.client_vm_id || !rsp.proxy_vm_id || !rsp.user_va_range)
+		return -EPROTO;
+
+	args->id = rsp.client_vm_id;
+	args->user_va_range = rsp.user_va_range;
+
+	pr_info("panthor-client: VM_CREATE session=%llu client_vm=%u proxy_vm=%u user_va_range=0x%llx\n",
+		pcfile->session_id, rsp.client_vm_id, rsp.proxy_vm_id,
+		rsp.user_va_range);
+	return 0;
+}
+
+static int panthor_client_vm_destroy(struct panthor_client_file *pcfile,
+				     struct drm_panthor_vm_destroy *args)
+{
+	struct panthor_vmshm_vm_destroy_req req = { 0 };
+	struct panthor_vmshm_vm_destroy_rsp rsp;
+	int ret;
+
+	if (!pcfile)
+		return -EINVAL;
+	if (args->pad)
+		return -EINVAL;
+
+	req.session_id = pcfile->session_id;
+	req.client_vm_id = args->id;
+
+	ret = panthor_client_rpc_vm_destroy(&req, &rsp);
+	if (ret)
+		return ret;
+	if (rsp.ret)
+		return rsp.ret;
+
+	pr_info("panthor-client: VM_DESTROY session=%llu client_vm=%u proxy_vm=%u\n",
+		pcfile->session_id, args->id, rsp.proxy_vm_id);
 	return 0;
 }
 
 static int panthor_client_ioctl_dev_query(struct drm_device *ddev, void *data,
 					  struct drm_file *file)
 {
-	return panthor_client_dev_query(data);
+	return panthor_client_dev_query(file->driver_priv, data);
+}
+
+static int panthor_client_ioctl_vm_create(struct drm_device *ddev, void *data,
+					  struct drm_file *file)
+{
+	return panthor_client_vm_create(file->driver_priv, data);
+}
+
+static int panthor_client_ioctl_vm_destroy(struct drm_device *ddev, void *data,
+					   struct drm_file *file)
+{
+	return panthor_client_vm_destroy(file->driver_priv, data);
 }
 
 static const struct drm_ioctl_desc panthor_client_ioctls[] = {
 	DRM_IOCTL_DEF_DRV(PANTHOR_DEV_QUERY, panthor_client_ioctl_dev_query,
+			  DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(PANTHOR_VM_CREATE, panthor_client_ioctl_vm_create,
+			  DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(PANTHOR_VM_DESTROY, panthor_client_ioctl_vm_destroy,
 			  DRM_RENDER_ALLOW),
 };
 
@@ -126,10 +301,53 @@ static const struct file_operations panthor_client_fops = {
 	.poll = drm_poll,
 	.read = drm_read,
 	.llseek = noop_llseek,
+	.fop_flags = FOP_UNSIGNED_OFFSET,
 };
 
+static int panthor_client_open(struct drm_device *ddev, struct drm_file *file)
+{
+	struct panthor_client_file *pcfile;
+	int ret;
+
+	pcfile = kzalloc(sizeof(*pcfile), GFP_KERNEL);
+	if (!pcfile)
+		return -ENOMEM;
+
+	ret = panthor_client_rpc_open_session(&pcfile->session_id);
+	if (ret) {
+		kfree(pcfile);
+		return ret;
+	}
+
+	file->driver_priv = pcfile;
+	return 0;
+}
+
+static void panthor_client_postclose(struct drm_device *ddev,
+				     struct drm_file *file)
+{
+	struct panthor_client_file *pcfile = file->driver_priv;
+	int ret;
+
+	if (!pcfile)
+		return;
+
+	ret = panthor_client_rpc_close_session(pcfile->session_id);
+	if (ret)
+		pr_warn_ratelimited("panthor-client: CLOSE_SESSION failed session=%llu ret=%d\n",
+				    pcfile->session_id, ret);
+	else
+		pr_info("panthor-client: CLOSE_SESSION session=%llu\n",
+			pcfile->session_id);
+
+	kfree(pcfile);
+	file->driver_priv = NULL;
+}
+
 static const struct drm_driver panthor_client_driver = {
-	.driver_features = DRIVER_RENDER,
+	.driver_features = PANTHOR_CLIENT_DRIVER_FEATURES,
+	.open = panthor_client_open,
+	.postclose = panthor_client_postclose,
 	.ioctls = panthor_client_ioctls,
 	.num_ioctls = ARRAY_SIZE(panthor_client_ioctls),
 	.fops = &panthor_client_fops,
@@ -290,123 +508,6 @@ static int panthor_client_dev_query_perf_rtt(void)
 }
 #endif
 
-static int panthor_client_chr_open(struct inode *inode, struct file *filp)
-{
-	if (!panthor_client)
-		return -ENODEV;
-
-	if (atomic_inc_return(&panthor_client->open_cnt) < 0) {
-		atomic_dec(&panthor_client->open_cnt);
-		return -EMFILE;
-	}
-
-	filp->private_data = panthor_client;
-	return 0;
-}
-
-static int panthor_client_chr_release(struct inode *inode, struct file *filp)
-{
-	struct panthor_client_device *pcdev = filp->private_data;
-
-	if (pcdev)
-		atomic_dec(&pcdev->open_cnt);
-	return 0;
-}
-
-static long panthor_client_chr_ioctl(struct file *filp, unsigned int cmd,
-				     unsigned long arg)
-{
-	struct drm_panthor_dev_query args;
-	int ret;
-
-	if (cmd != DRM_IOCTL_PANTHOR_DEV_QUERY)
-		return -ENOTTY;
-
-	if (copy_from_user(&args, (void __user *)arg, sizeof(args)))
-		return -EFAULT;
-
-	ret = panthor_client_dev_query(&args);
-	if (ret)
-		return ret;
-
-	if (copy_to_user((void __user *)arg, &args, sizeof(args)))
-		return -EFAULT;
-
-	return 0;
-}
-
-static const struct file_operations panthor_client_chr_fops = {
-	.owner = THIS_MODULE,
-	.open = panthor_client_chr_open,
-	.release = panthor_client_chr_release,
-	.unlocked_ioctl = panthor_client_chr_ioctl,
-	.compat_ioctl = panthor_client_chr_ioctl,
-	.llseek = noop_llseek,
-};
-
-static void panthor_client_chrdev_unregister(struct panthor_client_device *pcdev)
-{
-	if (!pcdev)
-		return;
-
-	if (pcdev->chardev && !IS_ERR(pcdev->chardev))
-		device_destroy(pcdev->class, pcdev->devt);
-	pcdev->chardev = NULL;
-
-	if (pcdev->class && !IS_ERR(pcdev->class))
-		class_destroy(pcdev->class);
-	pcdev->class = NULL;
-
-	if (pcdev->devt) {
-		cdev_del(&pcdev->cdev);
-		unregister_chrdev_region(pcdev->devt, 1);
-		pcdev->devt = 0;
-	}
-}
-
-static int panthor_client_chrdev_register(struct panthor_client_device *pcdev)
-{
-	struct device *parent = &pcdev->platform->dev;
-	int ret;
-
-	ret = alloc_chrdev_region(&pcdev->devt, 0, 1, DRIVER_NAME);
-	if (ret)
-		return ret;
-
-	cdev_init(&pcdev->cdev, &panthor_client_chr_fops);
-	pcdev->cdev.owner = THIS_MODULE;
-	ret = cdev_add(&pcdev->cdev, pcdev->devt, 1);
-	if (ret)
-		goto err_unregister_chrdev;
-
-	pcdev->class = class_create(PLATFORM_NAME);
-	if (IS_ERR(pcdev->class)) {
-		ret = PTR_ERR(pcdev->class);
-		pcdev->class = NULL;
-		goto err_cdev_del;
-	}
-
-	pcdev->chardev = device_create(pcdev->class, parent, pcdev->devt,
-				       NULL, DRIVER_NAME);
-	if (IS_ERR(pcdev->chardev)) {
-		ret = PTR_ERR(pcdev->chardev);
-		pcdev->chardev = NULL;
-		goto err_class_destroy;
-	}
-
-	return 0;
-
-err_class_destroy:
-	class_destroy(pcdev->class);
-	pcdev->class = NULL;
-err_cdev_del:
-	cdev_del(&pcdev->cdev);
-err_unregister_chrdev:
-	unregister_chrdev_region(pcdev->devt, 1);
-	pcdev->devt = 0;
-	return ret;
-}
-
 static int __init panthor_client_init(void)
 {
 	struct platform_device *pdev;
@@ -436,15 +537,10 @@ static int __init panthor_client_init(void)
 	}
 
 	panthor_client->platform = pdev;
-	atomic_set(&panthor_client->open_cnt, 0);
 
 	ret = drm_dev_register(&panthor_client->drm, 0);
 	if (ret)
 		goto err_release_devres;
-
-	ret = panthor_client_chrdev_register(panthor_client);
-	if (ret)
-		goto err_unregister_drm;
 
 	ret = panthor_client_dev_query_selftest_run();
 	if (ret)
@@ -454,12 +550,9 @@ static int __init panthor_client_init(void)
 	if (ret)
 		pr_warn("panthor-client: DEV_QUERY perf selftest failed (%d)\n", ret);
 
-	pr_info("panthor-client: registered DRM frontend and /dev/%s\n",
-		DRIVER_NAME);
+	pr_info("panthor-client: registered DRM frontend\n");
 	return 0;
 
-err_unregister_drm:
-	drm_dev_unregister(&panthor_client->drm);
 err_release_devres:
 	devres_release_group(&pdev->dev, NULL);
 err_unregister_platform:
@@ -475,7 +568,6 @@ static void __exit panthor_client_exit(void)
 		return;
 
 	pdev = panthor_client->platform;
-	panthor_client_chrdev_unregister(panthor_client);
 	drm_dev_unregister(&panthor_client->drm);
 	devres_release_group(&pdev->dev, NULL);
 	platform_device_unregister(pdev);

@@ -33,6 +33,10 @@
 static DEFINE_MUTEX(panthor_vmshm_lock);
 static struct panthor_device *panthor_vmshm_ptdev;
 
+struct panthor_vmshm_session {
+	struct panthor_file *pfile;
+};
+
 /**
  * DOC: user <-> kernel object copy helpers.
  */
@@ -881,6 +885,144 @@ out_put:
 	return 0;
 }
 EXPORT_SYMBOL_GPL(panthor_vmshm_dev_query);
+
+int panthor_vmshm_session_open(struct panthor_vmshm_session **session)
+{
+	struct panthor_vmshm_session *vmshm_session;
+	struct panthor_device *ptdev;
+	struct panthor_file *pfile;
+	int ret;
+
+	if (!session)
+		return -EINVAL;
+
+	*session = NULL;
+
+	mutex_lock(&panthor_vmshm_lock);
+	ptdev = panthor_vmshm_ptdev;
+	if (ptdev)
+		drm_dev_get(&ptdev->base);
+	mutex_unlock(&panthor_vmshm_lock);
+
+	if (!ptdev)
+		return -ENODEV;
+
+	if (!try_module_get(THIS_MODULE)) {
+		ret = -EINVAL;
+		goto err_put_dev;
+	}
+
+	vmshm_session = kzalloc(sizeof(*vmshm_session), GFP_KERNEL);
+	if (!vmshm_session) {
+		ret = -ENOMEM;
+		goto err_put_module;
+	}
+
+	pfile = kzalloc(sizeof(*pfile), GFP_KERNEL);
+	if (!pfile) {
+		ret = -ENOMEM;
+		goto err_free_session;
+	}
+
+	pfile->ptdev = ptdev;
+
+	ret = panthor_vm_pool_create(pfile);
+	if (ret)
+		goto err_free_file;
+
+	ret = panthor_group_pool_create(pfile);
+	if (ret)
+		goto err_destroy_vm_pool;
+
+	vmshm_session->pfile = pfile;
+	*session = vmshm_session;
+	return 0;
+
+err_destroy_vm_pool:
+	panthor_vm_pool_destroy(pfile);
+
+err_free_file:
+	kfree(pfile);
+
+err_free_session:
+	kfree(vmshm_session);
+
+err_put_module:
+	module_put(THIS_MODULE);
+
+err_put_dev:
+	drm_dev_put(&ptdev->base);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(panthor_vmshm_session_open);
+
+void panthor_vmshm_session_close(struct panthor_vmshm_session *session)
+{
+	struct panthor_device *ptdev;
+	struct panthor_file *pfile;
+
+	if (!session)
+		return;
+
+	pfile = session->pfile;
+	if (!pfile) {
+		kfree(session);
+		return;
+	}
+
+		ptdev = pfile->ptdev;
+	panthor_group_pool_destroy(pfile);
+	panthor_vm_pool_destroy(pfile);
+	kfree(pfile);
+	kfree(session);
+	drm_dev_put(&ptdev->base);
+	module_put(THIS_MODULE);
+}
+EXPORT_SYMBOL_GPL(panthor_vmshm_session_close);
+
+int panthor_vmshm_vm_create(struct panthor_vmshm_session *session,
+			    struct drm_panthor_vm_create *args)
+{
+	struct panthor_file *pfile;
+	int cookie, ret;
+
+	if (!session || !session->pfile || !args)
+		return -EINVAL;
+
+	pfile = session->pfile;
+	if (!drm_dev_enter(&pfile->ptdev->base, &cookie))
+		return -ENODEV;
+
+	ret = panthor_vm_pool_create_vm(pfile->ptdev, pfile->vms, args);
+	if (ret >= 0) {
+		args->id = ret;
+		ret = 0;
+	}
+
+	drm_dev_exit(cookie);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(panthor_vmshm_vm_create);
+
+int panthor_vmshm_vm_destroy(struct panthor_vmshm_session *session,
+			     __u32 vm_id)
+{
+	struct panthor_file *pfile;
+	int cookie, ret;
+
+	if (!session || !session->pfile)
+		return -EINVAL;
+
+	pfile = session->pfile;
+	if (!drm_dev_enter(&pfile->ptdev->base, &cookie))
+		return -ENODEV;
+
+	ret = panthor_vm_pool_destroy_vm(pfile->vms, vm_id);
+
+	drm_dev_exit(cookie);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(panthor_vmshm_vm_destroy);
 
 #define PANTHOR_VM_CREATE_FLAGS 0
 
