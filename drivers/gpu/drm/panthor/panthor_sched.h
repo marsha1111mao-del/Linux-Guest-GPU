@@ -18,6 +18,23 @@ struct panthor_file;
 struct panthor_group_pool;
 struct panthor_job;
 
+struct panthor_sched_run_job_stats {
+	u64 calls;
+	u64 total_ns;
+	u64 max_ns;
+	u64 pm_resume_ns;
+	u64 lock_wait_ns;
+	u64 init_fence_ns;
+	u64 ringbuf_write_ns;
+	u64 inflight_add_ns;
+	u64 iface_update_ns;
+	u64 schedule_or_doorbell_ns;
+	u64 last_fence_ns;
+	u64 pm_put_ns;
+	u64 errors;
+	u64 zero_size_jobs;
+};
+
 int panthor_group_create(struct panthor_file *pfile,
 			 const struct drm_panthor_group_create *group_args,
 			 const struct drm_panthor_queue_create *queue_args);
@@ -46,5 +63,9 @@ void panthor_sched_resume(struct panthor_device *ptdev);
 
 void panthor_sched_report_mmu_fault(struct panthor_device *ptdev);
 void panthor_sched_report_fw_events(struct panthor_device *ptdev, u32 events);
+
+bool panthor_submit_stats_is_enabled(void);
+void panthor_submit_stats_record_run_job(
+	const struct panthor_sched_run_job_stats *sample);
 
 #endif

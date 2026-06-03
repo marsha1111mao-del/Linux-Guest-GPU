@@ -24,6 +24,10 @@
 #include <linux/kthread.h>
 #include <linux/slab.h>
 #include <linux/completion.h>
+#include <linux/kstrtox.h>
+#include <linux/ktime.h>
+#include <linux/math64.h>
+#include <linux/module.h>
 
 #include <drm/drm_print.h>
 #include <drm/gpu_scheduler.h>
@@ -32,6 +36,113 @@
 
 #define to_drm_sched_job(sched_job)		\
 		container_of((sched_job), struct drm_sched_job, queue_node)
+
+static bool drm_sched_push_stats_enabled;
+static DEFINE_SPINLOCK(drm_sched_push_stats_lock);
+
+struct drm_sched_push_stats {
+	u64 calls;
+	u64 total_ns;
+	u64 max_ns;
+	u64 trace_ns;
+	u64 score_ns;
+	u64 last_user_ns;
+	u64 submit_ts_ns;
+	u64 spsc_push_ns;
+	u64 first_jobs;
+	u64 rq_lock_ns;
+	u64 rq_add_ns;
+	u64 fifo_update_ns;
+	u64 wakeup_ns;
+	u64 stopped;
+};
+
+static struct drm_sched_push_stats drm_sched_push_stats_data;
+
+static int drm_sched_push_stats_set(const char *val,
+				    const struct kernel_param *kp)
+{
+	struct drm_sched_push_stats snapshot;
+	bool enabled, dump = false;
+	unsigned long flags;
+	u64 avg_ns = 0;
+	int ret;
+
+	ret = kstrtobool(val, &enabled);
+	if (ret)
+		return ret;
+
+	spin_lock_irqsave(&drm_sched_push_stats_lock, flags);
+	if (enabled && !drm_sched_push_stats_enabled) {
+		memset(&drm_sched_push_stats_data, 0,
+		       sizeof(drm_sched_push_stats_data));
+	} else if (!enabled && drm_sched_push_stats_enabled) {
+		snapshot = drm_sched_push_stats_data;
+		dump = true;
+	}
+	WRITE_ONCE(drm_sched_push_stats_enabled, enabled);
+	spin_unlock_irqrestore(&drm_sched_push_stats_lock, flags);
+
+	if (dump) {
+		if (snapshot.calls)
+			avg_ns = div64_u64(snapshot.total_ns, snapshot.calls);
+
+		pr_info("drm_sched: [MZH][DRM_SCHED_PUSH_STATS] calls=%llu avg_ns=%llu max_ns=%llu trace_ns=%llu score_ns=%llu last_user_ns=%llu submit_ts_ns=%llu spsc_push_ns=%llu first_jobs=%llu rq_lock_ns=%llu rq_add_ns=%llu fifo_update_ns=%llu wakeup_ns=%llu stopped=%llu\n",
+			snapshot.calls, avg_ns, snapshot.max_ns,
+			snapshot.trace_ns, snapshot.score_ns,
+			snapshot.last_user_ns, snapshot.submit_ts_ns,
+			snapshot.spsc_push_ns, snapshot.first_jobs,
+			snapshot.rq_lock_ns, snapshot.rq_add_ns,
+			snapshot.fifo_update_ns, snapshot.wakeup_ns,
+			snapshot.stopped);
+	}
+
+	return 0;
+}
+
+static const struct kernel_param_ops drm_sched_push_stats_param_ops = {
+	.set = drm_sched_push_stats_set,
+	.get = param_get_bool,
+};
+
+module_param_cb(push_stats, &drm_sched_push_stats_param_ops,
+		&drm_sched_push_stats_enabled, 0644);
+MODULE_PARM_DESC(push_stats,
+		 "Collect DRM scheduler entity push aggregate timing stats");
+
+static inline void drm_sched_push_stats_accum(u64 *field, u64 start_ns)
+{
+	if (start_ns)
+		*field += ktime_get_ns() - start_ns;
+}
+
+static void
+drm_sched_push_stats_commit(const struct drm_sched_push_stats *sample)
+{
+	struct drm_sched_push_stats *stats = &drm_sched_push_stats_data;
+	unsigned long flags;
+
+	if (!sample->calls || !READ_ONCE(drm_sched_push_stats_enabled))
+		return;
+
+	spin_lock_irqsave(&drm_sched_push_stats_lock, flags);
+	stats->calls += sample->calls;
+	stats->total_ns += sample->total_ns;
+	if (sample->max_ns > stats->max_ns)
+		stats->max_ns = sample->max_ns;
+	stats->trace_ns += sample->trace_ns;
+	stats->score_ns += sample->score_ns;
+	stats->last_user_ns += sample->last_user_ns;
+	stats->submit_ts_ns += sample->submit_ts_ns;
+	stats->spsc_push_ns += sample->spsc_push_ns;
+	stats->first_jobs += sample->first_jobs;
+	stats->rq_lock_ns += sample->rq_lock_ns;
+	stats->rq_add_ns += sample->rq_add_ns;
+	stats->fifo_update_ns += sample->fifo_update_ns;
+	stats->wakeup_ns += sample->wakeup_ns;
+	stats->stopped += sample->stopped;
+	spin_unlock_irqrestore(&drm_sched_push_stats_lock, flags);
+}
 
 /**
  * drm_sched_entity_init - Init a context entity used by scheduler when
@@ -579,11 +690,95 @@ void drm_sched_entity_select_rq(struct drm_sched_entity *entity)
  *
  * Returns 0 for success, negative error code otherwise.
  */
+static void drm_sched_entity_push_job_stats(struct drm_sched_job *sched_job)
+{
+	struct drm_sched_entity *entity = sched_job->entity;
+	struct drm_sched_push_stats stats = { };
+	bool first;
+	ktime_t submit_ts;
+	u64 stats_start = ktime_get_ns();
+	u64 stats_phase_start;
+
+	stats_phase_start = ktime_get_ns();
+	trace_drm_sched_job(sched_job, entity);
+	drm_sched_push_stats_accum(&stats.trace_ns, stats_phase_start);
+	stats_phase_start = ktime_get_ns();
+	atomic_inc(entity->rq->sched->score);
+	drm_sched_push_stats_accum(&stats.score_ns, stats_phase_start);
+	stats_phase_start = ktime_get_ns();
+	WRITE_ONCE(entity->last_user, current->group_leader);
+	drm_sched_push_stats_accum(&stats.last_user_ns, stats_phase_start);
+
+	/*
+	 * After the sched_job is pushed into the entity queue, it may be
+	 * completed and freed up at any time. We can no longer access it.
+	 * Make sure to set the submit_ts first, to avoid a race.
+	 */
+	stats_phase_start = ktime_get_ns();
+	sched_job->submit_ts = submit_ts = ktime_get();
+	drm_sched_push_stats_accum(&stats.submit_ts_ns, stats_phase_start);
+	stats_phase_start = ktime_get_ns();
+	first = spsc_queue_push(&entity->job_queue, &sched_job->queue_node);
+	drm_sched_push_stats_accum(&stats.spsc_push_ns, stats_phase_start);
+
+	/* first job wakes up scheduler */
+	if (first) {
+		struct drm_gpu_scheduler *sched;
+		struct drm_sched_rq *rq;
+
+		/* Add the entity to the run queue */
+		stats.first_jobs = 1;
+		stats_phase_start = ktime_get_ns();
+		spin_lock(&entity->rq_lock);
+		drm_sched_push_stats_accum(&stats.rq_lock_ns,
+					   stats_phase_start);
+		if (entity->stopped) {
+			spin_unlock(&entity->rq_lock);
+
+			DRM_ERROR("Trying to push to a killed entity\n");
+			stats.stopped = 1;
+			goto out_stats;
+		}
+
+		rq = entity->rq;
+		sched = rq->sched;
+
+		stats_phase_start = ktime_get_ns();
+		drm_sched_rq_add_entity(rq, entity);
+		drm_sched_push_stats_accum(&stats.rq_add_ns,
+					   stats_phase_start);
+		spin_unlock(&entity->rq_lock);
+
+		if (drm_sched_policy == DRM_SCHED_POLICY_FIFO) {
+			stats_phase_start = ktime_get_ns();
+			drm_sched_rq_update_fifo(entity, submit_ts);
+			drm_sched_push_stats_accum(&stats.fifo_update_ns,
+						   stats_phase_start);
+		}
+
+		stats_phase_start = ktime_get_ns();
+		drm_sched_wakeup(sched);
+		drm_sched_push_stats_accum(&stats.wakeup_ns,
+					   stats_phase_start);
+	}
+
+out_stats:
+	stats.calls = 1;
+	stats.total_ns = ktime_get_ns() - stats_start;
+	stats.max_ns = stats.total_ns;
+	drm_sched_push_stats_commit(&stats);
+}
+
 void drm_sched_entity_push_job(struct drm_sched_job *sched_job)
 {
 	struct drm_sched_entity *entity = sched_job->entity;
 	bool first;
 	ktime_t submit_ts;
+
+	if (unlikely(READ_ONCE(drm_sched_push_stats_enabled))) {
+		drm_sched_entity_push_job_stats(sched_job);
+		return;
+	}
 
 	trace_drm_sched_job(sched_job, entity);
 	atomic_inc(entity->rq->sched->score);

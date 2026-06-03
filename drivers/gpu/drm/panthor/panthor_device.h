@@ -7,6 +7,7 @@
 #define __PANTHOR_DEVICE_H__
 
 #include <linux/atomic.h>
+#include <linux/interrupt.h>
 #include <linux/io-pgtable.h>
 #include <linux/regulator/consumer.h>
 #include <linux/sched.h>
@@ -65,6 +66,24 @@ struct panthor_irq {
 	/** @suspended: Set to true when the IRQ is suspended. */
 	atomic_t suspended;
 };
+
+u64 panthor_job_irq_stats_raw_begin(void);
+void panthor_job_irq_stats_raw_end(u64 start_ns, bool wake_thread);
+u64 panthor_job_irq_stats_thread_begin(void);
+void panthor_job_irq_stats_thread_loop(u32 status);
+void panthor_job_irq_stats_thread_end(u64 start_ns, irqreturn_t ret);
+
+static inline u64 panthor_mmu_irq_stats_raw_begin(void) { return 0; }
+static inline void panthor_mmu_irq_stats_raw_end(u64 start_ns, bool wake_thread) { }
+static inline u64 panthor_mmu_irq_stats_thread_begin(void) { return 0; }
+static inline void panthor_mmu_irq_stats_thread_loop(u32 status) { }
+static inline void panthor_mmu_irq_stats_thread_end(u64 start_ns, irqreturn_t ret) { }
+
+static inline u64 panthor_gpu_irq_stats_raw_begin(void) { return 0; }
+static inline void panthor_gpu_irq_stats_raw_end(u64 start_ns, bool wake_thread) { }
+static inline u64 panthor_gpu_irq_stats_thread_begin(void) { return 0; }
+static inline void panthor_gpu_irq_stats_thread_loop(u32 status) { }
+static inline void panthor_gpu_irq_stats_thread_end(u64 start_ns, irqreturn_t ret) { }
 
 /**
  * struct panthor_device - Panthor device
@@ -288,13 +307,19 @@ static irqreturn_t panthor_ ## __name ## _irq_raw_handler(int irq, void *data)		
 {												\
 	struct panthor_irq *pirq = data;							\
 	struct panthor_device *ptdev = pirq->ptdev;						\
+	u64 __stats_start = panthor_ ## __name ## _irq_stats_raw_begin();			\
 												\
-	if (atomic_read(&pirq->suspended))							\
+	if (atomic_read(&pirq->suspended)) {							\
+		panthor_ ## __name ## _irq_stats_raw_end(__stats_start, false);		\
 		return IRQ_NONE;								\
-	if (!gpu_read(ptdev, __reg_prefix ## _INT_STAT))					\
+	}											\
+	if (!gpu_read(ptdev, __reg_prefix ## _INT_STAT)) {					\
+		panthor_ ## __name ## _irq_stats_raw_end(__stats_start, false);		\
 		return IRQ_NONE;								\
+	}											\
 												\
 	gpu_write(ptdev, __reg_prefix ## _INT_MASK, 0);						\
+	panthor_ ## __name ## _irq_stats_raw_end(__stats_start, true);			\
 	return IRQ_WAKE_THREAD;									\
 }												\
 												\
@@ -303,6 +328,7 @@ static irqreturn_t panthor_ ## __name ## _irq_threaded_handler(int irq, void *da
 	struct panthor_irq *pirq = data;							\
 	struct panthor_device *ptdev = pirq->ptdev;						\
 	irqreturn_t ret = IRQ_NONE;								\
+	u64 __stats_start = panthor_ ## __name ## _irq_stats_thread_begin();		\
 												\
 	while (true) {										\
 		u32 status = gpu_read(ptdev, __reg_prefix ## _INT_RAWSTAT) & pirq->mask;	\
@@ -310,6 +336,7 @@ static irqreturn_t panthor_ ## __name ## _irq_threaded_handler(int irq, void *da
 		if (!status)									\
 			break;									\
 		gpu_write(ptdev, __reg_prefix ## _INT_CLEAR, status);				\
+		panthor_ ## __name ## _irq_stats_thread_loop(status);			\
 												\
 		__handler(ptdev, status);							\
 		ret = IRQ_HANDLED;								\
@@ -318,6 +345,7 @@ static irqreturn_t panthor_ ## __name ## _irq_threaded_handler(int irq, void *da
 	if (!atomic_read(&pirq->suspended))							\
 		gpu_write(ptdev, __reg_prefix ## _INT_MASK, pirq->mask);			\
 												\
+	panthor_ ## __name ## _irq_stats_thread_end(__stats_start, ret);		\
 	return ret;										\
 }												\
 												\

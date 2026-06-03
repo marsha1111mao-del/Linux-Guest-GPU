@@ -76,6 +76,10 @@
 #include <linux/sched.h>
 #include <linux/completion.h>
 #include <linux/dma-resv.h>
+#include <linux/kstrtox.h>
+#include <linux/ktime.h>
+#include <linux/math64.h>
+#include <linux/module.h>
 #include <uapi/linux/sched/types.h>
 
 #include <drm/drm_print.h>
@@ -98,12 +102,153 @@ static struct lockdep_map drm_sched_lockdep_map = {
 
 int drm_sched_policy = DRM_SCHED_POLICY_FIFO;
 
+static bool drm_sched_run_job_stats_enabled;
+static DEFINE_SPINLOCK(drm_sched_run_job_stats_lock);
+
+struct drm_sched_run_job_stats {
+	u64 calls;
+	u64 jobs;
+	u64 total_ns;
+	u64 max_ns;
+	u64 queued_to_start_samples;
+	u64 queued_to_start_ns;
+	u64 queued_to_start_max_ns;
+	u64 pause_return;
+	u64 select_entity_ns;
+	u64 no_entity;
+	u64 pop_job_ns;
+	u64 no_job;
+	u64 begin_ns;
+	u64 trace_ns;
+	u64 run_job_ns;
+	u64 complete_idle_ns;
+	u64 fence_scheduled_ns;
+	u64 fence_put_ns;
+	u64 add_cb_ns;
+	u64 job_done_direct_ns;
+	u64 wake_up_ns;
+	u64 requeue_ns;
+	u64 err_fence;
+	u64 cb_enoent;
+	u64 cb_errors;
+};
+
+static struct drm_sched_run_job_stats drm_sched_run_job_stats_data;
+
 /**
  * DOC: sched_policy (int)
  * Used to override default entities scheduling policy in a run queue.
  */
 MODULE_PARM_DESC(sched_policy, "Specify the scheduling policy for entities on a run-queue, " __stringify(DRM_SCHED_POLICY_RR) " = Round Robin, " __stringify(DRM_SCHED_POLICY_FIFO) " = FIFO (default).");
 module_param_named(sched_policy, drm_sched_policy, int, 0444);
+
+static int drm_sched_run_job_stats_set(const char *val,
+				       const struct kernel_param *kp)
+{
+	struct drm_sched_run_job_stats snapshot;
+	bool enabled, dump = false;
+	unsigned long flags;
+	u64 avg_ns = 0, queued_to_start_avg_ns = 0;
+	int ret;
+
+	ret = kstrtobool(val, &enabled);
+	if (ret)
+		return ret;
+
+	spin_lock_irqsave(&drm_sched_run_job_stats_lock, flags);
+	if (enabled && !drm_sched_run_job_stats_enabled) {
+		memset(&drm_sched_run_job_stats_data, 0,
+		       sizeof(drm_sched_run_job_stats_data));
+	} else if (!enabled && drm_sched_run_job_stats_enabled) {
+		snapshot = drm_sched_run_job_stats_data;
+		dump = true;
+	}
+	WRITE_ONCE(drm_sched_run_job_stats_enabled, enabled);
+	spin_unlock_irqrestore(&drm_sched_run_job_stats_lock, flags);
+
+	if (dump) {
+		if (snapshot.calls)
+			avg_ns = div64_u64(snapshot.total_ns, snapshot.calls);
+		if (snapshot.queued_to_start_samples)
+			queued_to_start_avg_ns =
+				div64_u64(snapshot.queued_to_start_ns,
+					  snapshot.queued_to_start_samples);
+
+		pr_info("drm_sched: [MZH][DRM_SCHED_RUN_JOB_STATS] calls=%llu jobs=%llu avg_ns=%llu max_ns=%llu queued_to_start_samples=%llu queued_to_start_avg_ns=%llu queued_to_start_max_ns=%llu queued_to_start_ns=%llu pause_return=%llu select_entity_ns=%llu no_entity=%llu pop_job_ns=%llu no_job=%llu begin_ns=%llu trace_ns=%llu run_job_ns=%llu complete_idle_ns=%llu fence_scheduled_ns=%llu fence_put_ns=%llu add_cb_ns=%llu job_done_direct_ns=%llu wake_up_ns=%llu requeue_ns=%llu err_fence=%llu cb_enoent=%llu cb_errors=%llu\n",
+			snapshot.calls, snapshot.jobs, avg_ns,
+			snapshot.max_ns, snapshot.queued_to_start_samples,
+			queued_to_start_avg_ns,
+			snapshot.queued_to_start_max_ns,
+			snapshot.queued_to_start_ns, snapshot.pause_return,
+			snapshot.select_entity_ns, snapshot.no_entity,
+			snapshot.pop_job_ns, snapshot.no_job,
+			snapshot.begin_ns, snapshot.trace_ns,
+			snapshot.run_job_ns, snapshot.complete_idle_ns,
+			snapshot.fence_scheduled_ns, snapshot.fence_put_ns,
+			snapshot.add_cb_ns, snapshot.job_done_direct_ns,
+			snapshot.wake_up_ns, snapshot.requeue_ns,
+			snapshot.err_fence, snapshot.cb_enoent,
+			snapshot.cb_errors);
+	}
+
+	return 0;
+}
+
+static const struct kernel_param_ops drm_sched_run_job_stats_param_ops = {
+	.set = drm_sched_run_job_stats_set,
+	.get = param_get_bool,
+};
+
+module_param_cb(run_job_stats, &drm_sched_run_job_stats_param_ops,
+		&drm_sched_run_job_stats_enabled, 0644);
+MODULE_PARM_DESC(run_job_stats,
+		 "Collect DRM scheduler run-job worker aggregate timing stats");
+
+static inline void drm_sched_run_job_stats_accum(u64 *field, u64 start_ns)
+{
+	if (start_ns)
+		*field += ktime_get_ns() - start_ns;
+}
+
+static void
+drm_sched_run_job_stats_commit(const struct drm_sched_run_job_stats *sample)
+{
+	struct drm_sched_run_job_stats *stats = &drm_sched_run_job_stats_data;
+	unsigned long flags;
+
+	if (!sample->calls || !READ_ONCE(drm_sched_run_job_stats_enabled))
+		return;
+
+	spin_lock_irqsave(&drm_sched_run_job_stats_lock, flags);
+	stats->calls += sample->calls;
+	stats->jobs += sample->jobs;
+	stats->total_ns += sample->total_ns;
+	if (sample->max_ns > stats->max_ns)
+		stats->max_ns = sample->max_ns;
+	stats->queued_to_start_samples += sample->queued_to_start_samples;
+	stats->queued_to_start_ns += sample->queued_to_start_ns;
+	if (sample->queued_to_start_max_ns > stats->queued_to_start_max_ns)
+		stats->queued_to_start_max_ns = sample->queued_to_start_max_ns;
+	stats->pause_return += sample->pause_return;
+	stats->select_entity_ns += sample->select_entity_ns;
+	stats->no_entity += sample->no_entity;
+	stats->pop_job_ns += sample->pop_job_ns;
+	stats->no_job += sample->no_job;
+	stats->begin_ns += sample->begin_ns;
+	stats->trace_ns += sample->trace_ns;
+	stats->run_job_ns += sample->run_job_ns;
+	stats->complete_idle_ns += sample->complete_idle_ns;
+	stats->fence_scheduled_ns += sample->fence_scheduled_ns;
+	stats->fence_put_ns += sample->fence_put_ns;
+	stats->add_cb_ns += sample->add_cb_ns;
+	stats->job_done_direct_ns += sample->job_done_direct_ns;
+	stats->wake_up_ns += sample->wake_up_ns;
+	stats->requeue_ns += sample->requeue_ns;
+	stats->err_fence += sample->err_fence;
+	stats->cb_enoent += sample->cb_enoent;
+	stats->cb_errors += sample->cb_errors;
+	spin_unlock_irqrestore(&drm_sched_run_job_stats_lock, flags);
+}
 
 static u32 drm_sched_available_credits(struct drm_gpu_scheduler *sched)
 {
@@ -371,8 +516,11 @@ drm_sched_rq_select_entity_fifo(struct drm_gpu_scheduler *sched,
  */
 static void drm_sched_run_job_queue(struct drm_gpu_scheduler *sched)
 {
-	if (!READ_ONCE(sched->pause_submit))
+	if (!READ_ONCE(sched->pause_submit)) {
+		if (unlikely(READ_ONCE(drm_sched_run_job_stats_enabled)))
+			WRITE_ONCE(sched->run_job_queue_ts_ns, ktime_get_ns());
 		queue_work(sched->submit_wq, &sched->work_run_job);
+	}
 }
 
 /**
@@ -1160,6 +1308,133 @@ static void drm_sched_free_job_work(struct work_struct *w)
 	drm_sched_run_job_queue(sched);
 }
 
+static void drm_sched_run_job_work_stats(struct drm_gpu_scheduler *sched)
+{
+	struct drm_sched_run_job_stats stats = { };
+	struct drm_sched_entity *entity;
+	struct dma_fence *fence;
+	struct drm_sched_fence *s_fence;
+	struct drm_sched_job *sched_job;
+	u64 stats_start = ktime_get_ns();
+	u64 stats_phase_start;
+	u64 queue_ts;
+	u64 queued_to_start_ns;
+	int r;
+
+	queue_ts = READ_ONCE(sched->run_job_queue_ts_ns);
+	if (queue_ts && stats_start >= queue_ts) {
+		queued_to_start_ns = stats_start - queue_ts;
+		stats.queued_to_start_samples = 1;
+		stats.queued_to_start_ns = queued_to_start_ns;
+		stats.queued_to_start_max_ns = queued_to_start_ns;
+	}
+
+	if (READ_ONCE(sched->pause_submit)) {
+		stats.pause_return = 1;
+		goto out_stats;
+	}
+
+	/* Find entity with a ready job */
+	stats_phase_start = ktime_get_ns();
+	entity = drm_sched_select_entity(sched);
+	drm_sched_run_job_stats_accum(&stats.select_entity_ns,
+				      stats_phase_start);
+	if (!entity) {
+		stats.no_entity = 1;
+		goto out_stats;	/* No more work */
+	}
+
+	stats_phase_start = ktime_get_ns();
+	sched_job = drm_sched_entity_pop_job(entity);
+	drm_sched_run_job_stats_accum(&stats.pop_job_ns, stats_phase_start);
+	if (!sched_job) {
+		stats.no_job = 1;
+
+		stats_phase_start = ktime_get_ns();
+		complete_all(&entity->entity_idle);
+		drm_sched_run_job_stats_accum(&stats.complete_idle_ns,
+					      stats_phase_start);
+
+		stats_phase_start = ktime_get_ns();
+		drm_sched_run_job_queue(sched);
+		drm_sched_run_job_stats_accum(&stats.requeue_ns,
+					      stats_phase_start);
+		goto out_stats;
+	}
+
+	stats.jobs = 1;
+	s_fence = sched_job->s_fence;
+
+	stats_phase_start = ktime_get_ns();
+	atomic_add(sched_job->credits, &sched->credit_count);
+	drm_sched_job_begin(sched_job);
+	drm_sched_run_job_stats_accum(&stats.begin_ns, stats_phase_start);
+
+	stats_phase_start = ktime_get_ns();
+	trace_drm_run_job(sched_job, entity);
+	drm_sched_run_job_stats_accum(&stats.trace_ns, stats_phase_start);
+
+	stats_phase_start = ktime_get_ns();
+	fence = sched->ops->run_job(sched_job);
+	drm_sched_run_job_stats_accum(&stats.run_job_ns, stats_phase_start);
+
+	stats_phase_start = ktime_get_ns();
+	complete_all(&entity->entity_idle);
+	drm_sched_run_job_stats_accum(&stats.complete_idle_ns,
+				      stats_phase_start);
+
+	stats_phase_start = ktime_get_ns();
+	drm_sched_fence_scheduled(s_fence, fence);
+	drm_sched_run_job_stats_accum(&stats.fence_scheduled_ns,
+				      stats_phase_start);
+
+	if (!IS_ERR_OR_NULL(fence)) {
+		/* Drop for original kref_init of the fence */
+		stats_phase_start = ktime_get_ns();
+		dma_fence_put(fence);
+		drm_sched_run_job_stats_accum(&stats.fence_put_ns,
+					      stats_phase_start);
+
+		stats_phase_start = ktime_get_ns();
+		r = dma_fence_add_callback(fence, &sched_job->cb,
+					   drm_sched_job_done_cb);
+		drm_sched_run_job_stats_accum(&stats.add_cb_ns,
+					      stats_phase_start);
+		if (r == -ENOENT) {
+			stats.cb_enoent = 1;
+			stats_phase_start = ktime_get_ns();
+			drm_sched_job_done(sched_job, fence->error);
+			drm_sched_run_job_stats_accum(&stats.job_done_direct_ns,
+						      stats_phase_start);
+		} else if (r) {
+			stats.cb_errors = 1;
+			DRM_DEV_ERROR(sched->dev,
+				      "fence add callback failed (%d)\n", r);
+		}
+	} else {
+		stats.err_fence = 1;
+		stats_phase_start = ktime_get_ns();
+		drm_sched_job_done(sched_job, IS_ERR(fence) ?
+				   PTR_ERR(fence) : 0);
+		drm_sched_run_job_stats_accum(&stats.job_done_direct_ns,
+					      stats_phase_start);
+	}
+
+	stats_phase_start = ktime_get_ns();
+	wake_up(&sched->job_scheduled);
+	drm_sched_run_job_stats_accum(&stats.wake_up_ns, stats_phase_start);
+
+	stats_phase_start = ktime_get_ns();
+	drm_sched_run_job_queue(sched);
+	drm_sched_run_job_stats_accum(&stats.requeue_ns, stats_phase_start);
+
+out_stats:
+	stats.calls = 1;
+	stats.total_ns = ktime_get_ns() - stats_start;
+	stats.max_ns = stats.total_ns;
+	drm_sched_run_job_stats_commit(&stats);
+}
+
 /**
  * drm_sched_run_job_work - worker to call run_job
  *
@@ -1174,6 +1449,11 @@ static void drm_sched_run_job_work(struct work_struct *w)
 	struct drm_sched_fence *s_fence;
 	struct drm_sched_job *sched_job;
 	int r;
+
+	if (unlikely(READ_ONCE(drm_sched_run_job_stats_enabled))) {
+		drm_sched_run_job_work_stats(sched);
+		return;
+	}
 
 	if (READ_ONCE(sched->pause_submit))
 		return;
@@ -1306,6 +1586,7 @@ int drm_sched_init(struct drm_gpu_scheduler *sched,
 	atomic_set(&sched->credit_count, 0);
 	INIT_DELAYED_WORK(&sched->work_tdr, drm_sched_job_timedout);
 	INIT_WORK(&sched->work_run_job, drm_sched_run_job_work);
+	sched->run_job_queue_ts_ns = 0;
 	INIT_WORK(&sched->work_free_job, drm_sched_free_job_work);
 	atomic_set(&sched->_score, 0);
 	atomic64_set(&sched->job_id_count, 0);

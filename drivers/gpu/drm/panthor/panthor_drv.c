@@ -4,6 +4,9 @@
 /* Copyright 2019 Collabora ltd. */
 
 #include <linux/list.h>
+#include <linux/kstrtox.h>
+#include <linux/ktime.h>
+#include <linux/math64.h>
 #include <linux/module.h>
 #include <linux/of_platform.h>
 #include <linux/pagemap.h>
@@ -29,6 +32,458 @@
 #include "panthor_mmu.h"
 #include "panthor_regs.h"
 #include "panthor_sched.h"
+
+struct panthor_job_irq_stats {
+	u64 raw_entries;
+	u64 raw_wake_thread;
+	u64 raw_none;
+	u64 raw_total_ns;
+	u64 raw_max_ns;
+	u64 raw_to_thread_samples;
+	u64 raw_to_thread_total_ns;
+	u64 raw_to_thread_max_ns;
+	u64 thread_entries;
+	u64 thread_handled;
+	u64 thread_none;
+	u64 thread_without_raw;
+	u64 thread_total_ns;
+	u64 thread_max_ns;
+	u64 loop_iterations;
+	u64 last_raw_end_ns;
+	u32 status_or;
+	bool thread_pending;
+};
+
+struct panthor_submit_stats {
+	u64 group_submit_calls;
+	u64 group_submit_jobs;
+	u64 group_submit_total_ns;
+	u64 group_submit_max_ns;
+	u64 group_copy_jobs_ns;
+	u64 group_init_ctx_ns;
+	u64 group_create_jobs_ns;
+	u64 group_collect_signals_ns;
+	u64 group_prepare_resvs_ns;
+	u64 group_arm_jobs_ns;
+	u64 group_push_jobs_ns;
+	u64 group_push_update_resvs_ns;
+	u64 group_push_entity_ns;
+	u64 group_push_fences_ns;
+	u64 group_cleanup_ns;
+	u64 vm_bind_async_calls;
+	u64 vm_bind_sync_calls;
+	u64 vm_bind_ops;
+	u64 vm_bind_total_ns;
+	u64 vm_bind_max_ns;
+	u64 vm_bind_copy_ops_ns;
+	u64 vm_bind_init_ctx_ns;
+	u64 vm_bind_create_jobs_ns;
+	u64 vm_bind_collect_signals_ns;
+	u64 vm_bind_prepare_resvs_ns;
+	u64 vm_bind_arm_jobs_ns;
+	u64 vm_bind_push_jobs_ns;
+	u64 vm_bind_push_update_resvs_ns;
+	u64 vm_bind_push_entity_ns;
+	u64 vm_bind_push_fences_ns;
+	u64 vm_bind_sync_exec_ns;
+	u64 vm_bind_cleanup_ns;
+	u64 run_job_calls;
+	u64 run_job_total_ns;
+	u64 run_job_max_ns;
+	u64 run_job_pm_resume_ns;
+	u64 run_job_lock_wait_ns;
+	u64 run_job_init_fence_ns;
+	u64 run_job_ringbuf_write_ns;
+	u64 run_job_inflight_add_ns;
+	u64 run_job_iface_update_ns;
+	u64 run_job_schedule_or_doorbell_ns;
+	u64 run_job_last_fence_ns;
+	u64 run_job_pm_put_ns;
+	u64 run_job_errors;
+	u64 run_job_zero_size_jobs;
+};
+
+static bool panthor_job_irq_stats_enabled;
+static bool panthor_submit_stats_enabled;
+static DEFINE_SPINLOCK(panthor_job_irq_stats_lock);
+static DEFINE_SPINLOCK(panthor_submit_stats_lock);
+static struct panthor_job_irq_stats panthor_job_irq_stats_data;
+static struct panthor_submit_stats panthor_submit_stats_data;
+
+enum panthor_submit_stats_kind {
+	PANTHOR_SUBMIT_STATS_GROUP_SUBMIT,
+	PANTHOR_SUBMIT_STATS_VM_BIND_ASYNC,
+	PANTHOR_SUBMIT_STATS_VM_BIND_SYNC,
+};
+
+struct panthor_submit_stats_sample {
+	enum panthor_submit_stats_kind kind;
+	u64 start_ns;
+	u64 copy_ns;
+	u64 init_ctx_ns;
+	u64 create_jobs_ns;
+	u64 collect_signals_ns;
+	u64 prepare_resvs_ns;
+	u64 arm_jobs_ns;
+	u64 push_jobs_ns;
+	u64 push_update_resvs_ns;
+	u64 push_entity_ns;
+	u64 push_fences_ns;
+	u64 sync_exec_ns;
+	u64 cleanup_ns;
+	u32 job_or_op_count;
+};
+
+bool panthor_submit_stats_is_enabled(void)
+{
+	return READ_ONCE(panthor_submit_stats_enabled);
+}
+
+static inline u64 panthor_submit_stats_now(bool enabled)
+{
+	if (!enabled)
+		return 0;
+
+	return ktime_get_ns();
+}
+
+static inline void panthor_submit_stats_accum(u64 *field, u64 start_ns)
+{
+	if (start_ns)
+		*field += ktime_get_ns() - start_ns;
+}
+
+void panthor_submit_stats_record_run_job(
+	const struct panthor_sched_run_job_stats *sample)
+{
+	struct panthor_submit_stats *stats = &panthor_submit_stats_data;
+	unsigned long flags;
+
+	if (!sample || !sample->calls || !panthor_submit_stats_is_enabled())
+		return;
+
+	spin_lock_irqsave(&panthor_submit_stats_lock, flags);
+	stats->run_job_calls += sample->calls;
+	stats->run_job_total_ns += sample->total_ns;
+	if (sample->max_ns > stats->run_job_max_ns)
+		stats->run_job_max_ns = sample->max_ns;
+	stats->run_job_pm_resume_ns += sample->pm_resume_ns;
+	stats->run_job_lock_wait_ns += sample->lock_wait_ns;
+	stats->run_job_init_fence_ns += sample->init_fence_ns;
+	stats->run_job_ringbuf_write_ns += sample->ringbuf_write_ns;
+	stats->run_job_inflight_add_ns += sample->inflight_add_ns;
+	stats->run_job_iface_update_ns += sample->iface_update_ns;
+	stats->run_job_schedule_or_doorbell_ns +=
+		sample->schedule_or_doorbell_ns;
+	stats->run_job_last_fence_ns += sample->last_fence_ns;
+	stats->run_job_pm_put_ns += sample->pm_put_ns;
+	stats->run_job_errors += sample->errors;
+	stats->run_job_zero_size_jobs += sample->zero_size_jobs;
+	spin_unlock_irqrestore(&panthor_submit_stats_lock, flags);
+}
+
+static void
+panthor_submit_stats_dump_snapshot(const struct panthor_submit_stats *stats)
+{
+	u64 group_avg_ns = 0, vm_bind_avg_ns = 0;
+	u64 vm_bind_calls = stats->vm_bind_async_calls + stats->vm_bind_sync_calls;
+
+	if (stats->group_submit_calls)
+		group_avg_ns = div64_u64(stats->group_submit_total_ns,
+					 stats->group_submit_calls);
+	if (vm_bind_calls)
+		vm_bind_avg_ns = div64_u64(stats->vm_bind_total_ns,
+					   vm_bind_calls);
+
+	pr_info("panthor: [MZH][PANTHOR_SUBMIT_STATS_GROUP] group_calls=%llu group_jobs=%llu group_avg_ns=%llu group_max_ns=%llu group_copy_jobs_ns=%llu group_init_ctx_ns=%llu group_create_jobs_ns=%llu group_collect_signals_ns=%llu group_prepare_resvs_ns=%llu group_arm_jobs_ns=%llu group_push_jobs_ns=%llu group_push_update_resvs_ns=%llu group_push_entity_ns=%llu group_push_fences_ns=%llu group_cleanup_ns=%llu\n",
+		stats->group_submit_calls, stats->group_submit_jobs,
+		group_avg_ns, stats->group_submit_max_ns,
+		stats->group_copy_jobs_ns, stats->group_init_ctx_ns,
+		stats->group_create_jobs_ns, stats->group_collect_signals_ns,
+		stats->group_prepare_resvs_ns, stats->group_arm_jobs_ns,
+		stats->group_push_jobs_ns,
+		stats->group_push_update_resvs_ns,
+		stats->group_push_entity_ns, stats->group_push_fences_ns,
+		stats->group_cleanup_ns);
+	pr_info("panthor: [MZH][PANTHOR_SUBMIT_STATS_VMBIND] vm_bind_async_calls=%llu vm_bind_sync_calls=%llu vm_bind_ops=%llu vm_bind_avg_ns=%llu vm_bind_max_ns=%llu vm_bind_copy_ops_ns=%llu vm_bind_init_ctx_ns=%llu vm_bind_create_jobs_ns=%llu vm_bind_collect_signals_ns=%llu vm_bind_prepare_resvs_ns=%llu vm_bind_arm_jobs_ns=%llu vm_bind_push_jobs_ns=%llu vm_bind_push_update_resvs_ns=%llu vm_bind_push_entity_ns=%llu vm_bind_push_fences_ns=%llu vm_bind_sync_exec_ns=%llu vm_bind_cleanup_ns=%llu\n",
+		stats->vm_bind_async_calls, stats->vm_bind_sync_calls,
+		stats->vm_bind_ops, vm_bind_avg_ns, stats->vm_bind_max_ns,
+		stats->vm_bind_copy_ops_ns, stats->vm_bind_init_ctx_ns,
+		stats->vm_bind_create_jobs_ns, stats->vm_bind_collect_signals_ns,
+		stats->vm_bind_prepare_resvs_ns, stats->vm_bind_arm_jobs_ns,
+		stats->vm_bind_push_jobs_ns,
+		stats->vm_bind_push_update_resvs_ns,
+		stats->vm_bind_push_entity_ns, stats->vm_bind_push_fences_ns,
+		stats->vm_bind_sync_exec_ns, stats->vm_bind_cleanup_ns);
+	pr_info("panthor: [MZH][PANTHOR_SUBMIT_STATS_RUN_JOB] run_job_calls=%llu run_job_total_ns=%llu run_job_max_ns=%llu run_job_pm_resume_ns=%llu run_job_lock_wait_ns=%llu run_job_init_fence_ns=%llu run_job_ringbuf_write_ns=%llu run_job_inflight_add_ns=%llu run_job_iface_update_ns=%llu run_job_schedule_or_doorbell_ns=%llu run_job_last_fence_ns=%llu run_job_pm_put_ns=%llu run_job_errors=%llu run_job_zero_size_jobs=%llu\n",
+		stats->run_job_calls, stats->run_job_total_ns,
+		stats->run_job_max_ns, stats->run_job_pm_resume_ns,
+		stats->run_job_lock_wait_ns, stats->run_job_init_fence_ns,
+		stats->run_job_ringbuf_write_ns,
+		stats->run_job_inflight_add_ns,
+		stats->run_job_iface_update_ns,
+		stats->run_job_schedule_or_doorbell_ns,
+		stats->run_job_last_fence_ns, stats->run_job_pm_put_ns,
+		stats->run_job_errors, stats->run_job_zero_size_jobs);
+}
+
+static int panthor_submit_stats_set(const char *val,
+				    const struct kernel_param *kp)
+{
+	struct panthor_submit_stats snapshot;
+	bool enabled, dump = false;
+	unsigned long flags;
+	int ret;
+
+	ret = kstrtobool(val, &enabled);
+	if (ret)
+		return ret;
+
+	spin_lock_irqsave(&panthor_submit_stats_lock, flags);
+	if (enabled && !panthor_submit_stats_enabled) {
+		memset(&panthor_submit_stats_data, 0,
+		       sizeof(panthor_submit_stats_data));
+	} else if (!enabled && panthor_submit_stats_enabled) {
+		snapshot = panthor_submit_stats_data;
+		dump = true;
+	}
+	WRITE_ONCE(panthor_submit_stats_enabled, enabled);
+	spin_unlock_irqrestore(&panthor_submit_stats_lock, flags);
+
+	if (dump)
+		panthor_submit_stats_dump_snapshot(&snapshot);
+
+	return 0;
+}
+
+static const struct kernel_param_ops panthor_submit_stats_param_ops = {
+	.set = panthor_submit_stats_set,
+	.get = param_get_bool,
+};
+
+module_param_cb(submit_stats, &panthor_submit_stats_param_ops,
+		&panthor_submit_stats_enabled, 0644);
+MODULE_PARM_DESC(submit_stats,
+		 "Collect low-overhead Panthor submit/vm-bind ioctl aggregate timing stats");
+
+static void panthor_submit_stats_commit(struct panthor_submit_stats_sample *sample)
+{
+	struct panthor_submit_stats *stats = &panthor_submit_stats_data;
+	unsigned long flags;
+	u64 total_ns;
+
+	if (!sample->start_ns || !READ_ONCE(panthor_submit_stats_enabled))
+		return;
+
+	total_ns = ktime_get_ns() - sample->start_ns;
+
+	spin_lock_irqsave(&panthor_submit_stats_lock, flags);
+	switch (sample->kind) {
+	case PANTHOR_SUBMIT_STATS_GROUP_SUBMIT:
+		stats->group_submit_calls++;
+		stats->group_submit_jobs += sample->job_or_op_count;
+		stats->group_submit_total_ns += total_ns;
+		if (total_ns > stats->group_submit_max_ns)
+			stats->group_submit_max_ns = total_ns;
+		stats->group_copy_jobs_ns += sample->copy_ns;
+		stats->group_init_ctx_ns += sample->init_ctx_ns;
+		stats->group_create_jobs_ns += sample->create_jobs_ns;
+		stats->group_collect_signals_ns += sample->collect_signals_ns;
+		stats->group_prepare_resvs_ns += sample->prepare_resvs_ns;
+		stats->group_arm_jobs_ns += sample->arm_jobs_ns;
+		stats->group_push_jobs_ns += sample->push_jobs_ns;
+		stats->group_push_update_resvs_ns +=
+			sample->push_update_resvs_ns;
+		stats->group_push_entity_ns += sample->push_entity_ns;
+		stats->group_push_fences_ns += sample->push_fences_ns;
+		stats->group_cleanup_ns += sample->cleanup_ns;
+		break;
+	case PANTHOR_SUBMIT_STATS_VM_BIND_ASYNC:
+		stats->vm_bind_async_calls++;
+		fallthrough;
+	case PANTHOR_SUBMIT_STATS_VM_BIND_SYNC:
+		if (sample->kind == PANTHOR_SUBMIT_STATS_VM_BIND_SYNC)
+			stats->vm_bind_sync_calls++;
+		stats->vm_bind_ops += sample->job_or_op_count;
+		stats->vm_bind_total_ns += total_ns;
+		if (total_ns > stats->vm_bind_max_ns)
+			stats->vm_bind_max_ns = total_ns;
+		stats->vm_bind_copy_ops_ns += sample->copy_ns;
+		stats->vm_bind_init_ctx_ns += sample->init_ctx_ns;
+		stats->vm_bind_create_jobs_ns += sample->create_jobs_ns;
+		stats->vm_bind_collect_signals_ns += sample->collect_signals_ns;
+		stats->vm_bind_prepare_resvs_ns += sample->prepare_resvs_ns;
+		stats->vm_bind_arm_jobs_ns += sample->arm_jobs_ns;
+		stats->vm_bind_push_jobs_ns += sample->push_jobs_ns;
+		stats->vm_bind_push_update_resvs_ns +=
+			sample->push_update_resvs_ns;
+		stats->vm_bind_push_entity_ns += sample->push_entity_ns;
+		stats->vm_bind_push_fences_ns += sample->push_fences_ns;
+		stats->vm_bind_sync_exec_ns += sample->sync_exec_ns;
+		stats->vm_bind_cleanup_ns += sample->cleanup_ns;
+		break;
+	}
+	spin_unlock_irqrestore(&panthor_submit_stats_lock, flags);
+}
+
+static void
+panthor_job_irq_stats_dump_snapshot(const struct panthor_job_irq_stats *stats)
+{
+	u64 raw_avg_ns = 0, raw_to_thread_avg_ns = 0, thread_avg_ns = 0;
+
+	if (stats->raw_entries)
+		raw_avg_ns = div64_u64(stats->raw_total_ns, stats->raw_entries);
+	if (stats->raw_to_thread_samples)
+		raw_to_thread_avg_ns = div64_u64(stats->raw_to_thread_total_ns,
+						 stats->raw_to_thread_samples);
+	if (stats->thread_entries)
+		thread_avg_ns = div64_u64(stats->thread_total_ns,
+					  stats->thread_entries);
+
+	pr_info("panthor: [MZH][PANTHOR_JOB_IRQ_STATS] raw_entries=%llu raw_wake_thread=%llu raw_none=%llu raw_avg_ns=%llu raw_max_ns=%llu raw_to_thread_samples=%llu raw_to_thread_avg_ns=%llu raw_to_thread_max_ns=%llu thread_entries=%llu thread_handled=%llu thread_none=%llu thread_without_raw=%llu thread_avg_ns=%llu thread_max_ns=%llu loop_iterations=%llu status_or=%#x pending=%u\n",
+		stats->raw_entries, stats->raw_wake_thread, stats->raw_none,
+		raw_avg_ns, stats->raw_max_ns, stats->raw_to_thread_samples,
+		raw_to_thread_avg_ns, stats->raw_to_thread_max_ns,
+		stats->thread_entries, stats->thread_handled, stats->thread_none,
+		stats->thread_without_raw, thread_avg_ns, stats->thread_max_ns,
+		stats->loop_iterations, stats->status_or,
+		stats->thread_pending ? 1 : 0);
+}
+
+static int panthor_job_irq_stats_set(const char *val,
+				     const struct kernel_param *kp)
+{
+	struct panthor_job_irq_stats snapshot;
+	bool enabled, dump = false;
+	unsigned long flags;
+	int ret;
+
+	ret = kstrtobool(val, &enabled);
+	if (ret)
+		return ret;
+
+	spin_lock_irqsave(&panthor_job_irq_stats_lock, flags);
+	if (enabled && !panthor_job_irq_stats_enabled) {
+		memset(&panthor_job_irq_stats_data, 0,
+		       sizeof(panthor_job_irq_stats_data));
+	} else if (!enabled && panthor_job_irq_stats_enabled) {
+		snapshot = panthor_job_irq_stats_data;
+		dump = true;
+	}
+	WRITE_ONCE(panthor_job_irq_stats_enabled, enabled);
+	spin_unlock_irqrestore(&panthor_job_irq_stats_lock, flags);
+
+	if (dump)
+		panthor_job_irq_stats_dump_snapshot(&snapshot);
+
+	return 0;
+}
+
+static const struct kernel_param_ops panthor_job_irq_stats_param_ops = {
+	.set = panthor_job_irq_stats_set,
+	.get = param_get_bool,
+};
+
+module_param_cb(job_irq_stats, &panthor_job_irq_stats_param_ops,
+		&panthor_job_irq_stats_enabled, 0644);
+MODULE_PARM_DESC(job_irq_stats,
+		 "Collect low-overhead Panthor job IRQ timing stats");
+
+u64 panthor_job_irq_stats_raw_begin(void)
+{
+	if (!READ_ONCE(panthor_job_irq_stats_enabled))
+		return 0;
+
+	return ktime_get_ns();
+}
+
+void panthor_job_irq_stats_raw_end(u64 start_ns, bool wake_thread)
+{
+	unsigned long flags;
+	u64 now, delta;
+
+	if (!start_ns || !READ_ONCE(panthor_job_irq_stats_enabled))
+		return;
+
+	now = ktime_get_ns();
+	delta = now - start_ns;
+
+	spin_lock_irqsave(&panthor_job_irq_stats_lock, flags);
+	panthor_job_irq_stats_data.raw_entries++;
+	panthor_job_irq_stats_data.raw_total_ns += delta;
+	if (delta > panthor_job_irq_stats_data.raw_max_ns)
+		panthor_job_irq_stats_data.raw_max_ns = delta;
+	if (wake_thread) {
+		panthor_job_irq_stats_data.raw_wake_thread++;
+		panthor_job_irq_stats_data.last_raw_end_ns = now;
+		panthor_job_irq_stats_data.thread_pending = true;
+	} else {
+		panthor_job_irq_stats_data.raw_none++;
+	}
+	spin_unlock_irqrestore(&panthor_job_irq_stats_lock, flags);
+}
+
+u64 panthor_job_irq_stats_thread_begin(void)
+{
+	unsigned long flags;
+	u64 now, delta;
+
+	if (!READ_ONCE(panthor_job_irq_stats_enabled))
+		return 0;
+
+	now = ktime_get_ns();
+
+	spin_lock_irqsave(&panthor_job_irq_stats_lock, flags);
+	panthor_job_irq_stats_data.thread_entries++;
+	if (panthor_job_irq_stats_data.thread_pending) {
+		delta = now - panthor_job_irq_stats_data.last_raw_end_ns;
+		panthor_job_irq_stats_data.raw_to_thread_samples++;
+		panthor_job_irq_stats_data.raw_to_thread_total_ns += delta;
+		if (delta > panthor_job_irq_stats_data.raw_to_thread_max_ns)
+			panthor_job_irq_stats_data.raw_to_thread_max_ns = delta;
+		panthor_job_irq_stats_data.thread_pending = false;
+	} else {
+		panthor_job_irq_stats_data.thread_without_raw++;
+	}
+	spin_unlock_irqrestore(&panthor_job_irq_stats_lock, flags);
+
+	return now;
+}
+
+void panthor_job_irq_stats_thread_loop(u32 status)
+{
+	unsigned long flags;
+
+	if (!READ_ONCE(panthor_job_irq_stats_enabled))
+		return;
+
+	spin_lock_irqsave(&panthor_job_irq_stats_lock, flags);
+	panthor_job_irq_stats_data.loop_iterations++;
+	panthor_job_irq_stats_data.status_or |= status;
+	spin_unlock_irqrestore(&panthor_job_irq_stats_lock, flags);
+}
+
+void panthor_job_irq_stats_thread_end(u64 start_ns, irqreturn_t ret)
+{
+	unsigned long flags;
+	u64 now, delta;
+
+	if (!start_ns || !READ_ONCE(panthor_job_irq_stats_enabled))
+		return;
+
+	now = ktime_get_ns();
+	delta = now - start_ns;
+
+	spin_lock_irqsave(&panthor_job_irq_stats_lock, flags);
+	panthor_job_irq_stats_data.thread_total_ns += delta;
+	if (delta > panthor_job_irq_stats_data.thread_max_ns)
+		panthor_job_irq_stats_data.thread_max_ns = delta;
+	if (ret == IRQ_HANDLED)
+		panthor_job_irq_stats_data.thread_handled++;
+	else
+		panthor_job_irq_stats_data.thread_none++;
+	spin_unlock_irqrestore(&panthor_job_irq_stats_lock, flags);
+}
 
 static DEFINE_MUTEX(panthor_vmshm_lock);
 static struct panthor_device *panthor_vmshm_ptdev;
@@ -311,6 +766,7 @@ struct panthor_submit_ctx {
 
 	/** @exec: drm_exec context used to acquire and prepare resv objects. */
 	struct drm_exec exec;
+
 };
 
 #define PANTHOR_SYNC_OP_FLAGS_MASK \
@@ -712,6 +1168,34 @@ static void panthor_submit_ctx_push_jobs(
 	panthor_submit_ctx_push_fences(ctx);
 }
 
+static void panthor_submit_ctx_push_jobs_stats(
+	struct panthor_submit_ctx *ctx,
+	void (*upd_resvs)(struct drm_exec *, struct drm_sched_job *),
+	struct panthor_submit_stats_sample *stats)
+{
+	bool stats_enabled = stats->start_ns;
+	u64 stats_phase_start;
+
+	for (u32 i = 0; i < ctx->job_count; i++) {
+		stats_phase_start = panthor_submit_stats_now(stats_enabled);
+		upd_resvs(&ctx->exec, ctx->jobs[i].job);
+		panthor_submit_stats_accum(&stats->push_update_resvs_ns,
+					   stats_phase_start);
+
+		stats_phase_start = panthor_submit_stats_now(stats_enabled);
+		drm_sched_entity_push_job(ctx->jobs[i].job);
+		panthor_submit_stats_accum(&stats->push_entity_ns,
+					   stats_phase_start);
+
+		/* Job is owned by the scheduler now. */
+		ctx->jobs[i].job = NULL;
+	}
+
+	stats_phase_start = panthor_submit_stats_now(stats_enabled);
+	panthor_submit_ctx_push_fences(ctx);
+	panthor_submit_stats_accum(&stats->push_fences_ns, stats_phase_start);
+}
+
 /**
  * panthor_submit_ctx_init() - Initializes a submission context
  * @ctx: Submit context to initialize.
@@ -928,7 +1412,7 @@ int panthor_vmshm_session_open(struct panthor_vmshm_session **session)
 
 	ret = panthor_vm_pool_create(pfile);
 	if (ret)
-		goto err_free_file;
+		goto err_free_pfile;
 
 	ret = panthor_group_pool_create(pfile);
 	if (ret)
@@ -941,7 +1425,7 @@ int panthor_vmshm_session_open(struct panthor_vmshm_session **session)
 err_destroy_vm_pool:
 	panthor_vm_pool_destroy(pfile);
 
-err_free_file:
+err_free_pfile:
 	kfree(pfile);
 
 err_free_session:
@@ -970,7 +1454,7 @@ void panthor_vmshm_session_close(struct panthor_vmshm_session *session)
 		return;
 	}
 
-		ptdev = pfile->ptdev;
+	ptdev = pfile->ptdev;
 	panthor_group_pool_destroy(pfile);
 	panthor_vm_pool_destroy(pfile);
 	kfree(pfile);
@@ -1068,6 +1552,7 @@ static int panthor_ioctl_bo_create(struct drm_device *ddev, void *data,
 	struct panthor_file *pfile = file->driver_priv;
 	struct drm_panthor_bo_create *args = data;
 	struct panthor_vm *vm = NULL;
+	u64 size;
 	int cookie, ret;
 
 	if (!drm_dev_enter(ddev, &cookie))
@@ -1078,6 +1563,8 @@ static int panthor_ioctl_bo_create(struct drm_device *ddev, void *data,
 		goto out_dev_exit;
 	}
 
+	size = args->size;
+
 	if (args->exclusive_vm_id) {
 		vm = panthor_vm_pool_get_vm(pfile->vms, args->exclusive_vm_id);
 		if (!vm) {
@@ -1086,8 +1573,10 @@ static int panthor_ioctl_bo_create(struct drm_device *ddev, void *data,
 		}
 	}
 
-	ret = panthor_gem_create_with_handle(file, ddev, vm, &args->size,
+	ret = panthor_gem_create_with_handle(file, ddev, vm, &size,
 					     args->flags, &args->handle);
+	if (!ret)
+		args->size = size;
 
 	panthor_vm_put(vm);
 
@@ -1128,6 +1617,12 @@ static int panthor_ioctl_group_submit(struct drm_device *ddev, void *data,
 	struct drm_panthor_group_submit *args = data;
 	struct drm_panthor_queue_submit *jobs_args;
 	struct panthor_submit_ctx ctx;
+	struct panthor_submit_stats_sample stats = {
+		.kind = PANTHOR_SUBMIT_STATS_GROUP_SUBMIT,
+		.job_or_op_count = args->queue_submits.count,
+	};
+	bool stats_enabled = panthor_submit_stats_is_enabled();
+	u64 stats_phase_start;
 	int ret = 0, cookie;
 
 	if (args->pad)
@@ -1136,15 +1631,21 @@ static int panthor_ioctl_group_submit(struct drm_device *ddev, void *data,
 	if (!drm_dev_enter(ddev, &cookie))
 		return -ENODEV;
 
+	stats.start_ns = panthor_submit_stats_now(stats_enabled);
+	stats_phase_start = panthor_submit_stats_now(stats_enabled);
 	ret = PANTHOR_UOBJ_GET_ARRAY(jobs_args, &args->queue_submits);
+	panthor_submit_stats_accum(&stats.copy_ns, stats_phase_start);
 	if (ret)
 		goto out_dev_exit;
 
+	stats_phase_start = panthor_submit_stats_now(stats_enabled);
 	ret = panthor_submit_ctx_init(&ctx, file, args->queue_submits.count);
+	panthor_submit_stats_accum(&stats.init_ctx_ns, stats_phase_start);
 	if (ret)
 		goto out_free_jobs_args;
 
 	/* Create jobs and attach sync operations */
+	stats_phase_start = panthor_submit_stats_now(stats_enabled);
 	for (u32 i = 0; i < args->queue_submits.count; i++) {
 		const struct drm_panthor_queue_submit *qsubmit = &jobs_args[i];
 		struct drm_sched_job *job;
@@ -1159,13 +1660,16 @@ static int panthor_ioctl_group_submit(struct drm_device *ddev, void *data,
 		if (ret)
 			goto out_cleanup_submit_ctx;
 	}
+	panthor_submit_stats_accum(&stats.create_jobs_ns, stats_phase_start);
 
 	/*
 	 * Collect signal operations on all jobs, such that each job can pick
 	 * from it for its dependencies and update the fence to signal when the
 	 * job is submitted.
 	 */
+	stats_phase_start = panthor_submit_stats_now(stats_enabled);
 	ret = panthor_submit_ctx_collect_jobs_signal_ops(&ctx);
+	panthor_submit_stats_accum(&stats.collect_signals_ns, stats_phase_start);
 	if (ret)
 		goto out_cleanup_submit_ctx;
 
@@ -1190,11 +1694,14 @@ static int panthor_ioctl_group_submit(struct drm_device *ddev, void *data,
 		/* All jobs target the same group, so they also point to the same VM. */
 		struct panthor_vm *vm = panthor_job_vm(ctx.jobs[0].job);
 
+		stats_phase_start = panthor_submit_stats_now(stats_enabled);
 		drm_exec_until_all_locked(&ctx.exec)
 		{
 			ret = panthor_vm_prepare_mapped_bos_resvs(
 				&ctx.exec, vm, args->queue_submits.count);
 		}
+		panthor_submit_stats_accum(&stats.prepare_resvs_ns,
+					   stats_phase_start);
 
 		if (ret)
 			goto out_cleanup_submit_ctx;
@@ -1205,7 +1712,9 @@ static int panthor_ioctl_group_submit(struct drm_device *ddev, void *data,
 	 * add the dependencies, arm the job fence, register the job fence to
 	 * the signal array.
 	 */
+	stats_phase_start = panthor_submit_stats_now(stats_enabled);
 	ret = panthor_submit_ctx_add_deps_and_arm_jobs(&ctx);
+	panthor_submit_stats_accum(&stats.arm_jobs_ns, stats_phase_start);
 	if (ret)
 		goto out_cleanup_submit_ctx;
 
@@ -1214,15 +1723,28 @@ static int panthor_ioctl_group_submit(struct drm_device *ddev, void *data,
 	 * the resv slots we reserved.  This also pushes the fences to the
 	 * syncobjs that are part of the signal array.
 	 */
-	panthor_submit_ctx_push_jobs(&ctx, panthor_job_update_resvs);
+	if (stats_enabled) {
+		stats_phase_start = panthor_submit_stats_now(stats_enabled);
+		panthor_submit_ctx_push_jobs_stats(&ctx, panthor_job_update_resvs,
+						   &stats);
+		panthor_submit_stats_accum(&stats.push_jobs_ns,
+					   stats_phase_start);
+	} else {
+		panthor_submit_ctx_push_jobs(&ctx, panthor_job_update_resvs);
+	}
 
 out_cleanup_submit_ctx:
+	stats_phase_start = panthor_submit_stats_now(stats_enabled);
 	panthor_submit_ctx_cleanup(&ctx, panthor_job_put);
+	panthor_submit_stats_accum(&stats.cleanup_ns, stats_phase_start);
 
 out_free_jobs_args:
+	stats_phase_start = panthor_submit_stats_now(stats_enabled);
 	kvfree(jobs_args);
+	panthor_submit_stats_accum(&stats.cleanup_ns, stats_phase_start);
 
 out_dev_exit:
+	panthor_submit_stats_commit(&stats);
 	drm_dev_exit(cookie);
 	return ret;
 }
@@ -1372,21 +1894,33 @@ static int panthor_ioctl_vm_bind_async(struct drm_device *ddev,
 	struct panthor_file *pfile = file->driver_priv;
 	struct drm_panthor_vm_bind_op *jobs_args;
 	struct panthor_submit_ctx ctx;
+	struct panthor_submit_stats_sample stats = {
+		.kind = PANTHOR_SUBMIT_STATS_VM_BIND_ASYNC,
+		.job_or_op_count = args->ops.count,
+	};
 	struct panthor_vm *vm;
+	bool stats_enabled = panthor_submit_stats_is_enabled();
+	u64 stats_phase_start;
 	int ret = 0;
 
+	stats.start_ns = panthor_submit_stats_now(stats_enabled);
 	vm = panthor_vm_pool_get_vm(pfile->vms, args->vm_id);
 	if (!vm)
 		return -EINVAL;
 
+	stats_phase_start = panthor_submit_stats_now(stats_enabled);
 	ret = PANTHOR_UOBJ_GET_ARRAY(jobs_args, &args->ops);
+	panthor_submit_stats_accum(&stats.copy_ns, stats_phase_start);
 	if (ret)
 		goto out_put_vm;
 
+	stats_phase_start = panthor_submit_stats_now(stats_enabled);
 	ret = panthor_submit_ctx_init(&ctx, file, args->ops.count);
+	panthor_submit_stats_accum(&stats.init_ctx_ns, stats_phase_start);
 	if (ret)
 		goto out_free_jobs_args;
 
+	stats_phase_start = panthor_submit_stats_now(stats_enabled);
 	for (u32 i = 0; i < args->ops.count; i++) {
 		struct drm_panthor_vm_bind_op *op = &jobs_args[i];
 		struct drm_sched_job *job;
@@ -1401,12 +1935,16 @@ static int panthor_ioctl_vm_bind_async(struct drm_device *ddev,
 		if (ret)
 			goto out_cleanup_submit_ctx;
 	}
+	panthor_submit_stats_accum(&stats.create_jobs_ns, stats_phase_start);
 
+	stats_phase_start = panthor_submit_stats_now(stats_enabled);
 	ret = panthor_submit_ctx_collect_jobs_signal_ops(&ctx);
+	panthor_submit_stats_accum(&stats.collect_signals_ns, stats_phase_start);
 	if (ret)
 		goto out_cleanup_submit_ctx;
 
 	/* Prepare reservation objects for each VM_BIND job. */
+	stats_phase_start = panthor_submit_stats_now(stats_enabled);
 	drm_exec_until_all_locked(&ctx.exec)
 	{
 		for (u32 i = 0; i < ctx.job_count; i++) {
@@ -1417,22 +1955,39 @@ static int panthor_ioctl_vm_bind_async(struct drm_device *ddev,
 				goto out_cleanup_submit_ctx;
 		}
 	}
+	panthor_submit_stats_accum(&stats.prepare_resvs_ns, stats_phase_start);
 
+	stats_phase_start = panthor_submit_stats_now(stats_enabled);
 	ret = panthor_submit_ctx_add_deps_and_arm_jobs(&ctx);
+	panthor_submit_stats_accum(&stats.arm_jobs_ns, stats_phase_start);
 	if (ret)
 		goto out_cleanup_submit_ctx;
 
 	/* Nothing can fail after that point. */
-	panthor_submit_ctx_push_jobs(&ctx, panthor_vm_bind_job_update_resvs);
+	if (stats_enabled) {
+		stats_phase_start = panthor_submit_stats_now(stats_enabled);
+		panthor_submit_ctx_push_jobs_stats(
+			&ctx, panthor_vm_bind_job_update_resvs, &stats);
+		panthor_submit_stats_accum(&stats.push_jobs_ns,
+					   stats_phase_start);
+	} else {
+		panthor_submit_ctx_push_jobs(&ctx,
+					     panthor_vm_bind_job_update_resvs);
+	}
 
 out_cleanup_submit_ctx:
+	stats_phase_start = panthor_submit_stats_now(stats_enabled);
 	panthor_submit_ctx_cleanup(&ctx, panthor_vm_bind_job_put);
+	panthor_submit_stats_accum(&stats.cleanup_ns, stats_phase_start);
 
 out_free_jobs_args:
+	stats_phase_start = panthor_submit_stats_now(stats_enabled);
 	kvfree(jobs_args);
+	panthor_submit_stats_accum(&stats.cleanup_ns, stats_phase_start);
 
 out_put_vm:
 	panthor_vm_put(vm);
+	panthor_submit_stats_commit(&stats);
 	return ret;
 }
 
@@ -1442,17 +1997,27 @@ static int panthor_ioctl_vm_bind_sync(struct drm_device *ddev,
 {
 	struct panthor_file *pfile = file->driver_priv;
 	struct drm_panthor_vm_bind_op *jobs_args;
+	struct panthor_submit_stats_sample stats = {
+		.kind = PANTHOR_SUBMIT_STATS_VM_BIND_SYNC,
+		.job_or_op_count = args->ops.count,
+	};
 	struct panthor_vm *vm;
+	bool stats_enabled = panthor_submit_stats_is_enabled();
+	u64 stats_phase_start;
 	int ret;
 
+	stats.start_ns = panthor_submit_stats_now(stats_enabled);
 	vm = panthor_vm_pool_get_vm(pfile->vms, args->vm_id);
 	if (!vm)
 		return -EINVAL;
 
+	stats_phase_start = panthor_submit_stats_now(stats_enabled);
 	ret = PANTHOR_UOBJ_GET_ARRAY(jobs_args, &args->ops);
+	panthor_submit_stats_accum(&stats.copy_ns, stats_phase_start);
 	if (ret)
 		goto out_put_vm;
 
+	stats_phase_start = panthor_submit_stats_now(stats_enabled);
 	for (u32 i = 0; i < args->ops.count; i++) {
 		ret = panthor_vm_bind_exec_sync_op(file, vm, &jobs_args[i]);
 		if (ret) {
@@ -1461,11 +2026,15 @@ static int panthor_ioctl_vm_bind_sync(struct drm_device *ddev,
 			break;
 		}
 	}
+	panthor_submit_stats_accum(&stats.sync_exec_ns, stats_phase_start);
 
+	stats_phase_start = panthor_submit_stats_now(stats_enabled);
 	kvfree(jobs_args);
+	panthor_submit_stats_accum(&stats.cleanup_ns, stats_phase_start);
 
 out_put_vm:
 	panthor_vm_put(vm);
+	panthor_submit_stats_commit(&stats);
 	return ret;
 }
 
@@ -1660,7 +2229,7 @@ static const struct drm_driver panthor_drm_driver = {
 
 static int panthor_probe(struct platform_device *pdev)
 {
-	pr_info("[MZH]panthor_probe");
+	pr_debug("[MZH]panthor_probe\n");
 	struct panthor_device *ptdev;
 	int ret;
 
@@ -1724,7 +2293,7 @@ struct workqueue_struct *panthor_cleanup_wq;
 static int __init panthor_init(void)
 {
 	int ret;
-	pr_info("[MZH]panthor_init");
+	pr_debug("[MZH]panthor_init\n");
 	ret = panthor_mmu_pt_cache_init();
 	if (ret)
 		return ret;

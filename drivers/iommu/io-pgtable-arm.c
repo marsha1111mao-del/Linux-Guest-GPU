@@ -13,11 +13,14 @@
 #include <linux/bitops.h>
 #include <linux/io-pgtable.h>
 #include <linux/kernel.h>
+#include <linux/ktime.h>
+#include <linux/module.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
 #include <linux/types.h>
 #include <linux/dma-mapping.h>
 #include <linux/arm-smccc.h>
+#include <linux/mutex.h>
 #include <asm/barrier.h>
 #include <linux/hashtable.h>
 #include "io-pgtable-arm.h"
@@ -134,6 +137,11 @@
 #define ARM_MALI_LPAE_MEMATTR_WRITE_ALLOC 0x8DULL
 #define PANTHOR_GPA2HPA_MAX_ENTRIES (PAGE_SIZE / sizeof(u64))
 
+enum panthor_gpa2hpa_cache_mode {
+	PANTHOR_GPA2HPA_CACHE_NONE,
+	PANTHOR_GPA2HPA_CACHE_TABLE,
+};
+
 /* IOPTE accessors */
 #define iopte_deref(pte, d) __va(iopte_to_paddr(pte, d))
 
@@ -156,6 +164,60 @@ struct panthor_table_pte_mapping {
 	u64 gva;
 	struct hlist_node node;
 };
+
+struct panthor_gpa_hpa_mapping {
+	u64 gpa_page;
+	u64 hpa_page;
+	struct hlist_node node;
+};
+
+struct panthor_passthrough_stats {
+	u64 gpa2hpa_batch_calls;
+	u64 gpa2hpa_entries;
+	u64 gpa2hpa_hvc_calls;
+	u64 gpa2hpa_hvc_entries;
+	u64 gpa2hpa_cache_hits;
+	u64 gpa2hpa_cache_misses;
+	u64 map_2m_attempts;
+	u64 map_2m_blocks;
+	u64 map_2m_fallback_tables;
+	u64 map_2m_hpa_unaligned;
+	u64 map_2m_hpa_discontig;
+	u64 pt_timing_samples;
+	u64 gpa2hpa_total_ns;
+	u64 gpa2hpa_max_ns;
+	u64 gpa2hpa_lock_wait_ns;
+	u64 gpa2hpa_scan_ns;
+	u64 gpa2hpa_prep_ns;
+	u64 gpa2hpa_hvc_ns;
+	u64 gpa2hpa_hvc_max_ns;
+	u64 gpa2hpa_result_ns;
+	u64 install_table_calls;
+	u64 install_table_total_ns;
+	u64 install_table_max_ns;
+	u64 install_table_translate_ns;
+	u64 install_table_store_ns;
+	u64 install_table_sync_ns;
+	u64 map_2m_total_ns;
+	u64 map_2m_max_ns;
+	u64 map_2m_alloc_hpas_ns;
+	u64 map_2m_translate_ns;
+	u64 map_2m_check_ns;
+	u64 map_2m_block_install_ns;
+	u64 map_2m_fallback_alloc_ns;
+	u64 map_2m_fallback_fill_ns;
+	u64 map_2m_fallback_sync_ns;
+	u64 map_2m_fallback_install_ns;
+	u64 map_2m_free_hpas_ns;
+	u64 init_pte_total_ns;
+	u64 init_pte_max_ns;
+	u64 init_pte_alloc_hpas_ns;
+	u64 init_pte_translate_ns;
+	u64 init_pte_fill_ns;
+	u64 init_pte_sync_ns;
+	u64 init_pte_free_hpas_ns;
+};
+
 struct arm_lpae_io_pgtable {
 	struct io_pgtable iop;
 
@@ -164,8 +226,47 @@ struct arm_lpae_io_pgtable {
 	int bits_per_level;
 
 	void *pgd;
+	struct page *panthor_gpa2hpa_page;
+	struct mutex panthor_gpa2hpa_lock;
 	DECLARE_HASHTABLE(panthor_table_pte_map, 10);
+	DECLARE_HASHTABLE(panthor_gpa_hpa_map, 12);
+	struct panthor_passthrough_stats panthor_stats;
 };
+
+static bool panthor_pt_timing_enabled;
+module_param_named(panthor_pt_timing, panthor_pt_timing_enabled, bool, 0644);
+MODULE_PARM_DESC(panthor_pt_timing,
+		 "Enable Panthor passthrough io-pgtable aggregate timing diagnostics");
+
+static inline bool panthor_pt_timing_active(void)
+{
+	return unlikely(READ_ONCE(panthor_pt_timing_enabled));
+}
+
+static inline u64 panthor_pt_timing_start(bool enabled)
+{
+	return enabled ? ktime_get_ns() : 0;
+}
+
+static inline void panthor_pt_timing_accum(u64 *field, u64 start_ns)
+{
+	if (start_ns)
+		*field += ktime_get_ns() - start_ns;
+}
+
+static inline void panthor_pt_timing_accum_max(u64 *field, u64 *max_field,
+					       u64 start_ns)
+{
+	u64 delta;
+
+	if (!start_ns)
+		return;
+
+	delta = ktime_get_ns() - start_ns;
+	*field += delta;
+	if (delta > *max_field)
+		*max_field = delta;
+}
 
 typedef u64 arm_lpae_iopte;
 
@@ -186,8 +287,6 @@ static int store_mapping(struct arm_lpae_io_pgtable *data, u64 hpa, u64 gva)
 
 	entry->gva = gva;
 	entry->hpa = hpa;
-	// pr_info("[MZH][store_mapping][pte(HPA)]:%llx,[value(GVA)]:%llx", hpa,
-	// 	gva);
 	hash_add(data->panthor_table_pte_map, &entry->node, hpa);
 	return 0;
 }
@@ -195,15 +294,12 @@ static int store_mapping(struct arm_lpae_io_pgtable *data, u64 hpa, u64 gva)
 static arm_lpae_iopte *lookup_mapping(struct arm_lpae_io_pgtable *data, u64 hpa)
 {
 	struct panthor_table_pte_mapping *entry;
-	// pr_info("[MZH][lookup_mapping][pte(HPA)]:%llx", hpa);
+
 	hash_for_each_possible(data->panthor_table_pte_map, entry, node, hpa) {
-		if (entry->hpa == hpa) {
-			// pr_info("[MZH][lookup_mapping][value(GVA)]:%llx",
-			// 	entry->gva);
+		if (entry->hpa == hpa)
 			return (arm_lpae_iopte *)entry->gva;
-		}
 	}
-	// pr_info("[MZH][lookup_mapping][value(GVA) NOT FOUND!]");
+
 	return NULL;
 }
 
@@ -220,6 +316,61 @@ static void remove_mapping(struct arm_lpae_io_pgtable *data, u64 hpa)
 	}
 }
 
+static int panthor_gpa_hpa_cache_lookup(struct arm_lpae_io_pgtable *data,
+					phys_addr_t gpa, phys_addr_t *hpa)
+{
+	struct panthor_gpa_hpa_mapping *entry;
+	u64 gpa_page = gpa & PAGE_MASK;
+
+	hash_for_each_possible(data->panthor_gpa_hpa_map, entry, node,
+			       gpa_page) {
+		if (entry->gpa_page == gpa_page) {
+			*hpa = entry->hpa_page | (gpa & ~PAGE_MASK);
+			return 0;
+		}
+	}
+
+	return -ENOENT;
+}
+
+static int panthor_gpa_hpa_cache_store(struct arm_lpae_io_pgtable *data,
+				       phys_addr_t gpa, phys_addr_t hpa)
+{
+	struct panthor_gpa_hpa_mapping *entry;
+	u64 gpa_page = gpa & PAGE_MASK;
+	u64 hpa_page = hpa & PAGE_MASK;
+
+	hash_for_each_possible(data->panthor_gpa_hpa_map, entry, node,
+			       gpa_page) {
+		if (entry->gpa_page == gpa_page) {
+			entry->hpa_page = hpa_page;
+			return 0;
+		}
+	}
+
+	entry = kmalloc(sizeof(*entry), GFP_KERNEL);
+	if (!entry)
+		return -ENOMEM;
+
+	entry->gpa_page = gpa_page;
+	entry->hpa_page = hpa_page;
+	hash_add(data->panthor_gpa_hpa_map, &entry->node, gpa_page);
+	return 0;
+}
+
+static void panthor_gpa_hpa_cache_free(struct arm_lpae_io_pgtable *data)
+{
+	struct panthor_gpa_hpa_mapping *entry;
+	struct hlist_node *tmp;
+	int slot;
+
+	hash_for_each_safe(data->panthor_gpa_hpa_map, slot, tmp, entry,
+			   node) {
+		hash_del(&entry->node);
+		kfree(entry);
+	}
+}
+
 static long kvm_hypercall_gpa_to_hpa_batch(u64 addr_array, u64 count)
 {
 	struct arm_smccc_res res;
@@ -227,61 +378,138 @@ static long kvm_hypercall_gpa_to_hpa_batch(u64 addr_array, u64 count)
 	arm_smccc_1_1_invoke(ARM_SMCCC_VENDOR_HYP_GPA_TO_HPA_FUNC_ID,
 			     addr_array, count, &res);
 
-	return res.a0; // 返回状态码
+	return res.a0;
 }
 
-static int panthor_gpa_to_hpa_batch(phys_addr_t gpa, size_t stride,
-				    int num_entries, phys_addr_t *hpas)
+static int panthor_gpa_to_hpa_batch(struct arm_lpae_io_pgtable *data,
+				    phys_addr_t gpa, size_t stride,
+				    int num_entries, phys_addr_t *hpas,
+				    enum panthor_gpa2hpa_cache_mode cache_mode)
 {
-	struct page *page;
 	u64 *array;
 	long ret;
-	int i;
+	bool use_cache = cache_mode != PANTHOR_GPA2HPA_CACHE_NONE;
+	bool timing = panthor_pt_timing_active();
+	u64 total_start = panthor_pt_timing_start(timing);
+	u64 phase_start;
+	int i, miss_count = 0;
 
 	if (!num_entries || num_entries > PAGE_SIZE / sizeof(*array))
 		return -EINVAL;
 
-	page = alloc_page(GFP_KERNEL);
-	if (!page)
+	if (!data->panthor_gpa2hpa_page)
 		return -ENOMEM;
 
-	array = page_address(page);
-	for (i = 0; i < num_entries; i++)
-		array[i] = (gpa + i * stride) & PAGE_MASK;
+	phase_start = panthor_pt_timing_start(timing);
+	mutex_lock(&data->panthor_gpa2hpa_lock);
+	panthor_pt_timing_accum(&data->panthor_stats.gpa2hpa_lock_wait_ns,
+				phase_start);
+	data->panthor_stats.gpa2hpa_batch_calls++;
+	data->panthor_stats.gpa2hpa_entries += num_entries;
+	if (timing)
+		data->panthor_stats.pt_timing_samples++;
 
-	flush_dcache_page(page);
+	phase_start = panthor_pt_timing_start(timing);
+	for (i = 0; i < num_entries; i++) {
+		phys_addr_t in_gpa = gpa + i * stride;
+		int cache_ret;
+
+		if (use_cache) {
+			cache_ret = panthor_gpa_hpa_cache_lookup(data, in_gpa,
+								 &hpas[i]);
+			if (!cache_ret) {
+				data->panthor_stats.gpa2hpa_cache_hits++;
+				continue;
+			}
+			data->panthor_stats.gpa2hpa_cache_misses++;
+		}
+
+		hpas[miss_count++] = in_gpa & PAGE_MASK;
+	}
+	panthor_pt_timing_accum(&data->panthor_stats.gpa2hpa_scan_ns,
+				phase_start);
+
+	if (!miss_count)
+		goto out_unlock;
+
+	array = page_address(data->panthor_gpa2hpa_page);
+	phase_start = panthor_pt_timing_start(timing);
+	for (i = 0; i < miss_count; i++)
+		array[i] = hpas[i];
+
+	data->panthor_stats.gpa2hpa_hvc_calls++;
+	data->panthor_stats.gpa2hpa_hvc_entries += miss_count;
+	flush_dcache_page(data->panthor_gpa2hpa_page);
 	wmb();
-	ret = kvm_hypercall_gpa_to_hpa_batch(page_to_phys(page), num_entries);
+	panthor_pt_timing_accum(&data->panthor_stats.gpa2hpa_prep_ns,
+				phase_start);
+
+	phase_start = panthor_pt_timing_start(timing);
+	ret = kvm_hypercall_gpa_to_hpa_batch(
+		page_to_phys(data->panthor_gpa2hpa_page), miss_count);
 	rmb();
+	panthor_pt_timing_accum_max(&data->panthor_stats.gpa2hpa_hvc_ns,
+				    &data->panthor_stats.gpa2hpa_hvc_max_ns,
+				    phase_start);
 
 	if (ret) {
 		pr_err("[MZH][GPA2HPA] HVC failed ret=%ld gpa=%pa entries=%d\n",
-		       ret, &gpa, num_entries);
-		__free_page(page);
-		return ret;
+		       ret, &gpa, miss_count);
+		goto out_unlock_ret;
 	}
 
-	for (i = 0; i < num_entries; i++) {
-		phys_addr_t in_gpa = gpa + i * stride;
-		phys_addr_t hpa = array[i] | (in_gpa & ~PAGE_MASK);
+	phase_start = panthor_pt_timing_start(timing);
+	for (i = 0; i < miss_count; i++) {
+		phys_addr_t in_gpa = hpas[i];
+		phys_addr_t hpa = array[i];
 
 		if (!hpa || hpa >> 52) {
 			pr_err("[MZH][GPA2HPA] invalid HPA gpa=%pa hpa=%pa\n",
 			       &in_gpa, &hpa);
-			__free_page(page);
-			return -EINVAL;
+			ret = -EINVAL;
+			goto out_unlock_ret;
 		}
+
+		if (use_cache) {
+			ret = panthor_gpa_hpa_cache_store(data, in_gpa, hpa);
+			if (ret)
+				goto out_unlock_ret;
+		}
+
+		if (!use_cache)
+			hpa |= ((gpa + i * stride) & ~PAGE_MASK);
 
 		hpas[i] = hpa;
 	}
 
-	__free_page(page);
-	return 0;
+	if (use_cache) {
+		for (i = 0; i < num_entries; i++) {
+			phys_addr_t in_gpa = gpa + i * stride;
+
+			ret = panthor_gpa_hpa_cache_lookup(data, in_gpa,
+							   &hpas[i]);
+			if (ret)
+				goto out_unlock_ret;
+		}
+	}
+	panthor_pt_timing_accum(&data->panthor_stats.gpa2hpa_result_ns,
+				phase_start);
+
+out_unlock:
+	ret = 0;
+out_unlock_ret:
+	mutex_unlock(&data->panthor_gpa2hpa_lock);
+	panthor_pt_timing_accum_max(&data->panthor_stats.gpa2hpa_total_ns,
+				    &data->panthor_stats.gpa2hpa_max_ns,
+				    total_start);
+	return ret;
 }
 
-static int panthor_gpa_to_hpa(phys_addr_t gpa, phys_addr_t *hpa)
+static int panthor_gpa_to_hpa(struct arm_lpae_io_pgtable *data,
+			      phys_addr_t gpa, phys_addr_t *hpa)
 {
-	return panthor_gpa_to_hpa_batch(gpa, PAGE_SIZE, 1, hpa);
+	return panthor_gpa_to_hpa_batch(data, gpa, PAGE_SIZE, 1, hpa,
+					PANTHOR_GPA2HPA_CACHE_TABLE);
 }
 
 static arm_lpae_iopte *
@@ -422,6 +650,188 @@ static size_t __arm_lpae_unmap(struct arm_lpae_io_pgtable *data,
 			       struct iommu_iotlb_gather *gather,
 			       unsigned long iova, size_t size, size_t pgcount,
 			       int lvl, arm_lpae_iopte *ptep);
+static void __arm_lpae_init_pte(struct arm_lpae_io_pgtable *data,
+				phys_addr_t paddr, arm_lpae_iopte prot,
+				int lvl, int num_entries,
+				arm_lpae_iopte *ptep);
+static size_t __arm_panthor_lpae_unmap(struct arm_lpae_io_pgtable *data,
+				       struct iommu_iotlb_gather *gather,
+				       unsigned long iova, size_t size,
+				       size_t pgcount, int lvl,
+				       arm_lpae_iopte *ptep);
+static int arm_panthor_lpae_init_pte(struct arm_lpae_io_pgtable *data,
+				     unsigned long iova, phys_addr_t paddr,
+				     arm_lpae_iopte prot, int lvl,
+				     int num_entries, arm_lpae_iopte *ptep);
+static int
+arm_panthor_lpae_install_table(arm_lpae_iopte *table, arm_lpae_iopte *ptep,
+			       arm_lpae_iopte curr,
+			       struct arm_lpae_io_pgtable *data,
+			       arm_lpae_iopte *oldp);
+
+static int arm_panthor_lpae_init_2m_block_or_pages(
+	struct arm_lpae_io_pgtable *data, unsigned long iova, phys_addr_t paddr,
+	arm_lpae_iopte prot, int lvl, arm_lpae_iopte *ptep, gfp_t gfp)
+{
+	struct io_pgtable_cfg *cfg = &data->iop.cfg;
+	const int pages_per_block = SZ_2M / PAGE_SIZE;
+	arm_lpae_iopte leaf_prot = prot;
+	phys_addr_t *hpas, hpa_base;
+	arm_lpae_iopte curr, pte;
+	bool block_ok = true;
+	bool timing = panthor_pt_timing_active();
+	u64 total_start = panthor_pt_timing_start(timing);
+	u64 phase_start;
+	int ret, i;
+
+	if (ARM_LPAE_BLOCK_SIZE(lvl, data) != SZ_2M)
+		return arm_panthor_lpae_init_pte(data, iova, paddr, prot, lvl,
+						 1, ptep);
+
+	data->panthor_stats.map_2m_attempts++;
+	curr = READ_ONCE(*ptep);
+	if (curr) {
+		ret = -EEXIST;
+		goto out_record_total;
+	}
+
+	phase_start = panthor_pt_timing_start(timing);
+	hpas = kmalloc_array(pages_per_block, sizeof(*hpas), gfp);
+	panthor_pt_timing_accum(&data->panthor_stats.map_2m_alloc_hpas_ns,
+				phase_start);
+	if (!hpas) {
+		ret = -ENOMEM;
+		goto out_record_total;
+	}
+
+	phase_start = panthor_pt_timing_start(timing);
+	ret = panthor_gpa_to_hpa_batch(data, paddr, PAGE_SIZE,
+				       pages_per_block, hpas,
+				       PANTHOR_GPA2HPA_CACHE_NONE);
+	panthor_pt_timing_accum(&data->panthor_stats.map_2m_translate_ns,
+				phase_start);
+	if (ret)
+		goto out_free_hpas;
+
+	phase_start = panthor_pt_timing_start(timing);
+	hpa_base = hpas[0];
+	if (!IS_ALIGNED(hpa_base, SZ_2M)) {
+		data->panthor_stats.map_2m_hpa_unaligned++;
+		block_ok = false;
+	} else {
+		for (i = 1; i < pages_per_block; i++) {
+			if (hpas[i] != hpa_base + (phys_addr_t)i * PAGE_SIZE) {
+				data->panthor_stats.map_2m_hpa_discontig++;
+				block_ok = false;
+				break;
+			}
+		}
+	}
+	panthor_pt_timing_accum(&data->panthor_stats.map_2m_check_ns,
+				phase_start);
+
+	if (block_ok) {
+		phase_start = panthor_pt_timing_start(timing);
+		pte = prot | ARM_LPAE_PTE_TYPE_BLOCK |
+		      paddr_to_iopte(hpa_base, data);
+		WRITE_ONCE(*ptep, pte);
+		if (!cfg->coherent_walk)
+			__arm_lpae_sync_pte(ptep, 1, cfg);
+		data->panthor_stats.map_2m_blocks++;
+		panthor_pt_timing_accum(
+			&data->panthor_stats.map_2m_block_install_ns,
+			phase_start);
+		goto out_free_hpas;
+	}
+
+	if (data->iop.fmt != ARM_MALI_LPAE &&
+	    lvl + 1 == ARM_LPAE_MAX_LEVELS - 1)
+		leaf_prot |= ARM_LPAE_PTE_TYPE_PAGE;
+	else
+		leaf_prot |= ARM_LPAE_PTE_TYPE_BLOCK;
+
+	{
+		size_t tblsz = ARM_LPAE_GRANULE(data);
+		arm_lpae_iopte *tablep, old;
+
+		phase_start = panthor_pt_timing_start(timing);
+		tablep = __arm_lpae_alloc_pages(tblsz, gfp, cfg,
+						data->iop.cookie);
+		panthor_pt_timing_accum(
+			&data->panthor_stats.map_2m_fallback_alloc_ns,
+			phase_start);
+		if (!tablep) {
+			ret = -ENOMEM;
+			goto out_free_hpas;
+		}
+
+		phase_start = panthor_pt_timing_start(timing);
+		for (i = 0; i < pages_per_block; i++)
+			tablep[i] = leaf_prot | paddr_to_iopte(hpas[i], data);
+		panthor_pt_timing_accum(
+			&data->panthor_stats.map_2m_fallback_fill_ns,
+			phase_start);
+
+		phase_start = panthor_pt_timing_start(timing);
+		if (!cfg->coherent_walk)
+			__arm_lpae_sync_pte(tablep, pages_per_block, cfg);
+		panthor_pt_timing_accum(
+			&data->panthor_stats.map_2m_fallback_sync_ns,
+			phase_start);
+
+		phase_start = panthor_pt_timing_start(timing);
+		ret = arm_panthor_lpae_install_table(tablep, ptep, 0, data,
+						     &old);
+		panthor_pt_timing_accum(
+			&data->panthor_stats.map_2m_fallback_install_ns,
+			phase_start);
+		if (ret) {
+			__arm_lpae_free_pages(tablep, tblsz, cfg,
+					      data->iop.cookie);
+			goto out_free_hpas;
+		}
+
+		if (old) {
+			__arm_lpae_free_pages(tablep, tblsz, cfg,
+					      data->iop.cookie);
+			ret = -EEXIST;
+		} else {
+			data->panthor_stats.map_2m_fallback_tables++;
+		}
+	}
+
+out_free_hpas:
+	phase_start = panthor_pt_timing_start(timing);
+	kfree(hpas);
+	panthor_pt_timing_accum(&data->panthor_stats.map_2m_free_hpas_ns,
+				phase_start);
+out_record_total:
+	panthor_pt_timing_accum_max(&data->panthor_stats.map_2m_total_ns,
+				    &data->panthor_stats.map_2m_max_ns,
+				    total_start);
+	return ret;
+}
+
+static int arm_panthor_lpae_init_2m_blocks_or_pages(
+	struct arm_lpae_io_pgtable *data, unsigned long iova, phys_addr_t paddr,
+	arm_lpae_iopte prot, int lvl, int num_entries, arm_lpae_iopte *ptep,
+	gfp_t gfp, size_t *mapped)
+{
+	int i, ret = 0;
+
+	for (i = 0; i < num_entries; i++) {
+		ret = arm_panthor_lpae_init_2m_block_or_pages(
+			data, iova + (unsigned long)i * SZ_2M,
+			paddr + (phys_addr_t)i * SZ_2M, prot, lvl, &ptep[i],
+			gfp);
+		if (ret)
+			break;
+
+		*mapped += SZ_2M;
+	}
+
+	return ret;
+}
 
 static int __arm_panthor_lpae_init_pte(struct arm_lpae_io_pgtable *data,
 				       phys_addr_t paddr, arm_lpae_iopte prot,
@@ -435,20 +845,33 @@ static int __arm_panthor_lpae_init_pte(struct arm_lpae_io_pgtable *data,
 	struct io_pgtable_cfg *cfg = &data->iop.cfg;
 	phys_addr_t *hpas;
 	int ret;
+	bool timing = panthor_pt_timing_active();
+	u64 total_start = panthor_pt_timing_start(timing);
+	u64 phase_start;
 
 	if (data->iop.fmt != ARM_MALI_LPAE && lvl == ARM_LPAE_MAX_LEVELS - 1)
 		pte |= ARM_LPAE_PTE_TYPE_PAGE;
 	else
 		pte |= ARM_LPAE_PTE_TYPE_BLOCK;
 
+	phase_start = panthor_pt_timing_start(timing);
 	hpas = kcalloc(num_entries, sizeof(*hpas), GFP_KERNEL);
-	if (!hpas)
-		return -ENOMEM;
+	panthor_pt_timing_accum(&data->panthor_stats.init_pte_alloc_hpas_ns,
+				phase_start);
+	if (!hpas) {
+		ret = -ENOMEM;
+		goto out_record_total;
+	}
 
-	ret = panthor_gpa_to_hpa_batch(paddr, sz, num_entries, hpas);
+	phase_start = panthor_pt_timing_start(timing);
+	ret = panthor_gpa_to_hpa_batch(data, paddr, sz, num_entries, hpas,
+				       PANTHOR_GPA2HPA_CACHE_NONE);
+	panthor_pt_timing_accum(&data->panthor_stats.init_pte_translate_ns,
+				phase_start);
 	if (ret)
 		goto out_free_hpas;
 
+	phase_start = panthor_pt_timing_start(timing);
 	for (i = 0; i < num_entries; i++) {
 		u64 raw_hpa = hpas[i]; // 原始的 Host Physical Address (HPA)
 		u64 pte_val =
@@ -461,12 +884,24 @@ static int __arm_panthor_lpae_init_pte(struct arm_lpae_io_pgtable *data,
 			 &(phys_addr_t){ paddr + i * sz },
 			 &(phys_addr_t){ raw_hpa }, (u64)pte_val, lvl, prot);
 	}
+	panthor_pt_timing_accum(&data->panthor_stats.init_pte_fill_ns,
+				phase_start);
 
+	phase_start = panthor_pt_timing_start(timing);
 	if (!cfg->coherent_walk)
 		__arm_lpae_sync_pte(ptep, num_entries, cfg);
+	panthor_pt_timing_accum(&data->panthor_stats.init_pte_sync_ns,
+				phase_start);
 
 out_free_hpas:
+	phase_start = panthor_pt_timing_start(timing);
 	kfree(hpas);
+	panthor_pt_timing_accum(&data->panthor_stats.init_pte_free_hpas_ns,
+				phase_start);
+out_record_total:
+	panthor_pt_timing_accum_max(&data->panthor_stats.init_pte_total_ns,
+				    &data->panthor_stats.init_pte_max_ns,
+				    total_start);
 	return ret;
 }
 
@@ -599,10 +1034,16 @@ arm_panthor_lpae_install_table(arm_lpae_iopte *table, arm_lpae_iopte *ptep,
 	phys_addr_t gpa = __pa(table);
 	phys_addr_t hpa;
 	int ret;
+	bool timing = panthor_pt_timing_active();
+	u64 total_start = panthor_pt_timing_start(timing);
+	u64 phase_start;
 
-	ret = panthor_gpa_to_hpa(gpa, &hpa);
+	phase_start = panthor_pt_timing_start(timing);
+	ret = panthor_gpa_to_hpa(data, gpa, &hpa);
+	panthor_pt_timing_accum(&data->panthor_stats.install_table_translate_ns,
+				phase_start);
 	if (ret)
-		return ret;
+		goto out_record_total;
 
 	//gpa->gpa
 	//gva->(arm_lpae_iopte *)table
@@ -615,11 +1056,14 @@ arm_panthor_lpae_install_table(arm_lpae_iopte *table, arm_lpae_iopte *ptep,
 	if (cfg->quirks & IO_PGTABLE_QUIRK_ARM_NS)
 		panthor_new |= ARM_LPAE_PTE_NSTABLE;
 	dma_wmb();
+	phase_start = panthor_pt_timing_start(timing);
 	ret = store_mapping(data, panthor_new & ARM_LPAE_PTE_ADDR_MASK, (u64)table);
+	panthor_pt_timing_accum(&data->panthor_stats.install_table_store_ns,
+				phase_start);
 	if (ret) {
 		pr_err("[MZH][TABLE] store mapping failed ret=%d gpa=%pa hpa=%pa table=%px\n",
 		       ret, &gpa, &hpa, table);
-		return ret;
+		goto out_record_total;
 	}
 	//cptep=L0[ptep]
 	panthor_old = cmpxchg64_relaxed(ptep, curr, panthor_new);
@@ -627,11 +1071,20 @@ arm_panthor_lpae_install_table(arm_lpae_iopte *table, arm_lpae_iopte *ptep,
 		remove_mapping(data, panthor_new & ARM_LPAE_PTE_ADDR_MASK);
 	*oldp = panthor_old;
 	if (cfg->coherent_walk || (panthor_old & ARM_LPAE_PTE_SW_SYNC))
-		return 0;
+		goto out_record_total;
+	phase_start = panthor_pt_timing_start(timing);
 	__arm_lpae_sync_pte(ptep, 1, cfg);
 	if (panthor_old == curr)
 		WRITE_ONCE(*ptep, panthor_new | ARM_LPAE_PTE_SW_SYNC);
-	return 0;
+	panthor_pt_timing_accum(&data->panthor_stats.install_table_sync_ns,
+				phase_start);
+out_record_total:
+	if (timing)
+		data->panthor_stats.install_table_calls++;
+	panthor_pt_timing_accum_max(&data->panthor_stats.install_table_total_ns,
+				    &data->panthor_stats.install_table_max_ns,
+				    total_start);
+	return ret;
 }
 
 static int __arm_lpae_map(struct arm_lpae_io_pgtable *data, unsigned long iova,
@@ -711,6 +1164,20 @@ static int __arm_panthor_lpae_map(struct arm_lpae_io_pgtable *data,
 	ptep += map_idx_start;
 	/* If we can install a leaf entry at this level, then do so */
 	if (size == block_size) {
+		if (block_size == SZ_2M) {
+			size_t mapped_2m = 0;
+
+			max_entries = ARM_LPAE_PTES_PER_TABLE(data) -
+				      map_idx_start;
+			num_entries = min_t(int, pgcount, max_entries);
+			ret = arm_panthor_lpae_init_2m_blocks_or_pages(
+				data, iova, paddr, prot, lvl, num_entries, ptep,
+				gfp, &mapped_2m);
+			*mapped += mapped_2m;
+
+			return ret;
+		}
+
 		max_entries = ARM_LPAE_PTES_PER_TABLE(data) - map_idx_start;
 		num_entries = min_t(int, pgcount, max_entries);
 		ret = arm_panthor_lpae_init_pte(data, iova, paddr, prot, lvl,
@@ -728,9 +1195,9 @@ static int __arm_panthor_lpae_map(struct arm_lpae_io_pgtable *data,
 	/* Grab a pointer to the next level */
 	pte = READ_ONCE(*ptep);
 	if (!pte) {
-			cptep = __arm_lpae_alloc_pages(tblsz, gfp, cfg,
-						       data->iop.cookie);
-			pr_debug("[MZH][alloc table pte][gva]:%llx", (u64)cptep);
+		cptep = __arm_lpae_alloc_pages(tblsz, gfp, cfg,
+					       data->iop.cookie);
+		pr_debug("[MZH][alloc table pte][gva]:%llx\n", (u64)cptep);
 		if (!cptep)
 			return -ENOMEM;
 		ret = arm_panthor_lpae_install_table(cptep, ptep, 0, data,
@@ -948,7 +1415,7 @@ static void __arm_panthor_lpae_free_pgtable(struct arm_lpae_io_pgtable *data,
 
 	start = ptep;
 	if (lvl != data->start_level) {
-		ret = panthor_gpa_to_hpa(__pa(start), &hpa);
+		ret = panthor_gpa_to_hpa(data, __pa(start), &hpa);
 		if (ret)
 			pr_err("[MZH][PTFREE] failed to translate table %px ret=%d\n",
 			       start, ret);
@@ -992,8 +1459,52 @@ static void arm_lpae_free_pgtable(struct io_pgtable *iop)
 static void arm_panthor_lpae_free_pgtable(struct io_pgtable *iop)
 {
 	struct arm_lpae_io_pgtable *data = io_pgtable_to_data(iop);
+	struct panthor_passthrough_stats *stats = &data->panthor_stats;
+	bool timing = panthor_pt_timing_active();
 
 	__arm_panthor_lpae_free_pgtable(data, data->start_level, data->pgd);
+	if (timing && (stats->gpa2hpa_batch_calls || stats->map_2m_attempts))
+		pr_info("[MZH][PANTHOR_PT_STATS] gpa2hpa_batches=%llu entries=%llu hvc_calls=%llu hvc_entries=%llu cache_hits=%llu cache_misses=%llu 2m_attempts=%llu 2m_blocks=%llu 2m_fallback_tables=%llu 2m_hpa_unaligned=%llu 2m_hpa_discontig=%llu\n",
+			stats->gpa2hpa_batch_calls, stats->gpa2hpa_entries,
+			stats->gpa2hpa_hvc_calls, stats->gpa2hpa_hvc_entries,
+			stats->gpa2hpa_cache_hits,
+			stats->gpa2hpa_cache_misses, stats->map_2m_attempts,
+			stats->map_2m_blocks, stats->map_2m_fallback_tables,
+			stats->map_2m_hpa_unaligned,
+			stats->map_2m_hpa_discontig);
+	if (timing && stats->pt_timing_samples) {
+		pr_info("[MZH][PANTHOR_PT_TIMING] samples=%llu gpa2hpa_total_ns=%llu gpa2hpa_max_ns=%llu gpa2hpa_lock_wait_ns=%llu gpa2hpa_scan_ns=%llu gpa2hpa_prep_ns=%llu gpa2hpa_hvc_ns=%llu gpa2hpa_hvc_max_ns=%llu gpa2hpa_result_ns=%llu install_calls=%llu install_total_ns=%llu install_max_ns=%llu install_translate_ns=%llu install_store_ns=%llu install_sync_ns=%llu\n",
+			stats->pt_timing_samples,
+			stats->gpa2hpa_total_ns, stats->gpa2hpa_max_ns,
+			stats->gpa2hpa_lock_wait_ns, stats->gpa2hpa_scan_ns,
+			stats->gpa2hpa_prep_ns, stats->gpa2hpa_hvc_ns,
+			stats->gpa2hpa_hvc_max_ns,
+			stats->gpa2hpa_result_ns, stats->install_table_calls,
+			stats->install_table_total_ns,
+			stats->install_table_max_ns,
+			stats->install_table_translate_ns,
+			stats->install_table_store_ns,
+			stats->install_table_sync_ns);
+		pr_info("[MZH][PANTHOR_PT_TIMING] map_2m_total_ns=%llu map_2m_max_ns=%llu map_2m_alloc_hpas_ns=%llu map_2m_translate_ns=%llu map_2m_check_ns=%llu map_2m_block_install_ns=%llu map_2m_fallback_alloc_ns=%llu map_2m_fallback_fill_ns=%llu map_2m_fallback_sync_ns=%llu map_2m_fallback_install_ns=%llu map_2m_free_hpas_ns=%llu\n",
+			stats->map_2m_total_ns, stats->map_2m_max_ns,
+			stats->map_2m_alloc_hpas_ns,
+			stats->map_2m_translate_ns, stats->map_2m_check_ns,
+			stats->map_2m_block_install_ns,
+			stats->map_2m_fallback_alloc_ns,
+			stats->map_2m_fallback_fill_ns,
+			stats->map_2m_fallback_sync_ns,
+			stats->map_2m_fallback_install_ns,
+			stats->map_2m_free_hpas_ns);
+		pr_info("[MZH][PANTHOR_PT_TIMING] init_pte_total_ns=%llu init_pte_max_ns=%llu init_pte_alloc_hpas_ns=%llu init_pte_translate_ns=%llu init_pte_fill_ns=%llu init_pte_sync_ns=%llu init_pte_free_hpas_ns=%llu\n",
+			stats->init_pte_total_ns, stats->init_pte_max_ns,
+			stats->init_pte_alloc_hpas_ns,
+			stats->init_pte_translate_ns, stats->init_pte_fill_ns,
+			stats->init_pte_sync_ns,
+			stats->init_pte_free_hpas_ns);
+	}
+	panthor_gpa_hpa_cache_free(data);
+	if (data->panthor_gpa2hpa_page)
+		__free_page(data->panthor_gpa2hpa_page);
 	kfree(data);
 }
 
@@ -1049,14 +1560,82 @@ static size_t arm_lpae_split_blk_unmap(struct arm_lpae_io_pgtable *data,
 
 		tablep = iopte_deref(pte, data);
 	} else if (unmap_idx_start >= 0) {
-		for (i = 0; i < num_entries; i++)
-			io_pgtable_tlb_add_page(&data->iop, gather,
-						iova + i * size, size);
+		if (gather)
+			for (i = 0; i < num_entries; i++)
+				io_pgtable_tlb_add_page(&data->iop, gather,
+							iova + i * size, size);
 
 		return num_entries * size;
 	}
 
 	return __arm_lpae_unmap(data, gather, iova, size, pgcount, lvl, tablep);
+}
+
+static size_t arm_panthor_lpae_split_blk_unmap(
+	struct arm_lpae_io_pgtable *data, struct iommu_iotlb_gather *gather,
+	unsigned long iova, size_t size, arm_lpae_iopte blk_pte, int lvl,
+	arm_lpae_iopte *ptep, size_t pgcount)
+{
+	struct io_pgtable_cfg *cfg = &data->iop.cfg;
+	arm_lpae_iopte pte, *tablep, old;
+	phys_addr_t blk_paddr;
+	size_t tablesz = ARM_LPAE_GRANULE(data);
+	size_t split_sz = ARM_LPAE_BLOCK_SIZE(lvl, data);
+	int ptes_per_table = ARM_LPAE_PTES_PER_TABLE(data);
+	int i, unmap_idx_start = -1, num_entries = 0, max_entries;
+	int ret;
+
+	if (WARN_ON(lvl == ARM_LPAE_MAX_LEVELS))
+		return 0;
+
+	tablep = __arm_lpae_alloc_pages(tablesz, GFP_ATOMIC, cfg,
+					data->iop.cookie);
+	if (!tablep)
+		return 0;
+
+	if (size == split_sz) {
+		unmap_idx_start = ARM_LPAE_LVL_IDX(iova, lvl, data);
+		max_entries = ptes_per_table - unmap_idx_start;
+		num_entries = min_t(int, pgcount, max_entries);
+	}
+
+	blk_paddr = iopte_to_paddr(blk_pte, data);
+	pte = iopte_prot(blk_pte);
+
+	for (i = 0; i < ptes_per_table; i++, blk_paddr += split_sz) {
+		if (i >= unmap_idx_start && i < (unmap_idx_start + num_entries))
+			continue;
+
+		__arm_lpae_init_pte(data, blk_paddr, pte, lvl, 1, &tablep[i]);
+	}
+
+	ret = arm_panthor_lpae_install_table(tablep, ptep, blk_pte, data,
+					     &old);
+	if (ret) {
+		__arm_lpae_free_pages(tablep, tablesz, cfg, data->iop.cookie);
+		return 0;
+	}
+
+	if (old != blk_pte) {
+		__arm_lpae_free_pages(tablep, tablesz, cfg, data->iop.cookie);
+		if (iopte_type(old) != ARM_LPAE_PTE_TYPE_TABLE)
+			return 0;
+
+		tablep = panthor_table_from_pte(data, old, lvl, iova,
+						"split-unmap");
+		if (!tablep)
+			return 0;
+	} else if (unmap_idx_start >= 0) {
+		if (gather)
+			for (i = 0; i < num_entries; i++)
+				io_pgtable_tlb_add_page(&data->iop, gather,
+							iova + i * size, size);
+
+		return num_entries * size;
+	}
+
+	return __arm_panthor_lpae_unmap(data, gather, iova, size, pgcount,
+					lvl, tablep);
 }
 
 static size_t __arm_lpae_unmap(struct arm_lpae_io_pgtable *data,
@@ -1189,9 +1768,9 @@ static size_t __arm_panthor_lpae_unmap(struct arm_lpae_io_pgtable *data,
 		 * Insert a table at the next level to map the old region,
 		 * minus the part we want to unmap
 		 */
-		pr_err("[MZH]CANT REACH!\n\n");
-		return arm_lpae_split_blk_unmap(data, gather, iova, size, pte,
-						lvl + 1, ptep, pgcount);
+		return arm_panthor_lpae_split_blk_unmap(data, gather, iova,
+							size, pte, lvl + 1,
+							ptep, pgcount);
 	}
 
 	/* Keep on walkin' */
@@ -1470,7 +2049,7 @@ arm_lpae_alloc_pgtable(struct io_pgtable_cfg *cfg)
 	if (cfg->oas > ARM_LPAE_MAX_ADDR_BITS)
 		return NULL;
 
-	data = kmalloc(sizeof(*data), GFP_KERNEL);
+	data = kzalloc(sizeof(*data), GFP_KERNEL);
 	if (!data)
 		return NULL;
 
@@ -1692,6 +2271,11 @@ arm_64_panthor_lpae_alloc_pgtable_s1(struct io_pgtable_cfg *cfg, void *cookie)
 
 	cfg->arm_lpae_s1_cfg.mair = reg;
 	hash_init(data->panthor_table_pte_map);
+	hash_init(data->panthor_gpa_hpa_map);
+	mutex_init(&data->panthor_gpa2hpa_lock);
+	data->panthor_gpa2hpa_page = alloc_page(GFP_KERNEL);
+	if (!data->panthor_gpa2hpa_page)
+		goto out_free_data;
 	/* Looking good; allocate a pgd */
 	data->pgd = __arm_lpae_alloc_pages(ARM_LPAE_PGD_SIZE(data), GFP_KERNEL,
 					   cfg, cookie);
@@ -1703,11 +2287,11 @@ arm_64_panthor_lpae_alloc_pgtable_s1(struct io_pgtable_cfg *cfg, void *cookie)
 	/* TTBR */
 	//cfg->arm_lpae_s1_cfg.ttbr = virt_to_phys(data->pgd);
 	gpa_ttbr = virt_to_phys(data->pgd);
-	ret = panthor_gpa_to_hpa(gpa_ttbr, &ttbr_hpa);
+	ret = panthor_gpa_to_hpa(data, gpa_ttbr, &ttbr_hpa);
 	if (ret) {
 		goto out_free_data;
 	}
-	pr_info("[MZH][arm_lpae_s1_cfg.ttbr]:%llx", ttbr_hpa);
+	pr_debug("[MZH][arm_lpae_s1_cfg.ttbr]:%llx\n", ttbr_hpa);
 	cfg->arm_lpae_s1_cfg.ttbr = ttbr_hpa;
 	return &data->iop;
 
@@ -1715,6 +2299,9 @@ out_free_data:
 	if (data->pgd)
 		__arm_lpae_free_pages(data->pgd, ARM_LPAE_PGD_SIZE(data), cfg,
 				      cookie);
+	panthor_gpa_hpa_cache_free(data);
+	if (data->panthor_gpa2hpa_page)
+		__free_page(data->panthor_gpa2hpa_page);
 	kfree(data);
 	return NULL;
 }

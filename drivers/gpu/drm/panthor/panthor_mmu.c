@@ -614,8 +614,8 @@ static int panthor_mmu_as_enable(struct panthor_device *ptdev, u32 as_nr,
 				 u64 transtab, u64 transcfg, u64 memattr)
 {
 	int ret;
-	pr_info("[MZH][enable as]:as_nr=%x\ttranstab=%llx\ttranscfg=%llx\tmemattr=%llx\t",
-		as_nr, transtab, transcfg, memattr);
+	pr_debug("[MZH][enable as]:as_nr=%x transtab=%llx transcfg=%llx memattr=%llx\n",
+		 as_nr, transtab, transcfg, memattr);
 	ret = mmu_hw_do_operation_locked(ptdev, as_nr, 0, ~0ULL,
 					 AS_COMMAND_FLUSH_MEM);
 	if (ret)
@@ -636,7 +636,7 @@ static int panthor_mmu_as_enable(struct panthor_device *ptdev, u32 as_nr,
 static int panthor_mmu_as_disable(struct panthor_device *ptdev, u32 as_nr)
 {
 	int ret;
-	pr_info("[MZH][disable as]:as_nr=%x\t", as_nr);
+	pr_debug("[MZH][disable as]:as_nr=%x\n", as_nr);
 	ret = mmu_hw_do_operation_locked(ptdev, as_nr, 0, ~0ULL,
 					 AS_COMMAND_FLUSH_MEM);
 	if (ret)
@@ -770,7 +770,7 @@ int panthor_vm_active(struct panthor_vm *vm)
 
 	/* Assign the free or reclaimed AS to the FD */
 	vm->as.id = as;
-	pr_info("[MZH][panthor_vm_active]vm->as.id=%d", vm->as.id);
+	pr_debug("[MZH][panthor_vm_active] vm->as.id=%d\n", vm->as.id);
 	set_bit(as, &ptdev->mmu->as.alloc_mask);
 	ptdev->mmu->as.slots[as].vm = vm;
 
@@ -870,16 +870,6 @@ int panthor_vm_as(struct panthor_vm *vm)
 {
 	return vm->as.id;
 }
-//固定返回 SZ_4K 和对应数量的cunt
-static size_t SZ_4K_get_pgsize(u64 addr, size_t size, size_t *count)
-{
-	*count = size / SZ_4K;
-	if (*count == 0 && size > 0) {
-		*count = 1;
-	}
-	return SZ_4K;
-}
-
 static size_t get_pgsize(u64 addr, size_t size, size_t *count)
 {
 	/*
@@ -941,10 +931,8 @@ static int panthor_vm_unmap_pages(struct panthor_vm *vm, u64 iova, u64 size)
 
 	while (offset < size) {
 		size_t unmapped_sz = 0, pgcount;
-		// size_t pgsize =
-		// 	get_pgsize(iova + offset, size - offset, &pgcount);
-		size_t pgsize = SZ_4K_get_pgsize(iova + offset, size - offset,
-						 &pgcount);
+		size_t pgsize =
+			get_pgsize(iova + offset, size - offset, &pgcount);
 
 		unmapped_sz = ops->unmap_pages(ops, iova + offset, pgsize,
 					       pgcount, NULL);
@@ -998,19 +986,19 @@ static int panthor_vm_map_pages(struct panthor_vm *vm, u64 iova, int prot,
 		len = min_t(size_t, len, size);
 		size -= len;
 
-		if (paddr != sg_paddr || paddr != page_paddr)
-			pr_err("[MZH][panthor_vm_map_pages] dma/phys mismatch: iova=%llx, dma=%pad, sg_phys=%pa, page_phys=%pa, sg_off=%x, skip=%llx, len=%zx, prot=%x",
-			       iova, &paddr, &sg_paddr, &page_paddr,
-			       sgl->offset, sg_skip, len, prot);
-		else
-			pr_debug("[MZH][panthor_vm_map_pages]:iova=%llx, dma=%pad, len=%zx, prot=%x",
-				 iova, &paddr, len, prot);
-		while (len) {
-			size_t pgcount, mapped = 0;
-			size_t pgsize =
-				SZ_4K_get_pgsize(iova | paddr, len, &pgcount);
-			pr_debug("[MZH][panthor_vm_while][iova]:%llx\t[paddr]:%llx[pgsize]:%lx[pgcount]:%lx",
-				 iova, paddr, pgsize, pgcount);
+			if (paddr != sg_paddr || paddr != page_paddr)
+				pr_err("[MZH][panthor_vm_map_pages] dma/phys mismatch: iova=%llx, dma=%pad, sg_phys=%pa, page_phys=%pa, sg_off=%x, skip=%llx, len=%zx, prot=%x",
+				       iova, &paddr, &sg_paddr, &page_paddr,
+				       sgl->offset, sg_skip, len, prot);
+			else
+				pr_debug("[MZH][panthor_vm_map_pages]:iova=%llx, dma=%pad, len=%zx, prot=%x\n",
+					 iova, &paddr, len, prot);
+			while (len) {
+				size_t pgcount, mapped = 0;
+				size_t pgsize = get_pgsize(iova, len, &pgcount);
+
+				pr_debug("[MZH][panthor_vm_while] iova=%llx paddr=%llx pgsize=%lx pgcount=%lx\n",
+					 iova, paddr, pgsize, pgcount);
 			ret = ops->map_pages(ops, iova, paddr, pgsize, pgcount,
 					     prot, GFP_KERNEL, &mapped);
 			iova += mapped;
@@ -1340,12 +1328,11 @@ static int panthor_vm_prepare_map_op_ctx(struct panthor_vm_op_ctx *op_ctx,
 		 30) +
 		((ALIGN(va + size, 1ull << 21) - ALIGN_DOWN(va, 1ull << 21)) >>
 		 21);
-	op_ctx->rsvd_page_tables.pages = kcalloc(
-		pt_count, sizeof(*op_ctx->rsvd_page_tables.pages), GFP_KERNEL);
-	// pr_info("[MZH] alloc op_ctx->rsvd_page_tables.pages");
-	if (!op_ctx->rsvd_page_tables.pages) {
-		ret = -ENOMEM;
-		goto err_cleanup;
+		op_ctx->rsvd_page_tables.pages = kcalloc(
+			pt_count, sizeof(*op_ctx->rsvd_page_tables.pages), GFP_KERNEL);
+		if (!op_ctx->rsvd_page_tables.pages) {
+			ret = -ENOMEM;
+			goto err_cleanup;
 	}
 
 	ret = kmem_cache_alloc_bulk(pt_cache, GFP_KERNEL, pt_count,

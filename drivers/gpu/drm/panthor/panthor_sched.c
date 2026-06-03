@@ -18,6 +18,7 @@
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/iosys-map.h>
+#include <linux/ktime.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
@@ -2830,6 +2831,209 @@ static void group_sync_upd_work(struct work_struct *work)
 }
 
 static struct dma_fence *
+queue_run_job_stats(struct drm_sched_job *sched_job)
+{
+	struct panthor_job *job = container_of(sched_job, struct panthor_job, base);
+	struct panthor_group *group = job->group;
+	struct panthor_queue *queue = group->queues[job->queue_idx];
+	struct panthor_device *ptdev = group->ptdev;
+	struct panthor_scheduler *sched = ptdev->scheduler;
+	u32 ringbuf_size = panthor_kernel_bo_size(queue->ringbuf);
+	u32 ringbuf_insert = queue->iface.input->insert & (ringbuf_size - 1);
+	u64 addr_reg = ptdev->csif_info.cs_reg_count -
+		       ptdev->csif_info.unpreserved_cs_reg_count;
+	u64 val_reg = addr_reg + 2;
+	u64 sync_addr = panthor_kernel_bo_gpuva(group->syncobjs) +
+			job->queue_idx * sizeof(struct panthor_syncobj_64b);
+	u32 waitall_mask = GENMASK(sched->sb_slot_count - 1, 0);
+	struct dma_fence *done_fence;
+	int ret;
+	struct panthor_sched_run_job_stats stats;
+	bool stats_enabled = panthor_submit_stats_is_enabled();
+	u64 stats_start = stats_enabled ? ktime_get_ns() : 0;
+	u64 stats_phase_start;
+
+	u64 call_instrs[NUM_INSTRS_PER_SLOT] = {
+		/* MOV32 rX+2, cs.latest_flush */
+		(2ull << 56) | (val_reg << 48) | job->call_info.latest_flush,
+
+		/* FLUSH_CACHE2.clean_inv_all.no_wait.signal(0) rX+2 */
+		(36ull << 56) | (0ull << 48) | (val_reg << 40) | (0 << 16) | 0x233,
+
+		/* MOV48 rX:rX+1, cs.start */
+		(1ull << 56) | (addr_reg << 48) | job->call_info.start,
+
+		/* MOV32 rX+2, cs.size */
+		(2ull << 56) | (val_reg << 48) | job->call_info.size,
+
+		/* WAIT(0) => waits for FLUSH_CACHE2 instruction */
+		(3ull << 56) | (1 << 16),
+
+		/* CALL rX:rX+1, rX+2 */
+		(32ull << 56) | (addr_reg << 40) | (val_reg << 32),
+
+		/* MOV48 rX:rX+1, sync_addr */
+		(1ull << 56) | (addr_reg << 48) | sync_addr,
+
+		/* MOV48 rX+2, #1 */
+		(1ull << 56) | (val_reg << 48) | 1,
+
+		/* WAIT(all) */
+		(3ull << 56) | (waitall_mask << 16),
+
+		/* SYNC_ADD64.system_scope.propage_err.nowait rX:rX+1, rX+2*/
+		(51ull << 56) | (0ull << 48) | (addr_reg << 40) | (val_reg << 32) | (0 << 16) | 1,
+
+		/* ERROR_BARRIER, so we can recover from faults at job
+		 * boundaries.
+		 */
+		(47ull << 56),
+	};
+
+	/* Need to be cacheline aligned to please the prefetcher. */
+	static_assert(sizeof(call_instrs) % 64 == 0,
+		      "call_instrs is not aligned on a cacheline");
+
+	if (stats_enabled)
+		memset(&stats, 0, sizeof(stats));
+
+	/* Stream size is zero, nothing to do except making sure all previously
+	 * submitted jobs are done before we signal the
+	 * drm_sched_job::s_fence::finished fence.
+	 */
+	if (!job->call_info.size) {
+		job->done_fence = dma_fence_get(queue->fence_ctx.last_fence);
+		done_fence = dma_fence_get(job->done_fence);
+		if (stats_start) {
+			stats.calls = 1;
+			stats.zero_size_jobs = 1;
+			stats.total_ns = ktime_get_ns() - stats_start;
+			stats.max_ns = stats.total_ns;
+			panthor_submit_stats_record_run_job(&stats);
+		}
+		return done_fence;
+	}
+
+	stats_phase_start = stats_enabled ? ktime_get_ns() : 0;
+	ret = pm_runtime_resume_and_get(ptdev->base.dev);
+	if (stats_phase_start)
+		stats.pm_resume_ns += ktime_get_ns() - stats_phase_start;
+	if (drm_WARN_ON(&ptdev->base, ret))
+		goto out_error_no_pm;
+
+	stats_phase_start = stats_enabled ? ktime_get_ns() : 0;
+	mutex_lock(&sched->lock);
+	if (stats_phase_start)
+		stats.lock_wait_ns += ktime_get_ns() - stats_phase_start;
+	if (!group_can_run(group)) {
+		done_fence = ERR_PTR(-ECANCELED);
+		goto out_unlock;
+	}
+
+	stats_phase_start = stats_enabled ? ktime_get_ns() : 0;
+	dma_fence_init(job->done_fence,
+		       &panthor_queue_fence_ops,
+		       &queue->fence_ctx.lock,
+		       queue->fence_ctx.id,
+		       atomic64_inc_return(&queue->fence_ctx.seqno));
+	if (stats_phase_start)
+		stats.init_fence_ns += ktime_get_ns() - stats_phase_start;
+
+	stats_phase_start = stats_enabled ? ktime_get_ns() : 0;
+	memcpy(queue->ringbuf->kmap + ringbuf_insert,
+	       call_instrs, sizeof(call_instrs));
+	if (stats_phase_start)
+		stats.ringbuf_write_ns += ktime_get_ns() - stats_phase_start;
+
+	panthor_job_get(&job->base);
+	stats_phase_start = stats_enabled ? ktime_get_ns() : 0;
+	spin_lock(&queue->fence_ctx.lock);
+	list_add_tail(&job->node, &queue->fence_ctx.in_flight_jobs);
+	spin_unlock(&queue->fence_ctx.lock);
+	if (stats_phase_start)
+		stats.inflight_add_ns += ktime_get_ns() - stats_phase_start;
+
+	job->ringbuf.start = queue->iface.input->insert;
+	job->ringbuf.end = job->ringbuf.start + sizeof(call_instrs);
+
+	/* Make sure the ring buffer is updated before the INSERT
+	 * register.
+	 */
+	wmb();
+
+	stats_phase_start = stats_enabled ? ktime_get_ns() : 0;
+	queue->iface.input->extract = queue->iface.output->extract;
+	queue->iface.input->insert = job->ringbuf.end;
+	if (stats_phase_start)
+		stats.iface_update_ns += ktime_get_ns() - stats_phase_start;
+
+	stats_phase_start = stats_enabled ? ktime_get_ns() : 0;
+	if (group->csg_id < 0) {
+		/* If the queue is blocked, we want to keep the timeout running, so we
+		 * can detect unbounded waits and kill the group when that happens.
+		 * Otherwise, we suspend the timeout so the time we spend waiting for
+		 * a CSG slot is not counted.
+		 */
+		if (!(group->blocked_queues & BIT(job->queue_idx)) &&
+		    !queue->timeout_suspended) {
+			queue->remaining_time = drm_sched_suspend_timeout(&queue->scheduler);
+			queue->timeout_suspended = true;
+		}
+
+		group_schedule_locked(group, BIT(job->queue_idx));
+	} else {
+		gpu_write(ptdev, CSF_DOORBELL(queue->doorbell_id), 1);
+		if (!sched->pm.has_ref &&
+		    !(group->blocked_queues & BIT(job->queue_idx))) {
+			pm_runtime_get(ptdev->base.dev);
+			sched->pm.has_ref = true;
+		}
+		panthor_devfreq_record_busy(sched->ptdev);
+	}
+	if (stats_phase_start)
+		stats.schedule_or_doorbell_ns += ktime_get_ns() -
+						 stats_phase_start;
+
+	/* Update the last fence. */
+	stats_phase_start = stats_enabled ? ktime_get_ns() : 0;
+	dma_fence_put(queue->fence_ctx.last_fence);
+	queue->fence_ctx.last_fence = dma_fence_get(job->done_fence);
+
+	done_fence = dma_fence_get(job->done_fence);
+	if (stats_phase_start)
+		stats.last_fence_ns += ktime_get_ns() - stats_phase_start;
+
+out_unlock:
+	mutex_unlock(&sched->lock);
+	stats_phase_start = stats_enabled ? ktime_get_ns() : 0;
+	pm_runtime_mark_last_busy(ptdev->base.dev);
+	pm_runtime_put_autosuspend(ptdev->base.dev);
+	if (stats_phase_start)
+		stats.pm_put_ns += ktime_get_ns() - stats_phase_start;
+
+	if (stats_start) {
+		stats.calls = 1;
+		stats.total_ns = ktime_get_ns() - stats_start;
+		stats.max_ns = stats.total_ns;
+		if (IS_ERR(done_fence))
+			stats.errors = 1;
+		panthor_submit_stats_record_run_job(&stats);
+	}
+
+	return done_fence;
+
+out_error_no_pm:
+	if (stats_start) {
+		stats.calls = 1;
+		stats.errors = 1;
+		stats.total_ns = ktime_get_ns() - stats_start;
+		stats.max_ns = stats.total_ns;
+		panthor_submit_stats_record_run_job(&stats);
+	}
+	return ERR_PTR(ret);
+}
+
+static struct dma_fence *
 queue_run_job(struct drm_sched_job *sched_job)
 {
 	struct panthor_job *job = container_of(sched_job, struct panthor_job, base);
@@ -2884,6 +3088,9 @@ queue_run_job(struct drm_sched_job *sched_job)
 		 */
 		(47ull << 56),
 	};
+
+	if (unlikely(panthor_submit_stats_is_enabled()))
+		return queue_run_job_stats(sched_job);
 
 	/* Need to be cacheline aligned to please the prefetcher. */
 	static_assert(sizeof(call_instrs) % 64 == 0,
@@ -3583,7 +3790,7 @@ int panthor_sched_init(struct panthor_device *ptdev)
 	 * system is running out of memory.
 	 */
 	sched->heap_alloc_wq = alloc_workqueue("panthor-heap-alloc", WQ_UNBOUND, 0);
-	sched->wq = alloc_workqueue("panthor-csf-sched", WQ_MEM_RECLAIM | WQ_UNBOUND, 0);
+	sched->wq = alloc_workqueue("panthor-csf-sched", WQ_MEM_RECLAIM, 0);
 	if (!sched->wq || !sched->heap_alloc_wq) {
 		panthor_sched_fini(&ptdev->base, sched);
 		drm_err(&ptdev->base, "Failed to allocate the workqueues");
