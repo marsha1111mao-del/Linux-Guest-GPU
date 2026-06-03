@@ -15,7 +15,7 @@ BUILD_DIR="${BUILD_DIR:-${ROOT_DIR}/out/passthrough-arm64}"
 TARGETS="${TARGETS:-Image}"
 JOBS="${JOBS:-$(nproc)}"
 FIRECRACKER_BINS="${FIRECRACKER_BINS:-/home/mzh/gpu/GPU-SFTP/firecracker-bins}"
-PASSTHROUGH_IMAGE="${PASSTHROUGH_IMAGE:-${FIRECRACKER_BINS}/Image}"
+PASSTHROUGH_IMAGE="${PASSTHROUGH_IMAGE:-${FIRECRACKER_BINS}/kernels/passthrough/Image}"
 
 make_args=(
 	-C "${ROOT_DIR}"
