@@ -5,6 +5,7 @@
 #include <linux/dma-buf.h>
 #include <linux/dma-mapping.h>
 #include <linux/err.h>
+#include <linux/proxy_vmshm.h>
 #include <linux/slab.h>
 
 #include <drm/panthor_drm.h>
@@ -17,11 +18,14 @@ static void panthor_gem_free_object(struct drm_gem_object *obj)
 {
 	struct panthor_gem_object *bo = to_panthor_bo(obj);
 	struct drm_gem_object *vm_root_gem = bo->exclusive_vm_root_gem;
+	struct proxy_vmshm_object *vmshm_payload = bo->vmshm_payload;
 
 	drm_gem_free_mmap_offset(&bo->base.base);
 	mutex_destroy(&bo->gpuva_list_lock);
+	bo->vmshm_payload = NULL;
 	drm_gem_shmem_free(&bo->base);
 	drm_gem_object_put(vm_root_gem);
+	proxy_vmshm_unpin(vmshm_payload);
 }
 
 /**
@@ -237,5 +241,65 @@ int panthor_gem_create_with_handle(struct drm_file *file,
 	/* drop reference from allocate - handle holds it now. */
 	drm_gem_object_put(&shmem->base);
 
+	return ret;
+}
+
+int panthor_gem_create_vmshm_with_handle(struct drm_file *file,
+					 struct drm_device *ddev,
+					 struct panthor_vm *exclusive_vm,
+					 u64 *size, u32 flags, u32 *handle,
+					 struct proxy_vmshm_object *payload)
+{
+	struct drm_gem_shmem_object *shmem;
+	struct panthor_gem_object *bo;
+	u64 payload_size;
+	int ret;
+
+	if (!payload || !size || !handle)
+		return -EINVAL;
+
+	payload_size = proxy_vmshm_obj_size(payload);
+	if (!payload_size || *size > payload_size)
+		return -EINVAL;
+
+	ret = proxy_vmshm_pin(payload);
+	if (ret)
+		return ret;
+
+	shmem = drm_gem_shmem_create(ddev, *size);
+	if (IS_ERR(shmem)) {
+		ret = PTR_ERR(shmem);
+		goto err_unpin_payload;
+	}
+
+	bo = to_panthor_bo(&shmem->base);
+	if (bo->base.base.size > payload_size) {
+		ret = -EINVAL;
+		goto err_put_shmem;
+	}
+
+	bo->flags = flags;
+	bo->vmshm_payload = payload;
+
+	if (exclusive_vm) {
+		bo->exclusive_vm_root_gem = panthor_vm_root_gem(exclusive_vm);
+		drm_gem_object_get(bo->exclusive_vm_root_gem);
+		bo->base.base.resv = bo->exclusive_vm_root_gem->resv;
+	}
+
+	ret = drm_gem_handle_create(file, &shmem->base, handle);
+	if (!ret)
+		*size = bo->base.base.size;
+
+	drm_gem_object_put(&shmem->base);
+	if (ret)
+		return ret;
+
+	return 0;
+
+err_put_shmem:
+	drm_gem_object_put(&shmem->base);
+err_unpin_payload:
+	proxy_vmshm_unpin(payload);
 	return ret;
 }

@@ -126,6 +126,26 @@ void drm_syncobj_replace_fence(struct drm_syncobj *syncobj,
 int drm_syncobj_find_fence(struct drm_file *file_private,
 			   u32 handle, u64 point, u64 flags,
 			   struct dma_fence **fence);
+int drm_syncobj_wait_handles(struct drm_file *file_private,
+			     const u32 *handles, u32 count_handles,
+			     s64 timeout_nsec, u32 flags, u64 deadline_nsec,
+			     u32 *first_signaled);
+int drm_syncobj_timeline_wait_handles(struct drm_file *file_private,
+				      const u32 *handles, const u64 *points,
+				      u32 count_handles, s64 timeout_nsec,
+				      u32 flags, u64 deadline_nsec,
+				      u32 *first_signaled);
+int drm_syncobj_transfer(struct drm_file *file_private,
+			 struct drm_syncobj_transfer *args);
+int drm_syncobj_reset_handles(struct drm_file *file_private,
+			      const u32 *handles, u32 count_handles);
+int drm_syncobj_signal_handles(struct drm_file *file_private,
+			       const u32 *handles, u32 count_handles);
+int drm_syncobj_timeline_signal_handles(struct drm_file *file_private,
+					const u32 *handles, const u64 *points,
+					u32 count_handles, u32 flags);
+int drm_syncobj_query_handles(struct drm_file *file_private, const u32 *handles,
+			      u64 *points, u32 count_handles, u32 flags);
 void drm_syncobj_free(struct kref *kref);
 int drm_syncobj_create(struct drm_syncobj **out_syncobj, uint32_t flags,
 		       struct dma_fence *fence);

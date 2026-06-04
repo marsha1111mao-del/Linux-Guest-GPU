@@ -13,6 +13,7 @@
 #include <linux/panthor_vmshm.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
+#include <linux/proxy_vmshm.h>
 
 #include <drm/drm_auth.h>
 #include <drm/drm_debugfs.h>
@@ -489,8 +490,39 @@ static DEFINE_MUTEX(panthor_vmshm_lock);
 static struct panthor_device *panthor_vmshm_ptdev;
 
 struct panthor_vmshm_session {
+	struct drm_file file;
 	struct panthor_file *pfile;
+	bool gem_idr_init;
+	bool syncobj_idr_init;
 };
+
+#define PANTHOR_BO_FLAGS DRM_PANTHOR_BO_NO_MMAP
+
+static void panthor_vmshm_release_gem_handles(struct panthor_vmshm_session *session)
+{
+	struct drm_gem_object *obj;
+	int handle;
+
+	for (;;) {
+		handle = 1;
+
+		spin_lock(&session->file.table_lock);
+		obj = idr_get_next(&session->file.object_idr, &handle);
+		spin_unlock(&session->file.table_lock);
+		if (!obj)
+			break;
+
+		drm_gem_handle_delete(&session->file, handle);
+	}
+}
+
+static int panthor_vmshm_release_syncobj_handle(int id, void *ptr, void *data)
+{
+	struct drm_syncobj *syncobj = ptr;
+
+	drm_syncobj_put(syncobj);
+	return 0;
+}
 
 /**
  * DOC: user <-> kernel object copy helpers.
@@ -920,6 +952,31 @@ static int panthor_submit_ctx_add_job(struct panthor_submit_ctx *ctx, u32 idx,
 		return ret;
 
 	ctx->jobs[idx].syncop_count = syncs->count;
+	return 0;
+}
+
+static int
+panthor_submit_ctx_add_job_kernel_syncs(struct panthor_submit_ctx *ctx, u32 idx,
+					struct drm_sched_job *job,
+					const struct drm_panthor_sync_op *syncs,
+					u32 sync_count)
+{
+	ctx->jobs[idx].job = job;
+
+	if (sync_count) {
+		if (!syncs)
+			return -EINVAL;
+
+		ctx->jobs[idx].syncops =
+			kvmalloc_array(sync_count, sizeof(*syncs), GFP_KERNEL);
+		if (!ctx->jobs[idx].syncops)
+			return -ENOMEM;
+
+		memcpy(ctx->jobs[idx].syncops, syncs,
+		       sizeof(*syncs) * sync_count);
+	}
+
+	ctx->jobs[idx].syncop_count = sync_count;
 	return 0;
 }
 
@@ -1410,20 +1467,40 @@ int panthor_vmshm_session_open(struct panthor_vmshm_session **session)
 
 	pfile->ptdev = ptdev;
 
+	vmshm_session->file.minor = ptdev->base.render ? ptdev->base.render :
+						    ptdev->base.primary;
+	if (!vmshm_session->file.minor) {
+		ret = -ENODEV;
+		goto err_free_pfile;
+	}
+
+	idr_init_base(&vmshm_session->file.object_idr, 1);
+	spin_lock_init(&vmshm_session->file.table_lock);
+	vmshm_session->gem_idr_init = true;
+	idr_init_base(&vmshm_session->file.syncobj_idr, 1);
+	spin_lock_init(&vmshm_session->file.syncobj_table_lock);
+	vmshm_session->syncobj_idr_init = true;
+
 	ret = panthor_vm_pool_create(pfile);
 	if (ret)
-		goto err_free_pfile;
+		goto err_syncobj_idr_destroy;
 
 	ret = panthor_group_pool_create(pfile);
 	if (ret)
 		goto err_destroy_vm_pool;
 
 	vmshm_session->pfile = pfile;
+	vmshm_session->file.driver_priv = pfile;
 	*session = vmshm_session;
 	return 0;
 
 err_destroy_vm_pool:
 	panthor_vm_pool_destroy(pfile);
+
+err_syncobj_idr_destroy:
+	idr_destroy(&vmshm_session->file.syncobj_idr);
+
+	idr_destroy(&vmshm_session->file.object_idr);
 
 err_free_pfile:
 	kfree(pfile);
@@ -1457,6 +1534,15 @@ void panthor_vmshm_session_close(struct panthor_vmshm_session *session)
 	ptdev = pfile->ptdev;
 	panthor_group_pool_destroy(pfile);
 	panthor_vm_pool_destroy(pfile);
+	if (session->gem_idr_init) {
+		panthor_vmshm_release_gem_handles(session);
+		idr_destroy(&session->file.object_idr);
+	}
+	if (session->syncobj_idr_init) {
+		idr_for_each(&session->file.syncobj_idr,
+			     panthor_vmshm_release_syncobj_handle, session);
+		idr_destroy(&session->file.syncobj_idr);
+	}
 	kfree(pfile);
 	kfree(session);
 	drm_dev_put(&ptdev->base);
@@ -1508,6 +1594,753 @@ int panthor_vmshm_vm_destroy(struct panthor_vmshm_session *session,
 }
 EXPORT_SYMBOL_GPL(panthor_vmshm_vm_destroy);
 
+int panthor_vmshm_bo_create(struct panthor_vmshm_session *session,
+			    struct drm_panthor_bo_create *args)
+{
+	struct panthor_file *pfile;
+	struct panthor_vm *vm = NULL;
+	u64 size;
+	int cookie, ret;
+
+	if (!session || !session->pfile || !args)
+		return -EINVAL;
+
+	pfile = session->pfile;
+	if (!drm_dev_enter(&pfile->ptdev->base, &cookie))
+		return -ENODEV;
+
+	if (!args->size || args->pad || (args->flags & ~PANTHOR_BO_FLAGS)) {
+		ret = -EINVAL;
+		goto out_dev_exit;
+	}
+
+	size = args->size;
+
+	if (args->exclusive_vm_id) {
+		vm = panthor_vm_pool_get_vm(pfile->vms, args->exclusive_vm_id);
+		if (!vm) {
+			ret = -EINVAL;
+			goto out_dev_exit;
+		}
+	}
+
+	ret = panthor_gem_create_with_handle(&session->file, &pfile->ptdev->base,
+					     vm, &size, args->flags,
+					     &args->handle);
+	if (!ret)
+		args->size = size;
+
+	panthor_vm_put(vm);
+
+out_dev_exit:
+	drm_dev_exit(cookie);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(panthor_vmshm_bo_create);
+
+int panthor_vmshm_bo_create_from_payload(struct panthor_vmshm_session *session,
+					 struct drm_panthor_bo_create *args,
+					 struct proxy_vmshm_object *payload)
+{
+	struct panthor_file *pfile;
+	struct panthor_vm *vm = NULL;
+	u64 size, payload_size;
+	int cookie, ret;
+
+	if (!session || !session->pfile || !args || !payload)
+		return -EINVAL;
+
+	pfile = session->pfile;
+	if (!drm_dev_enter(&pfile->ptdev->base, &cookie))
+		return -ENODEV;
+
+	if (!args->size || args->pad || (args->flags & ~PANTHOR_BO_FLAGS)) {
+		ret = -EINVAL;
+		goto out_dev_exit;
+	}
+
+	payload_size = proxy_vmshm_obj_size(payload);
+	if (!payload_size || args->size > payload_size) {
+		ret = -EINVAL;
+		goto out_dev_exit;
+	}
+
+	size = args->size;
+
+	if (args->exclusive_vm_id) {
+		vm = panthor_vm_pool_get_vm(pfile->vms, args->exclusive_vm_id);
+		if (!vm) {
+			ret = -EINVAL;
+			goto out_dev_exit;
+		}
+	}
+
+	ret = panthor_gem_create_vmshm_with_handle(&session->file,
+						   &pfile->ptdev->base,
+						   vm, &size, args->flags,
+						   &args->handle, payload);
+	if (!ret) {
+		args->size = size;
+		pr_info("panthor: BO_CREATE vmshm-backed handle=%u size=0x%llx payload=0x%llx payload_size=0x%llx segments=%u\n",
+			args->handle, args->size,
+			proxy_vmshm_obj_handle(payload),
+			(unsigned long long)payload_size,
+			proxy_vmshm_obj_nr_segments(payload));
+	}
+
+	panthor_vm_put(vm);
+
+out_dev_exit:
+	drm_dev_exit(cookie);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(panthor_vmshm_bo_create_from_payload);
+
+int panthor_vmshm_bo_destroy(struct panthor_vmshm_session *session,
+			     __u32 bo_handle)
+{
+	if (!session || !session->pfile)
+		return -EINVAL;
+
+	return drm_gem_handle_delete(&session->file, bo_handle);
+}
+EXPORT_SYMBOL_GPL(panthor_vmshm_bo_destroy);
+
+int panthor_vmshm_syncobj_create(struct panthor_vmshm_session *session,
+				 __u32 flags, __u32 *handle)
+{
+	struct drm_syncobj *syncobj;
+	int ret;
+
+	if (!session || !session->pfile || !handle)
+		return -EINVAL;
+	if (flags & ~DRM_SYNCOBJ_CREATE_SIGNALED)
+		return -EINVAL;
+
+	ret = drm_syncobj_create(&syncobj, flags, NULL);
+	if (ret)
+		return ret;
+
+	ret = drm_syncobj_get_handle(&session->file, syncobj, handle);
+	drm_syncobj_put(syncobj);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(panthor_vmshm_syncobj_create);
+
+int panthor_vmshm_syncobj_destroy(struct panthor_vmshm_session *session,
+				  __u32 handle)
+{
+	struct drm_syncobj *syncobj;
+
+	if (!session || !session->pfile || !handle)
+		return -EINVAL;
+
+	spin_lock(&session->file.syncobj_table_lock);
+	syncobj = idr_remove(&session->file.syncobj_idr, handle);
+	spin_unlock(&session->file.syncobj_table_lock);
+
+	if (!syncobj)
+		return -EINVAL;
+
+	drm_syncobj_put(syncobj);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(panthor_vmshm_syncobj_destroy);
+
+static s64 panthor_vmshm_rel_timeout_to_abs_ns(s64 rel_timeout_ns)
+{
+	s64 now_ns;
+
+	if (rel_timeout_ns <= 0)
+		return 0;
+
+	now_ns = ktime_get_ns();
+	if (rel_timeout_ns > S64_MAX - now_ns)
+		return S64_MAX;
+
+	return now_ns + rel_timeout_ns;
+}
+
+static u64 panthor_vmshm_rel_deadline_to_abs_ns(u64 rel_deadline_ns)
+{
+	u64 now_ns;
+
+	if (!rel_deadline_ns)
+		return 0;
+
+	now_ns = ktime_get_ns();
+	if (rel_deadline_ns > U64_MAX - now_ns)
+		return U64_MAX;
+
+	return now_ns + rel_deadline_ns;
+}
+
+int panthor_vmshm_syncobj_wait(struct panthor_vmshm_session *session,
+			       const __u32 *handles, __u32 count_handles,
+			       __s64 timeout_rel_nsec, __u32 flags,
+			       __u64 deadline_rel_nsec, __u32 *first_signaled)
+{
+	s64 timeout_abs_nsec;
+	u64 deadline_abs_nsec = 0;
+
+	if (!session || !session->pfile ||
+	    (count_handles && !handles) || !first_signaled)
+		return -EINVAL;
+	if (count_handles > PANTHOR_VMSHM_MAX_SYNCOBJ_WAIT_HANDLES)
+		return -E2BIG;
+
+	timeout_abs_nsec =
+		panthor_vmshm_rel_timeout_to_abs_ns(timeout_rel_nsec);
+	if (flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_DEADLINE)
+		deadline_abs_nsec =
+			panthor_vmshm_rel_deadline_to_abs_ns(deadline_rel_nsec);
+
+	return drm_syncobj_wait_handles(&session->file, handles, count_handles,
+					timeout_abs_nsec, flags,
+					deadline_abs_nsec, first_signaled);
+}
+EXPORT_SYMBOL_GPL(panthor_vmshm_syncobj_wait);
+
+int panthor_vmshm_syncobj_transfer(struct panthor_vmshm_session *session,
+				   struct drm_syncobj_transfer *args)
+{
+	if (!session || !session->pfile || !args)
+		return -EINVAL;
+
+	return drm_syncobj_transfer(&session->file, args);
+}
+EXPORT_SYMBOL_GPL(panthor_vmshm_syncobj_transfer);
+
+int panthor_vmshm_syncobj_timeline_wait(
+	struct panthor_vmshm_session *session, const __u32 *handles,
+	const __u64 *points, __u32 count_handles, __s64 timeout_rel_nsec,
+	__u32 flags, __u64 deadline_rel_nsec, __u32 *first_signaled)
+{
+	s64 timeout_abs_nsec;
+	u64 deadline_abs_nsec = 0;
+
+	if (!session || !session->pfile || !first_signaled ||
+	    (count_handles && (!handles || !points)))
+		return -EINVAL;
+	if (count_handles > PANTHOR_VMSHM_MAX_SYNCOBJ_WAIT_HANDLES)
+		return -E2BIG;
+
+	timeout_abs_nsec =
+		panthor_vmshm_rel_timeout_to_abs_ns(timeout_rel_nsec);
+	if (flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_DEADLINE)
+		deadline_abs_nsec =
+			panthor_vmshm_rel_deadline_to_abs_ns(deadline_rel_nsec);
+
+	return drm_syncobj_timeline_wait_handles(
+		&session->file, handles, points, count_handles,
+		timeout_abs_nsec, flags, deadline_abs_nsec, first_signaled);
+}
+EXPORT_SYMBOL_GPL(panthor_vmshm_syncobj_timeline_wait);
+
+int panthor_vmshm_syncobj_reset(struct panthor_vmshm_session *session,
+				const __u32 *handles, __u32 count_handles)
+{
+	if (!session || !session->pfile || (count_handles && !handles))
+		return -EINVAL;
+	if (count_handles > PANTHOR_VMSHM_MAX_SYNCOBJ_WAIT_HANDLES)
+		return -E2BIG;
+
+	return drm_syncobj_reset_handles(&session->file, handles,
+					 count_handles);
+}
+EXPORT_SYMBOL_GPL(panthor_vmshm_syncobj_reset);
+
+int panthor_vmshm_syncobj_signal(struct panthor_vmshm_session *session,
+				 const __u32 *handles, __u32 count_handles)
+{
+	if (!session || !session->pfile || (count_handles && !handles))
+		return -EINVAL;
+	if (count_handles > PANTHOR_VMSHM_MAX_SYNCOBJ_WAIT_HANDLES)
+		return -E2BIG;
+
+	return drm_syncobj_signal_handles(&session->file, handles,
+					  count_handles);
+}
+EXPORT_SYMBOL_GPL(panthor_vmshm_syncobj_signal);
+
+int panthor_vmshm_syncobj_timeline_signal(
+	struct panthor_vmshm_session *session, const __u32 *handles,
+	const __u64 *points, __u32 count_handles, __u32 flags)
+{
+	if (!session || !session->pfile ||
+	    (count_handles && (!handles || !points)))
+		return -EINVAL;
+	if (count_handles > PANTHOR_VMSHM_MAX_SYNCOBJ_WAIT_HANDLES)
+		return -E2BIG;
+
+	return drm_syncobj_timeline_signal_handles(&session->file, handles,
+						   points, count_handles,
+						   flags);
+}
+EXPORT_SYMBOL_GPL(panthor_vmshm_syncobj_timeline_signal);
+
+int panthor_vmshm_syncobj_query(struct panthor_vmshm_session *session,
+				const __u32 *handles, __u64 *points,
+				__u32 count_handles, __u32 flags)
+{
+	if (!session || !session->pfile ||
+	    (count_handles && (!handles || !points)))
+		return -EINVAL;
+	if (count_handles > PANTHOR_VMSHM_MAX_SYNCOBJ_WAIT_HANDLES)
+		return -E2BIG;
+
+	return drm_syncobj_query_handles(&session->file, handles, points,
+					 count_handles, flags);
+}
+EXPORT_SYMBOL_GPL(panthor_vmshm_syncobj_query);
+
+static int
+panthor_vmshm_vm_bind_async(struct panthor_vmshm_session *session,
+			    struct panthor_vm *vm,
+			    const struct drm_panthor_vm_bind_op *ops,
+			    __u32 op_count,
+			    const struct drm_panthor_sync_op *syncs,
+			    const __u32 *sync_starts,
+			    const __u32 *sync_counts, __u32 sync_count,
+			    __u32 *failed_op)
+{
+	struct panthor_submit_ctx ctx;
+	int ret;
+
+	if (!op_count)
+		return 0;
+	if (!sync_starts || !sync_counts)
+		return -EINVAL;
+
+	for (u32 i = 0; i < op_count; i++) {
+		__u32 sync_start = sync_starts[i];
+		__u32 op_sync_count = sync_counts[i];
+		__u32 op_type = ops[i].flags & DRM_PANTHOR_VM_BIND_OP_TYPE_MASK;
+
+		if (op_sync_count &&
+		    (!syncs || sync_start >= sync_count ||
+		     op_sync_count > sync_count ||
+		     sync_start > sync_count - op_sync_count))
+			return -EINVAL;
+
+		if (op_type == DRM_PANTHOR_VM_BIND_OP_TYPE_SYNC_ONLY &&
+		    !op_sync_count)
+			return -EINVAL;
+
+		for (u32 j = 0; j < op_sync_count; j++) {
+			ret = panthor_check_sync_op(&syncs[sync_start + j]);
+			if (ret)
+				return ret;
+		}
+	}
+
+	ret = panthor_submit_ctx_init(&ctx, &session->file, op_count);
+	if (ret)
+		return ret;
+
+	for (u32 i = 0; i < op_count; i++) {
+		struct drm_sched_job *job;
+		struct drm_panthor_vm_bind_op op = ops[i];
+		const struct drm_panthor_sync_op *op_syncs = NULL;
+
+		op.syncs.count = sync_counts[i];
+		op.syncs.stride = sizeof(*op_syncs);
+		op.syncs.array = 0;
+
+		job = panthor_vm_bind_job_create(&session->file, vm, &op);
+		if (IS_ERR(job)) {
+			ret = PTR_ERR(job);
+			if (failed_op)
+				*failed_op = i;
+			goto out_cleanup_submit_ctx;
+		}
+
+		if (sync_counts[i])
+			op_syncs = &syncs[sync_starts[i]];
+
+		ret = panthor_submit_ctx_add_job_kernel_syncs(
+			&ctx, i, job, op_syncs, sync_counts[i]);
+		if (ret) {
+			if (failed_op)
+				*failed_op = i;
+			goto out_cleanup_submit_ctx;
+		}
+	}
+
+	ret = panthor_submit_ctx_collect_jobs_signal_ops(&ctx);
+	if (ret)
+		goto out_cleanup_submit_ctx;
+
+	drm_exec_until_all_locked(&ctx.exec)
+	{
+		for (u32 i = 0; i < ctx.job_count; i++) {
+			ret = panthor_vm_bind_job_prepare_resvs(&ctx.exec,
+							       ctx.jobs[i].job);
+			drm_exec_retry_on_contention(&ctx.exec);
+			if (ret)
+				goto out_cleanup_submit_ctx;
+		}
+	}
+
+	ret = panthor_submit_ctx_add_deps_and_arm_jobs(&ctx);
+	if (ret)
+		goto out_cleanup_submit_ctx;
+
+	panthor_submit_ctx_push_jobs(&ctx, panthor_vm_bind_job_update_resvs);
+
+out_cleanup_submit_ctx:
+	panthor_submit_ctx_cleanup(&ctx, panthor_vm_bind_job_put);
+	return ret;
+}
+
+int panthor_vmshm_vm_bind(struct panthor_vmshm_session *session, __u32 vm_id,
+			  struct drm_panthor_vm_bind_op *ops, __u32 op_count,
+			  const struct drm_panthor_sync_op *syncs,
+			  const __u32 *sync_starts,
+			  const __u32 *sync_counts, __u32 sync_count,
+			  __u32 flags,
+			  __u32 *failed_op)
+{
+	struct panthor_file *pfile;
+	struct panthor_vm *vm;
+	int cookie, ret = 0;
+	u32 i;
+
+	if (failed_op)
+		*failed_op = PANTHOR_VMSHM_VM_BIND_FAILED_OP_NONE;
+
+	if (!session || !session->pfile || (op_count && !ops))
+		return -EINVAL;
+	if (op_count > PANTHOR_VMSHM_MAX_VM_BIND_OPS)
+		return -E2BIG;
+	if (flags & ~DRM_PANTHOR_VM_BIND_ASYNC)
+		return -EINVAL;
+	if (sync_count > PANTHOR_VMSHM_MAX_VM_BIND_SYNCS)
+		return -E2BIG;
+	if (sync_count && (!syncs || !sync_starts || !sync_counts))
+		return -EINVAL;
+
+	pfile = session->pfile;
+	if (!drm_dev_enter(&pfile->ptdev->base, &cookie))
+		return -ENODEV;
+
+	vm = panthor_vm_pool_get_vm(pfile->vms, vm_id);
+	if (!vm) {
+		ret = -EINVAL;
+		goto out_dev_exit;
+	}
+
+	if (flags & DRM_PANTHOR_VM_BIND_ASYNC) {
+		ret = panthor_vmshm_vm_bind_async(session, vm, ops,
+						  op_count, syncs, sync_starts,
+						  sync_counts, sync_count,
+						  failed_op);
+	} else {
+		if (sync_count)
+			ret = -EINVAL;
+
+		for (i = 0; !ret && i < op_count; i++) {
+			ret = panthor_vm_bind_exec_sync_op(&session->file, vm,
+							   &ops[i]);
+			if (ret) {
+				if (failed_op)
+					*failed_op = i;
+				break;
+			}
+		}
+	}
+
+	panthor_vm_put(vm);
+
+out_dev_exit:
+	drm_dev_exit(cookie);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(panthor_vmshm_vm_bind);
+
+int panthor_vmshm_vm_get_state(struct panthor_vmshm_session *session,
+				       __u32 vm_id, __u32 *state)
+{
+	struct panthor_file *pfile;
+	struct panthor_vm *vm;
+	int cookie, ret = 0;
+
+	if (!session || !session->pfile || !state)
+		return -EINVAL;
+
+	pfile = session->pfile;
+	if (!drm_dev_enter(&pfile->ptdev->base, &cookie))
+		return -ENODEV;
+
+	vm = panthor_vm_pool_get_vm(pfile->vms, vm_id);
+	if (!vm) {
+		ret = -EINVAL;
+		goto out_dev_exit;
+	}
+
+	if (panthor_vm_is_unusable(vm))
+		*state = DRM_PANTHOR_VM_STATE_UNUSABLE;
+	else
+		*state = DRM_PANTHOR_VM_STATE_USABLE;
+
+	panthor_vm_put(vm);
+
+out_dev_exit:
+	drm_dev_exit(cookie);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(panthor_vmshm_vm_get_state);
+
+int panthor_vmshm_group_create(struct panthor_vmshm_session *session,
+			       struct drm_panthor_group_create *args,
+			       const struct drm_panthor_queue_create *queues)
+{
+	struct panthor_file *pfile;
+	int cookie, ret;
+
+	if (!session || !session->pfile || !args || !queues)
+		return -EINVAL;
+	if (!args->queues.count ||
+	    args->queues.count > PANTHOR_VMSHM_MAX_GROUP_QUEUES)
+		return -EINVAL;
+	if (args->priority > PANTHOR_GROUP_PRIORITY_MEDIUM)
+		return -EACCES;
+
+	pfile = session->pfile;
+	if (!drm_dev_enter(&pfile->ptdev->base, &cookie))
+		return -ENODEV;
+
+	ret = panthor_group_create(pfile, args, queues);
+	if (ret >= 0) {
+		args->group_handle = ret;
+		ret = 0;
+	}
+
+	drm_dev_exit(cookie);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(panthor_vmshm_group_create);
+
+int panthor_vmshm_group_destroy(struct panthor_vmshm_session *session,
+				__u32 group_handle)
+{
+	struct panthor_file *pfile;
+	int cookie, ret;
+
+	if (!session || !session->pfile || !group_handle)
+		return -EINVAL;
+
+	pfile = session->pfile;
+	if (!drm_dev_enter(&pfile->ptdev->base, &cookie))
+		return -ENODEV;
+
+	ret = panthor_group_destroy(pfile, group_handle);
+	drm_dev_exit(cookie);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(panthor_vmshm_group_destroy);
+
+int panthor_vmshm_group_get_state(struct panthor_vmshm_session *session,
+				  struct drm_panthor_group_get_state *args)
+{
+	struct panthor_file *pfile;
+	int cookie, ret;
+
+	if (!session || !session->pfile || !args)
+		return -EINVAL;
+
+	pfile = session->pfile;
+	if (!drm_dev_enter(&pfile->ptdev->base, &cookie))
+		return -ENODEV;
+
+	ret = panthor_group_get_state(pfile, args);
+	drm_dev_exit(cookie);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(panthor_vmshm_group_get_state);
+
+int panthor_vmshm_group_submit(struct panthor_vmshm_session *session,
+			       __u32 group_handle,
+			       const struct drm_panthor_queue_submit *jobs,
+			       const struct drm_panthor_sync_op *syncs,
+			       const __u32 *sync_starts,
+			       const __u32 *sync_counts,
+			       __u32 job_count)
+{
+	struct panthor_file *pfile;
+	struct panthor_submit_ctx ctx;
+	int ret = 0, cookie;
+	u32 i;
+
+	if (!session || !session->pfile || !group_handle || !jobs ||
+	    !sync_starts || !sync_counts)
+		return -EINVAL;
+	if (!job_count || job_count > PANTHOR_VMSHM_MAX_GROUP_SUBMITS)
+		return -EINVAL;
+
+	for (i = 0; i < job_count; i++) {
+		u32 sync_start = sync_starts[i];
+		u32 sync_count = sync_counts[i];
+
+		if (sync_count &&
+		    (!syncs ||
+		     sync_start >= PANTHOR_VMSHM_MAX_GROUP_SUBMIT_SYNCS ||
+		     sync_count > PANTHOR_VMSHM_MAX_GROUP_SUBMIT_SYNCS ||
+		     sync_start > PANTHOR_VMSHM_MAX_GROUP_SUBMIT_SYNCS - sync_count))
+			return -EINVAL;
+
+		for (u32 j = 0; j < sync_count; j++) {
+			ret = panthor_check_sync_op(&syncs[sync_start + j]);
+			if (ret)
+				return ret;
+		}
+	}
+
+	pfile = session->pfile;
+	if (!drm_dev_enter(&pfile->ptdev->base, &cookie))
+		return -ENODEV;
+
+	ret = panthor_submit_ctx_init(&ctx, &session->file, job_count);
+	if (ret)
+		goto out_dev_exit;
+
+	for (i = 0; i < job_count; i++) {
+		struct drm_sched_job *job;
+		const struct drm_panthor_sync_op *job_syncs = NULL;
+
+		job = panthor_job_create(pfile, group_handle, &jobs[i]);
+		if (IS_ERR(job)) {
+			ret = PTR_ERR(job);
+			goto out_cleanup_submit_ctx;
+		}
+
+		if (sync_counts[i])
+			job_syncs = &syncs[sync_starts[i]];
+
+		ret = panthor_submit_ctx_add_job_kernel_syncs(
+			&ctx, i, job, job_syncs, sync_counts[i]);
+		if (ret)
+			goto out_cleanup_submit_ctx;
+	}
+
+	ret = panthor_submit_ctx_collect_jobs_signal_ops(&ctx);
+	if (ret)
+		goto out_cleanup_submit_ctx;
+
+	if (job_count > 0) {
+		struct panthor_vm *vm = panthor_job_vm(ctx.jobs[0].job);
+
+		drm_exec_until_all_locked(&ctx.exec)
+		{
+			ret = panthor_vm_prepare_mapped_bos_resvs(&ctx.exec, vm,
+								  job_count);
+		}
+		if (ret)
+			goto out_cleanup_submit_ctx;
+	}
+
+	ret = panthor_submit_ctx_add_deps_and_arm_jobs(&ctx);
+	if (ret)
+		goto out_cleanup_submit_ctx;
+
+	panthor_submit_ctx_push_jobs(&ctx, panthor_job_update_resvs);
+
+out_cleanup_submit_ctx:
+	panthor_submit_ctx_cleanup(&ctx, panthor_job_put);
+
+out_dev_exit:
+	drm_dev_exit(cookie);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(panthor_vmshm_group_submit);
+
+int panthor_vmshm_tiler_heap_create(struct panthor_vmshm_session *session,
+				    struct drm_panthor_tiler_heap_create *args)
+{
+	struct panthor_file *pfile;
+	struct panthor_heap_pool *pool;
+	struct panthor_vm *vm;
+	int cookie, ret;
+
+	if (!session || !session->pfile || !args)
+		return -EINVAL;
+
+	pfile = session->pfile;
+	if (!drm_dev_enter(&pfile->ptdev->base, &cookie))
+		return -ENODEV;
+
+	vm = panthor_vm_pool_get_vm(pfile->vms, args->vm_id);
+	if (!vm) {
+		ret = -EINVAL;
+		goto out_dev_exit;
+	}
+
+	pool = panthor_vm_get_heap_pool(vm, true);
+	if (IS_ERR(pool)) {
+		ret = PTR_ERR(pool);
+		goto out_put_vm;
+	}
+
+	ret = panthor_heap_create(pool, args->initial_chunk_count,
+				  args->chunk_size, args->max_chunks,
+				  args->target_in_flight,
+				  &args->tiler_heap_ctx_gpu_va,
+				  &args->first_heap_chunk_gpu_va);
+	if (ret >= 0) {
+		args->handle = (args->vm_id << 16) | ret;
+		ret = 0;
+	}
+
+	panthor_heap_pool_put(pool);
+
+out_put_vm:
+	panthor_vm_put(vm);
+
+out_dev_exit:
+	drm_dev_exit(cookie);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(panthor_vmshm_tiler_heap_create);
+
+int panthor_vmshm_tiler_heap_destroy(struct panthor_vmshm_session *session,
+				     __u32 heap_handle)
+{
+	struct panthor_file *pfile;
+	struct panthor_heap_pool *pool;
+	struct panthor_vm *vm;
+	int cookie, ret;
+
+	if (!session || !session->pfile || !heap_handle)
+		return -EINVAL;
+
+	pfile = session->pfile;
+	if (!drm_dev_enter(&pfile->ptdev->base, &cookie))
+		return -ENODEV;
+
+	vm = panthor_vm_pool_get_vm(pfile->vms, heap_handle >> 16);
+	if (!vm) {
+		ret = -EINVAL;
+		goto out_dev_exit;
+	}
+
+	pool = panthor_vm_get_heap_pool(vm, false);
+	if (IS_ERR(pool)) {
+		ret = PTR_ERR(pool);
+		goto out_put_vm;
+	}
+
+	ret = panthor_heap_destroy(pool, heap_handle & GENMASK(15, 0));
+	panthor_heap_pool_put(pool);
+
+out_put_vm:
+	panthor_vm_put(vm);
+
+out_dev_exit:
+	drm_dev_exit(cookie);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(panthor_vmshm_tiler_heap_destroy);
+
 #define PANTHOR_VM_CREATE_FLAGS 0
 
 static int panthor_ioctl_vm_create(struct drm_device *ddev, void *data,
@@ -1543,8 +2376,6 @@ static int panthor_ioctl_vm_destroy(struct drm_device *ddev, void *data,
 
 	return panthor_vm_pool_destroy_vm(pfile->vms, args->id);
 }
-
-#define PANTHOR_BO_FLAGS DRM_PANTHOR_BO_NO_MMAP
 
 static int panthor_ioctl_bo_create(struct drm_device *ddev, void *data,
 				   struct drm_file *file)

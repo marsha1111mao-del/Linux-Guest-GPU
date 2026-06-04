@@ -23,6 +23,7 @@
 #include <linux/kmemleak.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
+#include <linux/proxy_vmshm.h>
 #include <linux/rwsem.h>
 #include <linux/sched.h>
 #include <linux/shmem_fs.h>
@@ -209,6 +210,17 @@ struct panthor_vm_op_ctx {
 		 * to allocate in ::run_job().
 		 */
 		struct sg_table *sgt;
+
+		/**
+		 * @vmshm_spans: Translated vmshm-object payload spans.
+		 *
+		 * Only set for vmshm-backed GEMs. These spans cover the original
+		 * map request and are consumed by the GPUVA map step.
+		 */
+		struct proxy_vmshm_span *vmshm_spans;
+
+		/** @vmshm_span_count: Number of entries in @vmshm_spans. */
+		unsigned int vmshm_span_count;
 
 		/**
 		 * @new_vma: The new VMA object that will be inserted to the VA tree.
@@ -1029,6 +1041,109 @@ static int panthor_vm_map_pages(struct panthor_vm *vm, u64 iova, int prot,
 	return panthor_vm_flush_range(vm, start_iova, iova - start_iova);
 }
 
+static int
+panthor_vm_map_paddr_range(struct panthor_vm *vm, u64 start_iova,
+			   u64 *cur_iova, phys_addr_t paddr, int prot,
+			   size_t len)
+{
+	struct panthor_device *ptdev = vm->ptdev;
+	struct io_pgtable_ops *ops = vm->pgtbl_ops;
+	int ret;
+
+	if (!cur_iova || !len)
+		return -EINVAL;
+	if (!IS_ALIGNED((*cur_iova | (u64)paddr | len), SZ_4K))
+		return -EINVAL;
+
+	while (len) {
+		size_t pgcount, mapped = 0;
+		size_t pgsize = get_pgsize(*cur_iova, len, &pgcount);
+
+		ret = ops->map_pages(ops, *cur_iova, paddr, pgsize, pgcount,
+				     prot, GFP_KERNEL, &mapped);
+		*cur_iova += mapped;
+		paddr += mapped;
+		len -= mapped;
+
+		if (drm_WARN_ON(&ptdev->base, !ret && !mapped))
+			ret = -ENOMEM;
+
+		if (ret) {
+			drm_WARN_ON(&ptdev->base,
+				    panthor_vm_unmap_pages(vm, start_iova,
+							   *cur_iova - start_iova));
+			return ret;
+		}
+	}
+
+	return 0;
+}
+
+static int
+panthor_vm_map_vmshm_spans(struct panthor_vm *vm, u64 iova, int prot,
+			   const struct proxy_vmshm_span *spans,
+			   unsigned int span_count, u64 offset, u64 size)
+{
+	u64 end, expected_iova, start_iova = iova;
+	unsigned int i;
+	int ret;
+
+	if (!spans || !span_count)
+		return -EINVAL;
+	if (size > U64_MAX - offset)
+		return -EOVERFLOW;
+
+	end = offset + size;
+	expected_iova = iova;
+
+	for (i = 0; i < span_count; i++) {
+		const struct proxy_vmshm_span *span = &spans[i];
+		u64 span_start = span->logical_offset;
+		u64 span_end = span_start + span->size;
+		u64 start, stop, delta;
+		phys_addr_t paddr;
+
+		if (span_end <= offset || span_start >= end)
+			continue;
+
+		start = max(offset, span_start);
+		stop = min(end, span_end);
+		if (stop <= start)
+			continue;
+
+		if (expected_iova != iova + start - offset) {
+			if (expected_iova != start_iova)
+				drm_WARN_ON(&vm->ptdev->base,
+					    panthor_vm_unmap_pages(
+						    vm, start_iova,
+						    expected_iova - start_iova));
+			return -EINVAL;
+		}
+
+		delta = start - span_start;
+		paddr = span->gpa + delta;
+		ret = panthor_vm_map_paddr_range(vm, start_iova, &expected_iova,
+						 paddr, prot, stop - start);
+		if (ret)
+			return ret;
+	}
+
+	if (expected_iova != iova + size) {
+		if (expected_iova != start_iova)
+			drm_WARN_ON(&vm->ptdev->base,
+				    panthor_vm_unmap_pages(
+					    vm, start_iova,
+					    expected_iova - start_iova));
+		return -EINVAL;
+	}
+
+	if (span_count)
+		pr_info("panthor: VM_BIND vmshm payload mapped iova=0x%llx size=0x%llx spans=%u first_gpa=%pa\n",
+			start_iova, size, span_count, &spans[0].gpa);
+
+	return panthor_vm_flush_range(vm, start_iova, size);
+}
+
 static int flags_to_prot(u32 flags)
 {
 	int prot = 0;
@@ -1133,7 +1248,8 @@ static void panthor_vm_bo_put(struct drm_gpuvm_bo *vm_bo)
 	/* If the vm_bo object was destroyed, release the pin reference that
 	 * was hold by this object.
 	 */
-	if (unpin && !bo->base.base.import_attach)
+	if (unpin && !bo->base.base.import_attach &&
+	    !panthor_gem_is_vmshm_backed(bo))
 		drm_gem_shmem_unpin(&bo->base);
 
 	drm_gpuvm_put(vm);
@@ -1155,6 +1271,7 @@ static void panthor_vm_cleanup_op_ctx(struct panthor_vm_op_ctx *op_ctx,
 	}
 
 	kfree(op_ctx->rsvd_page_tables.pages);
+	kfree(op_ctx->map.vmshm_spans);
 
 	if (op_ctx->map.vm_bo)
 		panthor_vm_bo_put(op_ctx->map.vm_bo);
@@ -1233,8 +1350,10 @@ static int panthor_vm_prepare_map_op_ctx(struct panthor_vm_op_ctx *op_ctx,
 {
 	struct drm_gpuvm_bo *preallocated_vm_bo;
 	struct sg_table *sgt = NULL;
+	bool vmshm_backed;
 	u64 pt_count;
 	int ret;
+	unsigned int max_spans = 0;
 
 	if (!bo)
 		return -EINVAL;
@@ -1258,12 +1377,35 @@ static int panthor_vm_prepare_map_op_ctx(struct panthor_vm_op_ctx *op_ctx,
 	op_ctx->flags = flags;
 	op_ctx->va.range = size;
 	op_ctx->va.addr = va;
+	op_ctx->map.bo_offset = offset;
+	vmshm_backed = panthor_gem_is_vmshm_backed(bo);
 
 	ret = panthor_vm_op_ctx_prealloc_vmas(op_ctx);
 	if (ret)
 		goto err_cleanup;
 
-	if (!bo->base.base.import_attach) {
+	if (vmshm_backed) {
+		max_spans = proxy_vmshm_obj_nr_segments(bo->vmshm_payload);
+		if (!max_spans) {
+			ret = -EINVAL;
+			goto err_cleanup;
+		}
+
+		op_ctx->map.vmshm_spans =
+			kcalloc(max_spans, sizeof(*op_ctx->map.vmshm_spans),
+				GFP_KERNEL);
+		if (!op_ctx->map.vmshm_spans) {
+			ret = -ENOMEM;
+			goto err_cleanup;
+		}
+
+		ret = proxy_vmshm_obj_translate(bo->vmshm_payload, offset, size,
+						op_ctx->map.vmshm_spans,
+						max_spans,
+						&op_ctx->map.vmshm_span_count);
+		if (ret)
+			goto err_cleanup;
+	} else if (!bo->base.base.import_attach) {
 		/* Pre-reserve the BO pages, so the map operation doesn't have to
 		 * allocate.
 		 */
@@ -1272,20 +1414,22 @@ static int panthor_vm_prepare_map_op_ctx(struct panthor_vm_op_ctx *op_ctx,
 			goto err_cleanup;
 	}
 
-	sgt = drm_gem_shmem_get_pages_sgt(&bo->base);
-	if (IS_ERR(sgt)) {
-		if (!bo->base.base.import_attach)
-			drm_gem_shmem_unpin(&bo->base);
+	if (!vmshm_backed) {
+		sgt = drm_gem_shmem_get_pages_sgt(&bo->base);
+		if (IS_ERR(sgt)) {
+			if (!bo->base.base.import_attach)
+				drm_gem_shmem_unpin(&bo->base);
 
-		ret = PTR_ERR(sgt);
-		goto err_cleanup;
+			ret = PTR_ERR(sgt);
+			goto err_cleanup;
+		}
 	}
 
 	op_ctx->map.sgt = sgt;
 
 	preallocated_vm_bo = drm_gpuvm_bo_create(&vm->base, &bo->base.base);
 	if (!preallocated_vm_bo) {
-		if (!bo->base.base.import_attach)
+		if (!bo->base.base.import_attach && !vmshm_backed)
 			drm_gem_shmem_unpin(&bo->base);
 
 		ret = -ENOMEM;
@@ -1311,10 +1455,8 @@ static int panthor_vm_prepare_map_op_ctx(struct panthor_vm_op_ctx *op_ctx,
 	 * which will be released in panthor_vm_bo_put().
 	 */
 	if (preallocated_vm_bo != op_ctx->map.vm_bo &&
-	    !bo->base.base.import_attach)
+	    !bo->base.base.import_attach && !vmshm_backed)
 		drm_gem_shmem_unpin(&bo->base);
-
-	op_ctx->map.bo_offset = offset;
 
 	/* L1, L2 and L3 page tables.
 	 * We could optimize L3 allocation by iterating over the sgt and merging
@@ -2066,6 +2208,7 @@ static int panthor_gpuva_sm_step_map(struct drm_gpuva_op *op, void *priv)
 	struct panthor_vm *vm = priv;
 	struct panthor_vm_op_ctx *op_ctx = vm->op_ctx;
 	struct panthor_vma *vma = panthor_vm_op_ctx_get_vma(op_ctx);
+	struct panthor_gem_object *bo = to_panthor_bo(op->map.gem.obj);
 	int ret;
 
 	if (!vma)
@@ -2073,9 +2216,19 @@ static int panthor_gpuva_sm_step_map(struct drm_gpuva_op *op, void *priv)
 
 	panthor_vma_init(vma, op_ctx->flags & PANTHOR_VM_MAP_FLAGS);
 
-	ret = panthor_vm_map_pages(vm, op->map.va.addr,
-				   flags_to_prot(vma->flags), op_ctx->map.sgt,
-				   op->map.gem.offset, op->map.va.range);
+	if (panthor_gem_is_vmshm_backed(bo))
+		ret = panthor_vm_map_vmshm_spans(vm, op->map.va.addr,
+						 flags_to_prot(vma->flags),
+						 op_ctx->map.vmshm_spans,
+						 op_ctx->map.vmshm_span_count,
+						 op->map.gem.offset,
+						 op->map.va.range);
+	else
+		ret = panthor_vm_map_pages(vm, op->map.va.addr,
+					   flags_to_prot(vma->flags),
+					   op_ctx->map.sgt,
+					   op->map.gem.offset,
+					   op->map.va.range);
 	if (ret)
 		return ret;
 
@@ -2260,11 +2413,13 @@ static void panthor_vm_bind_job_release(struct kref *kref)
  */
 void panthor_vm_bind_job_put(struct drm_sched_job *sched_job)
 {
-	struct panthor_vm_bind_job *job =
-		container_of(sched_job, struct panthor_vm_bind_job, base);
+	struct panthor_vm_bind_job *job;
 
-	if (sched_job)
-		kref_put(&job->refcount, panthor_vm_bind_job_release);
+	if (!sched_job)
+		return;
+
+	job = container_of(sched_job, struct panthor_vm_bind_job, base);
+	kref_put(&job->refcount, panthor_vm_bind_job_release);
 }
 
 static void panthor_vm_bind_free_job(struct drm_sched_job *sched_job)

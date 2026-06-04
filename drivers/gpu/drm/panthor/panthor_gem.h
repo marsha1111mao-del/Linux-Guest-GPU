@@ -12,6 +12,7 @@
 #include <linux/rwsem.h>
 
 struct panthor_vm;
+struct proxy_vmshm_object;
 
 /**
  * struct panthor_gem_object - Driver specific GEM object.
@@ -46,6 +47,14 @@ struct panthor_gem_object {
 
 	/** @flags: Combination of drm_panthor_bo_flags flags. */
 	u32 flags;
+
+	/**
+	 * @vmshm_payload: vmshm-object backing for shared GPU virtualization BOs.
+	 *
+	 * When set, VM_BIND maps this payload directly instead of using the shmem
+	 * GEM page list. The object is pinned for the GEM lifetime.
+	 */
+	struct proxy_vmshm_object *vmshm_payload;
 };
 
 /**
@@ -92,9 +101,21 @@ panthor_gem_prime_import_sg_table(struct drm_device *ddev,
 
 int
 panthor_gem_create_with_handle(struct drm_file *file,
-			       struct drm_device *ddev,
-			       struct panthor_vm *exclusive_vm,
-			       u64 *size, u32 flags, uint32_t *handle);
+				       struct drm_device *ddev,
+				       struct panthor_vm *exclusive_vm,
+				       u64 *size, u32 flags, uint32_t *handle);
+int
+panthor_gem_create_vmshm_with_handle(struct drm_file *file,
+				     struct drm_device *ddev,
+				     struct panthor_vm *exclusive_vm,
+				     u64 *size, u32 flags, uint32_t *handle,
+				     struct proxy_vmshm_object *payload);
+
+static inline bool
+panthor_gem_is_vmshm_backed(const struct panthor_gem_object *bo)
+{
+	return bo && bo->vmshm_payload;
+}
 
 static inline u64
 panthor_kernel_bo_gpuva(struct panthor_kernel_bo *bo)
