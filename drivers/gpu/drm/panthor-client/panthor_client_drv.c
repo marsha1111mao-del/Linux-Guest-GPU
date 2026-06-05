@@ -130,6 +130,10 @@ struct panthor_client_syncobj_timeline_wait_legacy {
 	DRM_IOWR(0xCA, struct panthor_client_syncobj_timeline_wait_legacy)
 
 static struct panthor_client_device *panthor_client;
+static bool panthor_client_bo_mmap_cached;
+module_param_named(bo_mmap_cached, panthor_client_bo_mmap_cached, bool, 0644);
+MODULE_PARM_DESC(bo_mmap_cached,
+		 "Map shared-virtualization BO payloads as cached WB instead of write-combine");
 
 static int panthor_client_bo_destroy_rpc_session(u64 session_id,
 						 u32 client_bo_handle,
@@ -1089,9 +1093,9 @@ static int panthor_client_syncobj_wait(struct panthor_client_file *pcfile,
 	}
 
 	args->first_signaled = rsp.first_signaled;
-	pr_info("panthor-client: SYNCOBJ_WAIT session=%llu count=%u flags=0x%x first=%u\n",
-		pcfile->session_id, args->count_handles, args->flags,
-		rsp.first_signaled);
+	pr_info_ratelimited("panthor-client: SYNCOBJ_WAIT session=%llu count=%u flags=0x%x first=%u\n",
+			    pcfile->session_id, args->count_handles,
+			    args->flags, rsp.first_signaled);
 	ret = 0;
 	goto out_put_syncobjs;
 
@@ -1239,9 +1243,9 @@ panthor_client_syncobj_timeline_wait(
 	}
 
 	args->first_signaled = rsp.first_signaled;
-	pr_info("panthor-client: SYNCOBJ_TIMELINE_WAIT session=%llu count=%u flags=0x%x first=%u\n",
-		pcfile->session_id, args->count_handles, args->flags,
-		rsp.first_signaled);
+	pr_info_ratelimited("panthor-client: SYNCOBJ_TIMELINE_WAIT session=%llu count=%u flags=0x%x first=%u\n",
+			    pcfile->session_id, args->count_handles,
+			    args->flags, rsp.first_signaled);
 	ret = 0;
 	goto out_put_syncobjs;
 
@@ -1844,11 +1848,11 @@ panthor_client_group_submit(struct panthor_client_file *pcfile,
 		goto out_put_refs;
 	}
 
-		pr_info("panthor-client: GROUP_SUBMIT session=%llu client_group=%u proxy_group=%u jobs=%u syncs=%u first_stream=0x%llx first_size=%u first_latest_flush=0x%x\n",
-			pcfile->session_id, args->group_handle, rsp.proxy_group_handle,
-			req.job_count, req.sync_count,
-			req.jobs[0].stream_addr, req.jobs[0].stream_size,
-			req.jobs[0].latest_flush);
+	pr_info_ratelimited("panthor-client: GROUP_SUBMIT session=%llu client_group=%u proxy_group=%u jobs=%u syncs=%u first_stream=0x%llx first_size=%u first_latest_flush=0x%x\n",
+			    pcfile->session_id, args->group_handle,
+			    rsp.proxy_group_handle, req.job_count, req.sync_count,
+			    req.jobs[0].stream_addr, req.jobs[0].stream_size,
+			    req.jobs[0].latest_flush);
 	ret = 0;
 	goto out_put_refs;
 
@@ -2120,9 +2124,9 @@ static int panthor_client_vm_bind(struct panthor_client_file *pcfile,
 		goto out_put_refs;
 	}
 
-	pr_info("panthor-client: VM_BIND session=%llu client_vm=%u proxy_vm=%u ops=%u syncs=%u flags=0x%x\n",
-		pcfile->session_id, args->vm_id, rsp.proxy_vm_id,
-		args->ops.count, sync_count, args->flags);
+	pr_info_ratelimited("panthor-client: VM_BIND session=%llu client_vm=%u proxy_vm=%u ops=%u syncs=%u flags=0x%x\n",
+			    pcfile->session_id, args->vm_id, rsp.proxy_vm_id,
+			    args->ops.count, sync_count, args->flags);
 	ret = 0;
 	goto out_put_refs;
 
@@ -2221,9 +2225,10 @@ static int panthor_client_bo_create(struct panthor_client_file *pcfile,
 	args->size = rsp.size;
 	args->handle = rsp.client_bo_handle;
 
-	pr_info("panthor-client: BO_CREATE session=%llu client_bo=%u proxy_bo=%u size=0x%llx payload=0x%llx payload_size=0x%llx\n",
-		pcfile->session_id, rsp.client_bo_handle, rsp.proxy_bo_handle,
-		rsp.size, rsp.payload_handle, rsp.payload_size);
+	pr_info_ratelimited("panthor-client: BO_CREATE session=%llu client_bo=%u proxy_bo=%u size=0x%llx payload=0x%llx payload_size=0x%llx\n",
+			    pcfile->session_id, rsp.client_bo_handle,
+			    rsp.proxy_bo_handle, rsp.size, rsp.payload_handle,
+			    rsp.payload_size);
 	return 0;
 }
 
@@ -2718,7 +2723,8 @@ static int panthor_client_mmap(struct file *filp, struct vm_area_struct *vma)
 
 	gpa = client_vmshm_object_gpa(bo->payload_obj) + bo_offset;
 	vm_flags_set(vma, VM_IO | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP);
-	vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
+	if (!panthor_client_bo_mmap_cached)
+		vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
 	vma->vm_private_data = bo;
 	vma->vm_ops = &panthor_client_bo_vm_ops;
 
@@ -2729,9 +2735,10 @@ static int panthor_client_mmap(struct file *filp, struct vm_area_struct *vma)
 		goto out_put_bo;
 	}
 
-	pr_info("panthor-client: MMAP session=%llu client_bo=%u offset=0x%llx bo_offset=0x%llx size=0x%llx payload_gpa=%pa\n",
+	pr_info("panthor-client: MMAP session=%llu client_bo=%u offset=0x%llx bo_offset=0x%llx size=0x%llx payload_gpa=%pa attr=%s\n",
 		pcfile->session_id, bo->client_handle, offset, bo_offset,
-		map_size, &gpa);
+		map_size, &gpa,
+		panthor_client_bo_mmap_cached ? "WB" : "WC");
 	return 0;
 
 out_put_bo:
@@ -2976,6 +2983,9 @@ static int __init panthor_client_init(void)
 {
 	struct platform_device *pdev;
 	int ret;
+
+	pr_info("panthor-client: BO mmap cached=%d\n",
+		panthor_client_bo_mmap_cached ? 1 : 0);
 
 	pdev = platform_device_register_simple(PLATFORM_NAME, -1, NULL, 0);
 	if (IS_ERR(pdev))

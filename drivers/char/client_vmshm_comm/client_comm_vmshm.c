@@ -25,6 +25,7 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
+#include <linux/panthor_vmshm.h>
 #include <linux/platform_device.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
@@ -58,6 +59,7 @@
 #define CLIENT_COMM_VMSHM_PERF_RTT_ITERS	1000
 #define CLIENT_COMM_VMSHM_PERF_BURST_ITERS	1024
 #define CLIENT_COMM_VMSHM_PERF_BURST_DEPTH	64
+#define CLIENT_COMM_VMSHM_RPC_STATS_MAX		64
 
 enum proxy_comm_vmshm_status {
 	PROXY_COMM_VMSHM_STATUS_RESET = 0,
@@ -224,10 +226,269 @@ struct client_comm_vmshm_waiter {
 	int status;
 };
 
+struct client_comm_vmshm_rpc_stat {
+	bool valid;
+	u32 req_type;
+	u64 calls;
+	u64 errors;
+	u64 timeouts;
+	u64 total_ns;
+	u64 total_max_ns;
+	u64 lock_wait_ns;
+	u64 lock_wait_max_ns;
+	u64 send_ns;
+	u64 send_max_ns;
+	u64 wait_ns;
+	u64 wait_max_ns;
+	u64 poll_recv_ns;
+	u64 poll_recv_max_ns;
+	u64 poll_sleeps;
+};
+
+struct client_comm_vmshm_rpc_sample {
+	u32 req_type;
+	int ret;
+	u64 total_ns;
+	u64 lock_wait_ns;
+	u64 send_ns;
+	u64 wait_ns;
+	u64 poll_recv_ns;
+	u64 poll_sleeps;
+};
+
 static struct client_comm_vmshm_dev client_comm_vmshm_dev = {
 	.lock = __MUTEX_INITIALIZER(client_comm_vmshm_dev.lock),
 	.rpc_lock = __MUTEX_INITIALIZER(client_comm_vmshm_dev.rpc_lock),
 };
+static DEFINE_SPINLOCK(client_comm_vmshm_rpc_stats_lock);
+static bool client_comm_vmshm_rpc_stats_enabled;
+static struct client_comm_vmshm_rpc_stat
+	client_comm_vmshm_rpc_stats[CLIENT_COMM_VMSHM_RPC_STATS_MAX];
+
+static bool client_comm_vmshm_rpc_stats_is_enabled(void)
+{
+	return READ_ONCE(client_comm_vmshm_rpc_stats_enabled);
+}
+
+static const char *client_comm_vmshm_req_name(u32 type)
+{
+	switch (type) {
+	case VMSHM_COMM_SELFTEST_HELLO_REQ:
+		return "SELFTEST_HELLO";
+	case VMSHM_COMM_PERF_NOOP_REQ:
+		return "PERF_NOOP";
+	case VMSHM_COMM_PERF_REPORT_REQ:
+		return "PERF_REPORT";
+	case PANTHOR_VMSHM_MSG_OPEN_SESSION_REQ:
+		return "OPEN_SESSION";
+	case PANTHOR_VMSHM_MSG_CLOSE_SESSION_REQ:
+		return "CLOSE_SESSION";
+	case PANTHOR_VMSHM_MSG_DEV_QUERY_REQ:
+		return "DEV_QUERY";
+	case PANTHOR_VMSHM_MSG_VM_CREATE_REQ:
+		return "VM_CREATE";
+	case PANTHOR_VMSHM_MSG_VM_DESTROY_REQ:
+		return "VM_DESTROY";
+	case PANTHOR_VMSHM_MSG_VM_BIND_REQ:
+		return "VM_BIND";
+	case PANTHOR_VMSHM_MSG_VM_GET_STATE_REQ:
+		return "VM_GET_STATE";
+	case PANTHOR_VMSHM_MSG_BO_CREATE_REQ:
+		return "BO_CREATE";
+	case PANTHOR_VMSHM_MSG_BO_DESTROY_REQ:
+		return "BO_DESTROY";
+	case PANTHOR_VMSHM_MSG_SYNCOBJ_CREATE_REQ:
+		return "SYNCOBJ_CREATE";
+	case PANTHOR_VMSHM_MSG_SYNCOBJ_DESTROY_REQ:
+		return "SYNCOBJ_DESTROY";
+	case PANTHOR_VMSHM_MSG_SYNCOBJ_WAIT_REQ:
+		return "SYNCOBJ_WAIT";
+	case PANTHOR_VMSHM_MSG_SYNCOBJ_TRANSFER_REQ:
+		return "SYNCOBJ_TRANSFER";
+	case PANTHOR_VMSHM_MSG_SYNCOBJ_TIMELINE_WAIT_REQ:
+		return "SYNCOBJ_TIMELINE_WAIT";
+	case PANTHOR_VMSHM_MSG_SYNCOBJ_RESET_REQ:
+		return "SYNCOBJ_RESET";
+	case PANTHOR_VMSHM_MSG_SYNCOBJ_SIGNAL_REQ:
+		return "SYNCOBJ_SIGNAL";
+	case PANTHOR_VMSHM_MSG_SYNCOBJ_TIMELINE_SIGNAL_REQ:
+		return "SYNCOBJ_TIMELINE_SIGNAL";
+	case PANTHOR_VMSHM_MSG_SYNCOBJ_QUERY_REQ:
+		return "SYNCOBJ_QUERY";
+	case PANTHOR_VMSHM_MSG_GROUP_CREATE_REQ:
+		return "GROUP_CREATE";
+	case PANTHOR_VMSHM_MSG_GROUP_DESTROY_REQ:
+		return "GROUP_DESTROY";
+	case PANTHOR_VMSHM_MSG_GROUP_GET_STATE_REQ:
+		return "GROUP_GET_STATE";
+	case PANTHOR_VMSHM_MSG_TILER_HEAP_CREATE_REQ:
+		return "TILER_HEAP_CREATE";
+	case PANTHOR_VMSHM_MSG_TILER_HEAP_DESTROY_REQ:
+		return "TILER_HEAP_DESTROY";
+	case PANTHOR_VMSHM_MSG_GROUP_SUBMIT_REQ:
+		return "GROUP_SUBMIT";
+	default:
+		return "UNKNOWN";
+	}
+}
+
+static void
+client_comm_vmshm_rpc_stats_record(const struct client_comm_vmshm_rpc_sample *sample)
+{
+	struct client_comm_vmshm_rpc_stat *stat = NULL;
+	unsigned long flags;
+	u32 i;
+
+	if (!sample || !client_comm_vmshm_rpc_stats_is_enabled())
+		return;
+
+	spin_lock_irqsave(&client_comm_vmshm_rpc_stats_lock, flags);
+	for (i = 0; i < ARRAY_SIZE(client_comm_vmshm_rpc_stats); i++) {
+		if (client_comm_vmshm_rpc_stats[i].valid &&
+		    client_comm_vmshm_rpc_stats[i].req_type == sample->req_type) {
+			stat = &client_comm_vmshm_rpc_stats[i];
+			break;
+		}
+	}
+	if (!stat) {
+		for (i = 0; i < ARRAY_SIZE(client_comm_vmshm_rpc_stats); i++) {
+			if (!client_comm_vmshm_rpc_stats[i].valid) {
+				stat = &client_comm_vmshm_rpc_stats[i];
+				memset(stat, 0, sizeof(*stat));
+				stat->valid = true;
+				stat->req_type = sample->req_type;
+				break;
+			}
+		}
+	}
+	if (stat) {
+		stat->calls++;
+		if (sample->ret)
+			stat->errors++;
+		if (sample->ret == -ETIMEDOUT)
+			stat->timeouts++;
+		stat->total_ns += sample->total_ns;
+		if (sample->total_ns > stat->total_max_ns)
+			stat->total_max_ns = sample->total_ns;
+		stat->lock_wait_ns += sample->lock_wait_ns;
+		if (sample->lock_wait_ns > stat->lock_wait_max_ns)
+			stat->lock_wait_max_ns = sample->lock_wait_ns;
+		stat->send_ns += sample->send_ns;
+		if (sample->send_ns > stat->send_max_ns)
+			stat->send_max_ns = sample->send_ns;
+		stat->wait_ns += sample->wait_ns;
+		if (sample->wait_ns > stat->wait_max_ns)
+			stat->wait_max_ns = sample->wait_ns;
+		stat->poll_recv_ns += sample->poll_recv_ns;
+		if (sample->poll_recv_ns > stat->poll_recv_max_ns)
+			stat->poll_recv_max_ns = sample->poll_recv_ns;
+		stat->poll_sleeps += sample->poll_sleeps;
+	}
+	spin_unlock_irqrestore(&client_comm_vmshm_rpc_stats_lock, flags);
+}
+
+static void
+client_comm_vmshm_rpc_stats_dump_snapshot(
+	const struct client_comm_vmshm_rpc_stat *snapshot, u32 count,
+	const char *reason)
+{
+	u32 i;
+
+	pr_info("client_comm_vmshm: [MZH][CLIENT_COMM_RPC_STATS_SNAPSHOT] reason=%s entries=%u\n",
+		reason ? reason : "unspecified", count);
+
+	for (i = 0; i < count; i++) {
+		const struct client_comm_vmshm_rpc_stat *stat = &snapshot[i];
+		u64 avg_total, avg_lock, avg_send, avg_wait, avg_poll_recv;
+
+		if (!stat->valid || !stat->calls)
+			continue;
+
+		avg_total = div64_u64(stat->total_ns, stat->calls);
+		avg_lock = div64_u64(stat->lock_wait_ns, stat->calls);
+		avg_send = div64_u64(stat->send_ns, stat->calls);
+		avg_wait = div64_u64(stat->wait_ns, stat->calls);
+		avg_poll_recv = div64_u64(stat->poll_recv_ns, stat->calls);
+
+		pr_info("client_comm_vmshm: [MZH][CLIENT_COMM_RPC_STATS] op=%s type=0x%x calls=%llu errors=%llu timeouts=%llu total_ns=%llu avg_ns=%llu max_ns=%llu lock_wait_avg_ns=%llu lock_wait_max_ns=%llu send_avg_ns=%llu send_max_ns=%llu wait_avg_ns=%llu wait_max_ns=%llu poll_recv_avg_ns=%llu poll_recv_max_ns=%llu poll_sleeps=%llu\n",
+			client_comm_vmshm_req_name(stat->req_type), stat->req_type,
+			stat->calls, stat->errors, stat->timeouts,
+			stat->total_ns, avg_total, stat->total_max_ns,
+			avg_lock, stat->lock_wait_max_ns,
+			avg_send, stat->send_max_ns,
+			avg_wait, stat->wait_max_ns,
+			avg_poll_recv, stat->poll_recv_max_ns,
+			stat->poll_sleeps);
+	}
+}
+
+static void
+client_comm_vmshm_rpc_stats_dump_current_if_enabled(const char *reason)
+{
+	struct client_comm_vmshm_rpc_stat *snapshot = NULL;
+	unsigned long flags;
+	bool enabled;
+
+	spin_lock_irqsave(&client_comm_vmshm_rpc_stats_lock, flags);
+	enabled = client_comm_vmshm_rpc_stats_enabled;
+	if (enabled)
+		snapshot = kmemdup(client_comm_vmshm_rpc_stats,
+				   sizeof(client_comm_vmshm_rpc_stats),
+				   GFP_ATOMIC);
+	spin_unlock_irqrestore(&client_comm_vmshm_rpc_stats_lock, flags);
+
+	if (!enabled || !snapshot)
+		return;
+
+	client_comm_vmshm_rpc_stats_dump_snapshot(
+		snapshot, CLIENT_COMM_VMSHM_RPC_STATS_MAX, reason);
+	kfree(snapshot);
+}
+
+static int client_comm_vmshm_rpc_stats_set(const char *val,
+					   const struct kernel_param *kp)
+{
+	struct client_comm_vmshm_rpc_stat *snapshot = NULL;
+	unsigned long flags;
+	bool enabled;
+	bool dump = false;
+	int ret;
+
+	ret = kstrtobool(val, &enabled);
+	if (ret)
+		return ret;
+
+	spin_lock_irqsave(&client_comm_vmshm_rpc_stats_lock, flags);
+	if (enabled && !client_comm_vmshm_rpc_stats_enabled) {
+		memset(client_comm_vmshm_rpc_stats, 0,
+		       sizeof(client_comm_vmshm_rpc_stats));
+	} else if (!enabled && client_comm_vmshm_rpc_stats_enabled) {
+		snapshot = kmemdup(client_comm_vmshm_rpc_stats,
+				   sizeof(client_comm_vmshm_rpc_stats),
+				   GFP_ATOMIC);
+		dump = true;
+	}
+	WRITE_ONCE(client_comm_vmshm_rpc_stats_enabled, enabled);
+	spin_unlock_irqrestore(&client_comm_vmshm_rpc_stats_lock, flags);
+
+	if (dump && snapshot) {
+		client_comm_vmshm_rpc_stats_dump_snapshot(
+			snapshot, CLIENT_COMM_VMSHM_RPC_STATS_MAX, "disabled");
+		kfree(snapshot);
+	}
+
+	return 0;
+}
+
+static const struct kernel_param_ops client_comm_vmshm_rpc_stats_param_ops = {
+	.set = client_comm_vmshm_rpc_stats_set,
+	.get = param_get_bool,
+};
+
+module_param_cb(rpc_stats, &client_comm_vmshm_rpc_stats_param_ops,
+		&client_comm_vmshm_rpc_stats_enabled, 0644);
+MODULE_PARM_DESC(rpc_stats,
+		 "Collect aggregated client-side vmshm RPC latency stats");
 
 static void client_comm_vmshm_rx_work(struct work_struct *work);
 
@@ -683,13 +944,25 @@ int client_comm_vmshm_call(u32 req_type, u32 req_flags,
 	};
 	u64 seq;
 	int ret, i;
+	bool stats_enabled = client_comm_vmshm_rpc_stats_is_enabled();
+	u64 total_start_ns = 0, lock_start_ns = 0, send_start_ns;
+	u64 wait_start_ns, recv_start_ns;
+	struct client_comm_vmshm_rpc_sample sample = {
+		.req_type = req_type,
+	};
 
 	if (req_len && !req_payload)
 		return -EINVAL;
 	if (rsp_payload_capacity && !rsp_payload)
 		return -EINVAL;
 
+	if (stats_enabled) {
+		total_start_ns = ktime_get_ns();
+		lock_start_ns = total_start_ns;
+	}
 	mutex_lock(&d->rpc_lock);
+	if (stats_enabled)
+		sample.lock_wait_ns = ktime_get_ns() - lock_start_ns;
 	if (!client_comm_vmshm_ready()) {
 		ret = -ENODEV;
 		goto out_unlock;
@@ -717,7 +990,10 @@ int client_comm_vmshm_call(u32 req_type, u32 req_flags,
 		list_add_tail(&waiter.node, &d->waiters);
 		spin_unlock(&d->waiters_lock);
 
+		send_start_ns = stats_enabled ? ktime_get_ns() : 0;
 		ret = client_comm_vmshm_send_to_proxy(&tx);
+		if (stats_enabled)
+			sample.send_ns += ktime_get_ns() - send_start_ns;
 		if (ret) {
 			spin_lock(&d->waiters_lock);
 			if (!list_empty(&waiter.node))
@@ -727,9 +1003,12 @@ int client_comm_vmshm_call(u32 req_type, u32 req_flags,
 		}
 
 		timeout = msecs_to_jiffies(CLIENT_COMM_VMSHM_RPC_TIMEOUT_MS);
+		wait_start_ns = stats_enabled ? ktime_get_ns() : 0;
 		if (!wait_for_completion_timeout(&waiter.done, timeout)) {
 			bool completed;
 
+			if (stats_enabled)
+				sample.wait_ns += ktime_get_ns() - wait_start_ns;
 			spin_lock(&d->waiters_lock);
 			if (!list_empty(&waiter.node))
 				list_del_init(&waiter.node);
@@ -741,6 +1020,8 @@ int client_comm_vmshm_call(u32 req_type, u32 req_flags,
 				*rsp_rx = waiter.rsp_rx;
 			goto out_unlock;
 		}
+		if (stats_enabled)
+			sample.wait_ns += ktime_get_ns() - wait_start_ns;
 
 		ret = waiter.status;
 		if (!ret && rsp_rx)
@@ -748,7 +1029,10 @@ int client_comm_vmshm_call(u32 req_type, u32 req_flags,
 		goto out_unlock;
 	}
 
+	send_start_ns = stats_enabled ? ktime_get_ns() : 0;
 	ret = client_comm_vmshm_send_to_proxy(&tx);
+	if (stats_enabled)
+		sample.send_ns += ktime_get_ns() - send_start_ns;
 	if (ret)
 		goto out_unlock;
 
@@ -761,8 +1045,13 @@ int client_comm_vmshm_call(u32 req_type, u32 req_flags,
 		if (rsp_payload && rsp_payload_capacity)
 			memset(rsp_payload, 0, rsp_payload_capacity);
 
+		recv_start_ns = stats_enabled ? ktime_get_ns() : 0;
 		ret = client_comm_vmshm_recv_from_proxy(&rx);
+		if (stats_enabled)
+			sample.poll_recv_ns += ktime_get_ns() - recv_start_ns;
 		if (ret == -ENOENT) {
+			if (stats_enabled)
+				sample.poll_sleeps++;
 			usleep_range(CLIENT_COMM_VMSHM_RPC_WAIT_US,
 				     CLIENT_COMM_VMSHM_RPC_WAIT_US * 2);
 			continue;
@@ -783,6 +1072,14 @@ int client_comm_vmshm_call(u32 req_type, u32 req_flags,
 
 out_unlock:
 	mutex_unlock(&d->rpc_lock);
+	if (stats_enabled) {
+		sample.ret = ret;
+		sample.total_ns = ktime_get_ns() - total_start_ns;
+		client_comm_vmshm_rpc_stats_record(&sample);
+		if (req_type == PANTHOR_VMSHM_MSG_CLOSE_SESSION_REQ)
+			client_comm_vmshm_rpc_stats_dump_current_if_enabled(
+				"panthor-close-session");
+	}
 	return ret;
 }
 EXPORT_SYMBOL_GPL(client_comm_vmshm_call);

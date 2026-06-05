@@ -1138,8 +1138,9 @@ panthor_vm_map_vmshm_spans(struct panthor_vm *vm, u64 iova, int prot,
 	}
 
 	if (span_count)
-		pr_info("panthor: VM_BIND vmshm payload mapped iova=0x%llx size=0x%llx spans=%u first_gpa=%pa\n",
-			start_iova, size, span_count, &spans[0].gpa);
+		pr_info_ratelimited("panthor: VM_BIND vmshm payload mapped iova=0x%llx size=0x%llx spans=%u first_gpa=%pa\n",
+				    start_iova, size, span_count,
+				    &spans[0].gpa);
 
 	return panthor_vm_flush_range(vm, start_iova, size);
 }

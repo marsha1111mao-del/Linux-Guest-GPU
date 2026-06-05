@@ -22,17 +22,15 @@
 #include <linux/io.h>
 #include <linux/ioctl.h>
 #include <linux/kthread.h>
-#include <linux/ktime.h>
 #include <linux/list.h>
 #include <linux/log2.h>
-#include <linux/math64.h>
 #include <linux/mm.h>
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
-#include <linux/sched.h>
+#include <linux/rwsem.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 #include <linux/vmshm_comm.h>
@@ -232,11 +230,6 @@ struct proxy_comm_vmshm_dev {
 	int irq;
 	bool irq_notify;
 	struct work_struct rx_work;
-	atomic64_t irq_last_ns;
-	u64 irq_work_samples;
-	u64 irq_work_min_ns;
-	u64 irq_work_total_ns;
-	u64 irq_work_max_ns;
 	u64 perf_noop_count;
 	dev_t devt;
 	struct cdev cdev;
@@ -258,7 +251,7 @@ struct proxy_comm_vmshm_handler_slot {
 
 static DEFINE_MUTEX(proxy_comm_vmshm_channels_lock);
 static LIST_HEAD(proxy_comm_vmshm_channels);
-static DEFINE_MUTEX(proxy_comm_vmshm_handler_lock);
+static DECLARE_RWSEM(proxy_comm_vmshm_handler_rwsem);
 static struct proxy_comm_vmshm_handler_slot
 	proxy_comm_vmshm_handlers[PROXY_COMM_VMSHM_MAX_HANDLERS];
 static unsigned int proxy_comm_vmshm_handler_count;
@@ -269,6 +262,14 @@ static struct class *proxy_comm_vmshm_class;
 static unsigned int proxy_comm_vmshm_chardev_users;
 
 static void proxy_comm_vmshm_rx_work(struct work_struct *work);
+
+static void proxy_comm_vmshm_queue_rx(struct proxy_comm_vmshm_dev *d)
+{
+	if (!d)
+		return;
+
+	schedule_work(&d->rx_work);
+}
 
 static bool proxy_comm_vmshm_range_valid(struct proxy_comm_vmshm_dev *d,
 					 u32 offset, u32 size)
@@ -1059,24 +1060,6 @@ static bool proxy_comm_vmshm_ready_locked(struct proxy_comm_vmshm_dev *d)
 		       PROXY_COMM_VMSHM_STATUS_READY;
 }
 
-static void
-proxy_comm_vmshm_record_irq_work_latency(struct proxy_comm_vmshm_dev *d)
-{
-	u64 irq_ns = (u64)atomic64_xchg(&d->irq_last_ns, 0);
-	u64 delta;
-
-	if (!irq_ns)
-		return;
-
-	delta = ktime_get_ns() - irq_ns;
-	if (!d->irq_work_samples || delta < d->irq_work_min_ns)
-		d->irq_work_min_ns = delta;
-	if (delta > d->irq_work_max_ns)
-		d->irq_work_max_ns = delta;
-	d->irq_work_total_ns += delta;
-	d->irq_work_samples++;
-}
-
 static void proxy_comm_vmshm_kick_client(struct proxy_comm_vmshm_dev *d)
 {
 	if (d->irq_notify && d->doorbell)
@@ -1091,7 +1074,7 @@ static void proxy_comm_vmshm_schedule_all_locked(void)
 
 	list_for_each_entry(d, &proxy_comm_vmshm_channels, node) {
 		if (d->irq_notify && proxy_comm_vmshm_ready_locked(d))
-			schedule_work(&d->rx_work);
+			proxy_comm_vmshm_queue_rx(d);
 	}
 }
 
@@ -1197,38 +1180,42 @@ static int proxy_comm_vmshm_dispatch_one(struct proxy_comm_vmshm_dev *d)
 	void *priv = NULL;
 	int ret, i;
 
-	mutex_lock(&proxy_comm_vmshm_handler_lock);
+	down_read(&proxy_comm_vmshm_handler_rwsem);
 	if (!proxy_comm_vmshm_handler_count) {
-		mutex_unlock(&proxy_comm_vmshm_handler_lock);
+		up_read(&proxy_comm_vmshm_handler_rwsem);
 		return -ENOENT;
 	}
-	mutex_unlock(&proxy_comm_vmshm_handler_lock);
 
-	if (!proxy_comm_vmshm_ready_locked(d))
+	if (!proxy_comm_vmshm_ready_locked(d)) {
+		up_read(&proxy_comm_vmshm_handler_rwsem);
 		return -ENODEV;
+	}
 
 	memset(payload, 0, sizeof(payload));
 	ret = proxy_comm_vmshm_recv_from_dev(d, &rx);
-	if (ret)
+	if (ret) {
+		up_read(&proxy_comm_vmshm_handler_rwsem);
 		return ret;
+	}
 
-	mutex_lock(&proxy_comm_vmshm_handler_lock);
 	for (i = 0; i < PROXY_COMM_VMSHM_MAX_HANDLERS; i++) {
 		if (proxy_comm_vmshm_handlers[i].handler &&
 		    proxy_comm_vmshm_handlers[i].type == rx.type) {
 			handler = proxy_comm_vmshm_handlers[i].handler;
 			priv = proxy_comm_vmshm_handlers[i].priv;
-			ret = handler(&rx, priv);
 			break;
 		}
 	}
-	mutex_unlock(&proxy_comm_vmshm_handler_lock);
 
 	if (!handler) {
 		pr_debug("proxy_comm_vmshm: no handler for type 0x%x\n",
-			 rx.type);
+		 rx.type);
+		up_read(&proxy_comm_vmshm_handler_rwsem);
 		return 0;
 	}
+
+	ret = handler(&rx, priv);
+	up_read(&proxy_comm_vmshm_handler_rwsem);
 	if (ret)
 		pr_warn_ratelimited("proxy_comm_vmshm: handler 0x%x failed (%d)\n",
 				    rx.type, ret);
@@ -1247,19 +1234,19 @@ static void proxy_comm_vmshm_drain_rx(struct proxy_comm_vmshm_dev *d,
 		if (ret == -ENOENT) {
 			if (sleep_when_empty)
 				msleep(PROXY_COMM_VMSHM_DISPATCH_EMPTY_WAIT_MS);
-			break;
+			return;
 		}
 		if (ret == -ENODEV) {
 			if (sleep_when_empty)
 				msleep(PROXY_COMM_VMSHM_DISPATCH_WAIT_MS);
-			break;
+			return;
 		}
 
 		pr_warn_ratelimited("proxy_comm_vmshm: dispatch recv failed (%d)\n",
 				    ret);
 		if (sleep_when_empty)
 			msleep(PROXY_COMM_VMSHM_DISPATCH_EMPTY_WAIT_MS);
-		break;
+		return;
 	}
 }
 
@@ -1268,7 +1255,6 @@ static void proxy_comm_vmshm_rx_work(struct work_struct *work)
 	struct proxy_comm_vmshm_dev *d =
 		container_of(work, struct proxy_comm_vmshm_dev, rx_work);
 
-	proxy_comm_vmshm_record_irq_work_latency(d);
 	proxy_comm_vmshm_drain_rx(d, false);
 }
 
@@ -1276,8 +1262,7 @@ static irqreturn_t proxy_comm_vmshm_irq(int irq, void *data)
 {
 	struct proxy_comm_vmshm_dev *d = data;
 
-	atomic64_set(&d->irq_last_ns, ktime_get_ns());
-	schedule_work(&d->rx_work);
+	proxy_comm_vmshm_queue_rx(d);
 	return IRQ_HANDLED;
 }
 
@@ -1285,8 +1270,10 @@ static int proxy_comm_vmshm_dispatch_thread(void *data)
 {
 	struct proxy_comm_vmshm_dev *d = data;
 
-	while (!kthread_should_stop())
+	while (!kthread_should_stop()) {
 		proxy_comm_vmshm_drain_rx(d, true);
+		cond_resched();
+	}
 
 	return 0;
 }
@@ -1338,7 +1325,7 @@ int proxy_comm_vmshm_register_handler(u32 type,
 	if (!type || !handler)
 		return -EINVAL;
 
-	mutex_lock(&proxy_comm_vmshm_handler_lock);
+	down_write(&proxy_comm_vmshm_handler_rwsem);
 	for (i = 0; i < PROXY_COMM_VMSHM_MAX_HANDLERS; i++) {
 		if (proxy_comm_vmshm_handlers[i].handler &&
 		    proxy_comm_vmshm_handlers[i].type == type) {
@@ -1373,7 +1360,7 @@ int proxy_comm_vmshm_register_handler(u32 type,
 	}
 
 out_unlock:
-	mutex_unlock(&proxy_comm_vmshm_handler_lock);
+	up_write(&proxy_comm_vmshm_handler_rwsem);
 	return ret;
 }
 EXPORT_SYMBOL_GPL(proxy_comm_vmshm_register_handler);
@@ -1384,7 +1371,7 @@ void proxy_comm_vmshm_unregister_handler(u32 type,
 {
 	int i;
 
-	mutex_lock(&proxy_comm_vmshm_handler_lock);
+	down_write(&proxy_comm_vmshm_handler_rwsem);
 	for (i = 0; i < PROXY_COMM_VMSHM_MAX_HANDLERS; i++) {
 		if (proxy_comm_vmshm_handlers[i].handler == handler &&
 		    proxy_comm_vmshm_handlers[i].type == type &&
@@ -1396,7 +1383,7 @@ void proxy_comm_vmshm_unregister_handler(u32 type,
 			break;
 		}
 	}
-	mutex_unlock(&proxy_comm_vmshm_handler_lock);
+	up_write(&proxy_comm_vmshm_handler_rwsem);
 }
 EXPORT_SYMBOL_GPL(proxy_comm_vmshm_unregister_handler);
 
@@ -1514,13 +1501,6 @@ proxy_comm_vmshm_perf_send_report_rsp(struct proxy_comm_vmshm_channel *channel,
 		return -ENODEV;
 
 	report.noop_count = d->perf_noop_count;
-	report.irq_to_work_samples = d->irq_work_samples;
-	report.irq_to_work_min_ns = d->irq_work_min_ns;
-	report.irq_to_work_max_ns = d->irq_work_max_ns;
-	if (report.irq_to_work_samples)
-		report.irq_to_work_avg_ns =
-			div64_u64(d->irq_work_total_ns,
-				  report.irq_to_work_samples);
 
 	for (i = 0; i < PROXY_COMM_VMSHM_INIT_RETRIES; i++) {
 		ret = proxy_comm_vmshm_send_to_channel(channel, &tx);
@@ -1992,17 +1972,17 @@ static int proxy_comm_vmshm_probe(struct platform_device *pdev)
 	if (ret)
 		goto err_unregister_channel;
 
-	mutex_lock(&proxy_comm_vmshm_handler_lock);
+	down_read(&proxy_comm_vmshm_handler_rwsem);
 	if (proxy_comm_vmshm_handler_count) {
 		ret = proxy_comm_vmshm_start_dispatcher_locked(d);
 		if (ret) {
-			mutex_unlock(&proxy_comm_vmshm_handler_lock);
+			up_read(&proxy_comm_vmshm_handler_rwsem);
 			goto err_unregister_channel;
 		}
 	}
-	mutex_unlock(&proxy_comm_vmshm_handler_lock);
+	up_read(&proxy_comm_vmshm_handler_rwsem);
 	if (d->irq_notify)
-		schedule_work(&d->rx_work);
+		proxy_comm_vmshm_queue_rx(d);
 
 	return 0;
 

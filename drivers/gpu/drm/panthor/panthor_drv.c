@@ -4,6 +4,7 @@
 /* Copyright 2019 Collabora ltd. */
 
 #include <linux/list.h>
+#include <linux/atomic.h>
 #include <linux/kstrtox.h>
 #include <linux/ktime.h>
 #include <linux/math64.h>
@@ -228,6 +229,26 @@ panthor_submit_stats_dump_snapshot(const struct panthor_submit_stats *stats)
 		stats->run_job_errors, stats->run_job_zero_size_jobs);
 }
 
+static void panthor_submit_stats_dump_current_if_enabled(const char *reason)
+{
+	struct panthor_submit_stats snapshot;
+	unsigned long flags;
+	bool enabled;
+
+	spin_lock_irqsave(&panthor_submit_stats_lock, flags);
+	enabled = panthor_submit_stats_enabled;
+	if (enabled)
+		snapshot = panthor_submit_stats_data;
+	spin_unlock_irqrestore(&panthor_submit_stats_lock, flags);
+
+	if (!enabled)
+		return;
+
+	pr_info("panthor: [MZH][PANTHOR_SUBMIT_STATS_SNAPSHOT] reason=%s\n",
+		reason ? reason : "unspecified");
+	panthor_submit_stats_dump_snapshot(&snapshot);
+}
+
 static int panthor_submit_stats_set(const char *val,
 				    const struct kernel_param *kp)
 {
@@ -349,6 +370,26 @@ panthor_job_irq_stats_dump_snapshot(const struct panthor_job_irq_stats *stats)
 		stats->thread_without_raw, thread_avg_ns, stats->thread_max_ns,
 		stats->loop_iterations, stats->status_or,
 		stats->thread_pending ? 1 : 0);
+}
+
+static void panthor_job_irq_stats_dump_current_if_enabled(const char *reason)
+{
+	struct panthor_job_irq_stats snapshot;
+	unsigned long flags;
+	bool enabled;
+
+	spin_lock_irqsave(&panthor_job_irq_stats_lock, flags);
+	enabled = panthor_job_irq_stats_enabled;
+	if (enabled)
+		snapshot = panthor_job_irq_stats_data;
+	spin_unlock_irqrestore(&panthor_job_irq_stats_lock, flags);
+
+	if (!enabled)
+		return;
+
+	pr_info("panthor: [MZH][PANTHOR_JOB_IRQ_STATS_SNAPSHOT] reason=%s\n",
+		reason ? reason : "unspecified");
+	panthor_job_irq_stats_dump_snapshot(&snapshot);
 }
 
 static int panthor_job_irq_stats_set(const char *val,
@@ -487,6 +528,7 @@ void panthor_job_irq_stats_thread_end(u64 start_ns, irqreturn_t ret)
 }
 
 static DEFINE_MUTEX(panthor_vmshm_lock);
+static atomic_t panthor_vmshm_active_sessions = ATOMIC_INIT(0);
 static struct panthor_device *panthor_vmshm_ptdev;
 
 struct panthor_vmshm_session {
@@ -1491,6 +1533,7 @@ int panthor_vmshm_session_open(struct panthor_vmshm_session **session)
 
 	vmshm_session->pfile = pfile;
 	vmshm_session->file.driver_priv = pfile;
+	atomic_inc(&panthor_vmshm_active_sessions);
 	*session = vmshm_session;
 	return 0;
 
@@ -1521,6 +1564,7 @@ void panthor_vmshm_session_close(struct panthor_vmshm_session *session)
 {
 	struct panthor_device *ptdev;
 	struct panthor_file *pfile;
+	bool last_session;
 
 	if (!session)
 		return;
@@ -1542,6 +1586,11 @@ void panthor_vmshm_session_close(struct panthor_vmshm_session *session)
 		idr_for_each(&session->file.syncobj_idr,
 			     panthor_vmshm_release_syncobj_handle, session);
 		idr_destroy(&session->file.syncobj_idr);
+	}
+	last_session = atomic_dec_and_test(&panthor_vmshm_active_sessions);
+	if (last_session) {
+		panthor_submit_stats_dump_current_if_enabled("vmshm-last-session-close");
+		panthor_job_irq_stats_dump_current_if_enabled("vmshm-last-session-close");
 	}
 	kfree(pfile);
 	kfree(session);
@@ -1681,11 +1730,11 @@ int panthor_vmshm_bo_create_from_payload(struct panthor_vmshm_session *session,
 						   &args->handle, payload);
 	if (!ret) {
 		args->size = size;
-		pr_info("panthor: BO_CREATE vmshm-backed handle=%u size=0x%llx payload=0x%llx payload_size=0x%llx segments=%u\n",
-			args->handle, args->size,
-			proxy_vmshm_obj_handle(payload),
-			(unsigned long long)payload_size,
-			proxy_vmshm_obj_nr_segments(payload));
+		pr_info_ratelimited("panthor: BO_CREATE vmshm-backed handle=%u size=0x%llx payload=0x%llx payload_size=0x%llx segments=%u\n",
+				    args->handle, args->size,
+				    proxy_vmshm_obj_handle(payload),
+				    (unsigned long long)payload_size,
+				    proxy_vmshm_obj_nr_segments(payload));
 	}
 
 	panthor_vm_put(vm);

@@ -20,6 +20,7 @@
 #include <linux/iosys-map.h>
 #include <linux/ktime.h>
 #include <linux/module.h>
+#include <linux/moduleparam.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 
@@ -93,6 +94,16 @@
 
 #define MIN_CSGS				3
 #define MAX_CSG_PRIO				0xf
+
+static unsigned int panthor_sched_tick_ms = 10;
+module_param_named(sched_tick_ms, panthor_sched_tick_ms, uint, 0644);
+MODULE_PARM_DESC(sched_tick_ms,
+		 "Panthor CSG scheduler timeslice in milliseconds (0 keeps the default 10 ms)");
+
+static bool panthor_sched_highpri_wq;
+module_param_named(sched_highpri_wq, panthor_sched_highpri_wq, bool, 0644);
+MODULE_PARM_DESC(sched_highpri_wq,
+		 "Use a high-priority Panthor scheduler workqueue for diagnostic proxy-VM scheduling experiments");
 
 struct panthor_group;
 
@@ -3753,7 +3764,8 @@ int panthor_sched_init(struct panthor_device *ptdev)
 
 	sched->last_tick = 0;
 	sched->resched_target = U64_MAX;
-	sched->tick_period = msecs_to_jiffies(10);
+	sched->tick_period = msecs_to_jiffies(panthor_sched_tick_ms ?
+					      panthor_sched_tick_ms : 10);
 	INIT_DELAYED_WORK(&sched->tick_work, tick_work);
 	INIT_WORK(&sched->sync_upd_work, sync_upd_work);
 	INIT_WORK(&sched->fw_events_work, process_fw_events_work);
@@ -3790,7 +3802,11 @@ int panthor_sched_init(struct panthor_device *ptdev)
 	 * system is running out of memory.
 	 */
 	sched->heap_alloc_wq = alloc_workqueue("panthor-heap-alloc", WQ_UNBOUND, 0);
-	sched->wq = alloc_workqueue("panthor-csf-sched", WQ_MEM_RECLAIM, 0);
+	sched->wq = alloc_workqueue("panthor-csf-sched",
+				    WQ_MEM_RECLAIM |
+					    (panthor_sched_highpri_wq ?
+					     WQ_HIGHPRI : 0),
+				    0);
 	if (!sched->wq || !sched->heap_alloc_wq) {
 		panthor_sched_fini(&ptdev->base, sched);
 		drm_err(&ptdev->base, "Failed to allocate the workqueues");

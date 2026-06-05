@@ -8,17 +8,24 @@
  */
 
 #include <linux/atomic.h>
+#include <linux/bitops.h>
 #include <linux/bits.h>
 #include <linux/delay.h>
+#include <linux/ktime.h>
+#include <linux/kstrtox.h>
 #include <linux/limits.h>
 #include <linux/list.h>
+#include <linux/math64.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/refcount.h>
 #include <linux/slab.h>
+#include <linux/spinlock.h>
 #include <linux/string.h>
 #include <linux/proxy_vmshm.h>
 #include <linux/vmshm_comm.h>
+#include <linux/wait.h>
+#include <linux/workqueue.h>
 #include <linux/xarray.h>
 #include <linux/panthor_vmshm.h>
 
@@ -29,6 +36,8 @@
 #define PANTHOR_PROXY_MAX_SYNCOBJS_PER_SESSION	4096
 #define PANTHOR_PROXY_MAX_GROUPS_PER_SESSION	128
 #define PANTHOR_PROXY_MAX_HEAPS_PER_SESSION	512
+#define PANTHOR_PROXY_RPC_STATS_MAX	32
+#define PANTHOR_PROXY_SUBMIT_SCHED_MAX_DEPTH	256
 #define PANTHOR_PROXY_SYNC_OP_FLAGS_MASK \
 	(DRM_PANTHOR_SYNC_OP_HANDLE_TYPE_MASK | DRM_PANTHOR_SYNC_OP_SIGNAL)
 
@@ -72,6 +81,8 @@ struct panthor_proxy_heap {
 
 struct panthor_proxy_session {
 	struct list_head node;
+	struct list_head sched_node;
+	struct list_head submit_queue;
 	u64 session_id;
 	struct panthor_vmshm_session *real_session;
 	struct mutex lock;
@@ -82,6 +93,8 @@ struct panthor_proxy_session {
 	struct xarray heaps;
 	refcount_t refcnt;
 	bool closing;
+	bool sched_queued;
+	u32 submit_queue_depth;
 };
 
 typedef void (*panthor_proxy_msg_handler_t)(
@@ -97,12 +110,222 @@ struct panthor_proxy_msg_handler {
 	panthor_proxy_msg_handler_t handler;
 };
 
+struct panthor_proxy_rpc_stat {
+	u64 calls;
+	u64 total_ns;
+	u64 max_ns;
+};
+
+struct panthor_proxy_rpc_stats {
+	u64 bad_rx;
+	u64 unknown_type;
+	u64 bad_len;
+	struct panthor_proxy_rpc_stat op[PANTHOR_PROXY_RPC_STATS_MAX];
+};
+
+struct panthor_proxy_submit_req {
+	struct list_head node;
+	struct panthor_proxy_session *session;
+	struct panthor_vmshm_group_submit_req req;
+	struct panthor_vmshm_group_submit_rsp rsp;
+	wait_queue_head_t wait;
+	bool done;
+	int ret;
+};
+
+struct panthor_proxy_submit_scheduler {
+	struct mutex lock;
+	struct list_head runnable_sessions;
+	struct work_struct work;
+	atomic_t queued;
+};
+
 static DEFINE_MUTEX(panthor_proxy_sessions_lock);
 static LIST_HEAD(panthor_proxy_sessions);
 static atomic64_t panthor_proxy_next_session_id = ATOMIC64_INIT(0);
+static atomic_t panthor_proxy_active_sessions = ATOMIC_INIT(0);
+static DEFINE_SPINLOCK(panthor_proxy_rpc_stats_lock);
+static struct panthor_proxy_submit_scheduler panthor_proxy_submit_sched;
+static bool panthor_proxy_rpc_stats_enabled;
+static struct panthor_proxy_rpc_stats panthor_proxy_rpc_stats_data;
+static unsigned int panthor_proxy_group_core_partitions;
+module_param_named(group_core_partitions,
+		   panthor_proxy_group_core_partitions, uint, 0644);
+MODULE_PARM_DESC(group_core_partitions,
+		 "Experimental proxy group core partition count (0/1 disables; 2 splits shader cores between two clients)");
 
 static void panthor_proxy_syncobj_put(struct panthor_proxy_session *session,
 				      struct panthor_proxy_syncobj *syncobj);
+static int
+panthor_proxy_session_group_submit(
+	struct panthor_proxy_session *session,
+	const struct panthor_vmshm_group_submit_req *req,
+	struct panthor_vmshm_group_submit_rsp *rsp);
+static void
+panthor_proxy_submit_sched_fail_session(struct panthor_proxy_session *session,
+					int ret);
+static void
+panthor_proxy_rpc_stats_dump_snapshot(const struct panthor_proxy_rpc_stats *stats);
+static void panthor_proxy_rpc_stats_dump_current_if_enabled(const char *reason);
+
+static bool panthor_proxy_rpc_stats_is_enabled(void)
+{
+	return READ_ONCE(panthor_proxy_rpc_stats_enabled);
+}
+
+static u64 panthor_proxy_partition_core_mask(u64 mask, u64 session_id,
+					     unsigned int partitions)
+{
+	u32 slot, start, end, idx = 0;
+	u32 count = hweight64(mask);
+	u64 remaining = mask;
+	u64 out = 0;
+
+	if (partitions < 2 || count < partitions || !session_id)
+		return mask;
+
+	slot = (u32)((session_id - 1) % partitions);
+	start = div_u64((u64)count * slot, partitions);
+	end = div_u64((u64)count * (slot + 1), partitions);
+	if (start == end)
+		return mask;
+
+	while (remaining) {
+		unsigned int bit = __ffs64(remaining);
+
+		if (idx >= start && idx < end)
+			out |= BIT_ULL(bit);
+		idx++;
+		remaining &= remaining - 1;
+	}
+
+	return out ?: mask;
+}
+
+static u8 panthor_proxy_clamp_max_cores(u8 max_cores, u64 mask)
+{
+	u32 available = hweight64(mask);
+
+	if (available < max_cores)
+		return available;
+
+	return max_cores;
+}
+
+static void
+panthor_proxy_apply_group_core_partition(struct panthor_proxy_session *session,
+					 struct drm_panthor_group_create *args)
+{
+	unsigned int partitions =
+		READ_ONCE(panthor_proxy_group_core_partitions);
+	u64 old_compute_mask, old_fragment_mask;
+	u8 old_max_compute, old_max_fragment;
+
+	if (!session || !args || partitions < 2)
+		return;
+
+	old_compute_mask = args->compute_core_mask;
+	old_fragment_mask = args->fragment_core_mask;
+	old_max_compute = args->max_compute_cores;
+	old_max_fragment = args->max_fragment_cores;
+
+	args->compute_core_mask = panthor_proxy_partition_core_mask(
+		args->compute_core_mask, session->session_id, partitions);
+	args->fragment_core_mask = panthor_proxy_partition_core_mask(
+		args->fragment_core_mask, session->session_id, partitions);
+	args->max_compute_cores =
+		panthor_proxy_clamp_max_cores(args->max_compute_cores,
+					      args->compute_core_mask);
+	args->max_fragment_cores =
+		panthor_proxy_clamp_max_cores(args->max_fragment_cores,
+					      args->fragment_core_mask);
+
+	if (old_compute_mask != args->compute_core_mask ||
+	    old_fragment_mask != args->fragment_core_mask ||
+	    old_max_compute != args->max_compute_cores ||
+	    old_max_fragment != args->max_fragment_cores) {
+		pr_info("panthor-proxy: GROUP_CORE_PARTITION session=%llu partitions=%u compute_mask=0x%llx->0x%llx max_compute=%u->%u fragment_mask=0x%llx->0x%llx max_fragment=%u->%u\n",
+			session->session_id, partitions, old_compute_mask,
+			args->compute_core_mask, old_max_compute,
+			args->max_compute_cores, old_fragment_mask,
+			args->fragment_core_mask, old_max_fragment,
+			args->max_fragment_cores);
+	}
+}
+
+static void panthor_proxy_rpc_stats_record_bad_rx(void)
+{
+	unsigned long flags;
+
+	if (!panthor_proxy_rpc_stats_is_enabled())
+		return;
+
+	spin_lock_irqsave(&panthor_proxy_rpc_stats_lock, flags);
+	panthor_proxy_rpc_stats_data.bad_rx++;
+	spin_unlock_irqrestore(&panthor_proxy_rpc_stats_lock, flags);
+}
+
+static void panthor_proxy_rpc_stats_record_unknown_type(void)
+{
+	unsigned long flags;
+
+	if (!panthor_proxy_rpc_stats_is_enabled())
+		return;
+
+	spin_lock_irqsave(&panthor_proxy_rpc_stats_lock, flags);
+	panthor_proxy_rpc_stats_data.unknown_type++;
+	spin_unlock_irqrestore(&panthor_proxy_rpc_stats_lock, flags);
+}
+
+static void panthor_proxy_rpc_stats_record_bad_len(void)
+{
+	unsigned long flags;
+
+	if (!panthor_proxy_rpc_stats_is_enabled())
+		return;
+
+	spin_lock_irqsave(&panthor_proxy_rpc_stats_lock, flags);
+	panthor_proxy_rpc_stats_data.bad_len++;
+	spin_unlock_irqrestore(&panthor_proxy_rpc_stats_lock, flags);
+}
+
+static void panthor_proxy_rpc_stats_record_op(u32 index, u64 elapsed_ns)
+{
+	struct panthor_proxy_rpc_stat *stat;
+	unsigned long flags;
+
+	if (!panthor_proxy_rpc_stats_is_enabled() ||
+	    index >= PANTHOR_PROXY_RPC_STATS_MAX)
+		return;
+
+	spin_lock_irqsave(&panthor_proxy_rpc_stats_lock, flags);
+	stat = &panthor_proxy_rpc_stats_data.op[index];
+	stat->calls++;
+	stat->total_ns += elapsed_ns;
+	if (elapsed_ns > stat->max_ns)
+		stat->max_ns = elapsed_ns;
+	spin_unlock_irqrestore(&panthor_proxy_rpc_stats_lock, flags);
+}
+
+static void panthor_proxy_rpc_stats_dump_current_if_enabled(const char *reason)
+{
+	struct panthor_proxy_rpc_stats snapshot;
+	unsigned long flags;
+	bool enabled;
+
+	spin_lock_irqsave(&panthor_proxy_rpc_stats_lock, flags);
+	enabled = panthor_proxy_rpc_stats_enabled;
+	if (enabled)
+		snapshot = panthor_proxy_rpc_stats_data;
+	spin_unlock_irqrestore(&panthor_proxy_rpc_stats_lock, flags);
+
+	if (!enabled)
+		return;
+
+	pr_info("panthor-proxy: [MZH][PANTHOR_PROXY_RPC_STATS_SNAPSHOT] reason=%s\n",
+		reason ? reason : "unspecified");
+	panthor_proxy_rpc_stats_dump_snapshot(&snapshot);
+}
 
 static struct panthor_proxy_session *
 panthor_proxy_session_find_locked(u64 session_id)
@@ -129,6 +352,8 @@ static int panthor_proxy_session_create(u64 *session_id)
 	if (!session)
 		return -ENOMEM;
 
+	INIT_LIST_HEAD(&session->sched_node);
+	INIT_LIST_HEAD(&session->submit_queue);
 	mutex_init(&session->lock);
 	xa_init_flags(&session->vms, XA_FLAGS_ALLOC1);
 	xa_init_flags(&session->bos, XA_FLAGS_ALLOC1);
@@ -163,6 +388,7 @@ static int panthor_proxy_session_create(u64 *session_id)
 	mutex_lock(&panthor_proxy_sessions_lock);
 	list_add_tail(&session->node, &panthor_proxy_sessions);
 	mutex_unlock(&panthor_proxy_sessions_lock);
+	atomic_inc(&panthor_proxy_active_sessions);
 
 	*session_id = session->session_id;
 	return 0;
@@ -179,6 +405,7 @@ static void panthor_proxy_session_release(struct panthor_proxy_session *session)
 	u32 leftover_bos = 0, leftover_syncobjs = 0, leftover_vms = 0;
 	u32 leftover_groups = 0, leftover_heaps = 0;
 	u64 session_id;
+	bool last_session;
 
 	if (!session)
 		return;
@@ -228,11 +455,16 @@ static void panthor_proxy_session_release(struct panthor_proxy_session *session)
 	}
 	xa_destroy(&session->vms);
 	if (leftover_bos || leftover_syncobjs || leftover_vms ||
-	    leftover_groups || leftover_heaps)
+	    leftover_groups || leftover_heaps) {
 		pr_info("panthor-proxy: SESSION_RELEASE session=%llu leftover_bos=%u leftover_syncobjs=%u leftover_vms=%u leftover_groups=%u leftover_heaps=%u\n",
 			session_id, leftover_bos, leftover_syncobjs,
 			leftover_vms, leftover_groups, leftover_heaps);
+	}
+
 	panthor_vmshm_session_close(session->real_session);
+	last_session = atomic_dec_and_test(&panthor_proxy_active_sessions);
+	if (last_session)
+		panthor_proxy_rpc_stats_dump_current_if_enabled("proxy-last-session-close");
 	kfree(session);
 }
 
@@ -294,6 +526,7 @@ static int panthor_proxy_session_destroy(u64 session_id)
 	if (!session)
 		return -ENOENT;
 
+	panthor_proxy_submit_sched_fail_session(session, -ESHUTDOWN);
 	panthor_proxy_session_put(session);
 	return 0;
 }
@@ -312,6 +545,7 @@ static void panthor_proxy_sessions_destroy_all(void)
 
 	list_for_each_entry_safe(session, tmp, &sessions, node) {
 		list_del(&session->node);
+		panthor_proxy_submit_sched_fail_session(session, -ESHUTDOWN);
 		panthor_proxy_session_put(session);
 	}
 }
@@ -346,6 +580,151 @@ static bool panthor_proxy_session_exists(u64 session_id)
 	exists = session;
 	panthor_proxy_session_put(session);
 	return exists;
+}
+
+static void
+panthor_proxy_submit_sched_fail_session(struct panthor_proxy_session *session,
+					int ret)
+{
+	struct panthor_proxy_submit_req *submit, *tmp;
+	LIST_HEAD(failed);
+
+	if (!session)
+		return;
+
+	mutex_lock(&panthor_proxy_submit_sched.lock);
+	if (session->sched_queued) {
+		list_del_init(&session->sched_node);
+		session->sched_queued = false;
+	}
+	list_splice_init(&session->submit_queue, &failed);
+	session->submit_queue_depth = 0;
+	list_for_each_entry(submit, &failed, node)
+		atomic_dec(&panthor_proxy_submit_sched.queued);
+	mutex_unlock(&panthor_proxy_submit_sched.lock);
+
+	list_for_each_entry_safe(submit, tmp, &failed, node) {
+		list_del_init(&submit->node);
+		submit->ret = ret;
+		submit->rsp.ret = ret;
+		WRITE_ONCE(submit->done, true);
+		wake_up(&submit->wait);
+		panthor_proxy_session_put(session);
+	}
+}
+
+static void
+panthor_proxy_submit_sched_queue_locked(struct panthor_proxy_session *session)
+{
+	lockdep_assert_held(&panthor_proxy_submit_sched.lock);
+
+	if (session->sched_queued)
+		return;
+
+	session->sched_queued = true;
+	list_add_tail(&session->sched_node,
+		      &panthor_proxy_submit_sched.runnable_sessions);
+}
+
+static struct panthor_proxy_submit_req *
+panthor_proxy_submit_sched_pick_locked(void)
+{
+	struct panthor_proxy_session *session;
+	struct panthor_proxy_submit_req *submit;
+
+	lockdep_assert_held(&panthor_proxy_submit_sched.lock);
+
+	session = list_first_entry_or_null(
+		&panthor_proxy_submit_sched.runnable_sessions,
+		struct panthor_proxy_session, sched_node);
+	if (!session)
+		return NULL;
+
+	list_del_init(&session->sched_node);
+	session->sched_queued = false;
+
+	submit = list_first_entry_or_null(&session->submit_queue,
+					  struct panthor_proxy_submit_req,
+					  node);
+	if (!submit)
+		return NULL;
+
+	list_del_init(&submit->node);
+	session->submit_queue_depth--;
+
+	if (!list_empty(&session->submit_queue))
+		panthor_proxy_submit_sched_queue_locked(session);
+
+	atomic_dec(&panthor_proxy_submit_sched.queued);
+	return submit;
+}
+
+static void panthor_proxy_submit_sched_work(struct work_struct *work)
+{
+	for (;;) {
+		struct panthor_proxy_submit_req *submit;
+
+		mutex_lock(&panthor_proxy_submit_sched.lock);
+		submit = panthor_proxy_submit_sched_pick_locked();
+		mutex_unlock(&panthor_proxy_submit_sched.lock);
+		if (!submit)
+			return;
+
+		submit->ret = panthor_proxy_session_group_submit(
+			submit->session, &submit->req, &submit->rsp);
+
+		panthor_proxy_session_put(submit->session);
+		WRITE_ONCE(submit->done, true);
+		wake_up(&submit->wait);
+	}
+}
+
+static int
+panthor_proxy_submit_sched_run(struct panthor_proxy_session *session,
+			       const struct panthor_vmshm_group_submit_req *req,
+			       struct panthor_vmshm_group_submit_rsp *rsp)
+{
+	struct panthor_proxy_submit_req submit = {
+		.session = session,
+		.req = *req,
+	};
+	int queued;
+
+	if (!session || !req || !rsp)
+		return -EINVAL;
+
+	init_waitqueue_head(&submit.wait);
+	INIT_LIST_HEAD(&submit.node);
+	refcount_inc(&session->refcnt);
+
+	mutex_lock(&panthor_proxy_sessions_lock);
+	if (session->closing) {
+		mutex_unlock(&panthor_proxy_sessions_lock);
+		panthor_proxy_session_put(session);
+		return -ESHUTDOWN;
+	}
+
+	mutex_lock(&panthor_proxy_submit_sched.lock);
+	queued = atomic_read(&panthor_proxy_submit_sched.queued);
+	if (queued >= PANTHOR_PROXY_SUBMIT_SCHED_MAX_DEPTH) {
+		mutex_unlock(&panthor_proxy_submit_sched.lock);
+		mutex_unlock(&panthor_proxy_sessions_lock);
+		panthor_proxy_session_put(session);
+		return -EBUSY;
+	}
+
+	list_add_tail(&submit.node, &session->submit_queue);
+	session->submit_queue_depth++;
+	atomic_inc(&panthor_proxy_submit_sched.queued);
+	panthor_proxy_submit_sched_queue_locked(session);
+	mutex_unlock(&panthor_proxy_submit_sched.lock);
+	mutex_unlock(&panthor_proxy_sessions_lock);
+
+	schedule_work(&panthor_proxy_submit_sched.work);
+	wait_event(submit.wait, READ_ONCE(submit.done));
+
+	*rsp = submit.rsp;
+	return submit.ret;
 }
 
 static int
@@ -566,9 +945,9 @@ panthor_proxy_session_bo_create(struct panthor_proxy_session *session,
 	rsp->payload_offset = bo->payload_offset;
 	rsp->payload_size = bo->payload_size;
 	mutex_unlock(&session->lock);
-	pr_info("panthor-proxy: BO_CREATE vmshm-backed session=%llu client_bo=%u proxy_bo=%u size=0x%llx payload=0x%llx payload_size=0x%llx\n",
-		session->session_id, client_bo_handle, args.handle, args.size,
-		bo->payload_handle, bo->payload_size);
+	pr_info_ratelimited("panthor-proxy: BO_CREATE vmshm-backed session=%llu client_bo=%u proxy_bo=%u size=0x%llx payload=0x%llx payload_size=0x%llx\n",
+			    session->session_id, client_bo_handle, args.handle,
+			    args.size, bo->payload_handle, bo->payload_size);
 	return 0;
 
 err_destroy_proxy_bo:
@@ -644,6 +1023,7 @@ panthor_proxy_session_group_create(
 	args.compute_core_mask = req->compute_core_mask;
 	args.fragment_core_mask = req->fragment_core_mask;
 	args.tiler_core_mask = req->tiler_core_mask;
+	panthor_proxy_apply_group_core_partition(session, &args);
 
 	mutex_lock(&session->lock);
 	ret = panthor_proxy_session_translate_vm_locked(
@@ -1676,9 +2056,9 @@ panthor_proxy_handle_vm_bind(struct proxy_comm_vmshm_channel *channel,
 	if (ret)
 		rsp.ret = ret;
 
-	pr_info("panthor-proxy: VM_BIND session=%llu client_vm=%u proxy_vm=%u ops=%u ret=%d failed_op=%u\n",
-		req->session_id, req->client_vm_id, rsp.proxy_vm_id,
-		req->op_count, rsp.ret, rsp.failed_op);
+	pr_info_ratelimited("panthor-proxy: VM_BIND session=%llu client_vm=%u proxy_vm=%u ops=%u ret=%d failed_op=%u\n",
+			    req->session_id, req->client_vm_id, rsp.proxy_vm_id,
+			    req->op_count, rsp.ret, rsp.failed_op);
 
 out_send:
 	ret = panthor_proxy_send_rsp(channel, rx->seq,
@@ -1749,10 +2129,10 @@ panthor_proxy_handle_bo_create(struct proxy_comm_vmshm_channel *channel,
 	if (ret)
 		rsp.ret = ret;
 	else
-		pr_info("panthor-proxy: BO_CREATE session=%llu client_bo=%u proxy_bo=%u size=0x%llx payload=0x%llx payload_size=0x%llx\n",
-			req->session_id, rsp.client_bo_handle,
-			rsp.proxy_bo_handle, rsp.size, rsp.payload_handle,
-			rsp.payload_size);
+		pr_info_ratelimited("panthor-proxy: BO_CREATE session=%llu client_bo=%u proxy_bo=%u size=0x%llx payload=0x%llx payload_size=0x%llx\n",
+				    req->session_id, rsp.client_bo_handle,
+				    rsp.proxy_bo_handle, rsp.size,
+				    rsp.payload_handle, rsp.payload_size);
 
 out_send:
 	ret = panthor_proxy_send_rsp(channel, rx->seq,
@@ -1901,9 +2281,9 @@ panthor_proxy_handle_syncobj_wait(struct proxy_comm_vmshm_channel *channel,
 
 	rsp.ret = panthor_proxy_session_syncobj_wait(session, req, &rsp);
 	panthor_proxy_session_put(session);
-	pr_info("panthor-proxy: SYNCOBJ_WAIT session=%llu count=%u flags=0x%x first=%u ret=%d\n",
-		req->session_id, req->count_handles, req->flags,
-		rsp.first_signaled, rsp.ret);
+	pr_info_ratelimited("panthor-proxy: SYNCOBJ_WAIT session=%llu count=%u flags=0x%x first=%u ret=%d\n",
+			    req->session_id, req->count_handles, req->flags,
+			    rsp.first_signaled, rsp.ret);
 
 out_send:
 	ret = panthor_proxy_send_rsp(channel, rx->seq,
@@ -1967,9 +2347,9 @@ panthor_proxy_handle_syncobj_timeline_wait(
 	rsp.ret = panthor_proxy_session_syncobj_timeline_wait(session, req,
 							      &rsp);
 	panthor_proxy_session_put(session);
-	pr_info("panthor-proxy: SYNCOBJ_TIMELINE_WAIT session=%llu count=%u flags=0x%x first=%u ret=%d\n",
-		req->session_id, req->count_handles, req->flags,
-		rsp.first_signaled, rsp.ret);
+	pr_info_ratelimited("panthor-proxy: SYNCOBJ_TIMELINE_WAIT session=%llu count=%u flags=0x%x first=%u ret=%d\n",
+			    req->session_id, req->count_handles, req->flags,
+			    rsp.first_signaled, rsp.ret);
 
 out_send:
 	ret = panthor_proxy_send_rsp(
@@ -2210,15 +2590,15 @@ panthor_proxy_handle_group_submit(struct proxy_comm_vmshm_channel *channel,
 		goto out_send;
 	}
 
-	rsp.ret = panthor_proxy_session_group_submit(session, req, &rsp);
+	rsp.ret = panthor_proxy_submit_sched_run(session, req, &rsp);
 	panthor_proxy_session_put(session);
-	pr_info("panthor-proxy: GROUP_SUBMIT session=%llu client_group=%u proxy_group=%u jobs=%u syncs=%u first_stream=0x%llx first_size=%u first_latest_flush=0x%x ret=%d\n",
-		req->session_id, req->client_group_handle,
-		rsp.proxy_group_handle, rsp.job_count, rsp.sync_count,
-		req->job_count ? req->jobs[0].stream_addr : 0,
-		req->job_count ? req->jobs[0].stream_size : 0,
-		req->job_count ? req->jobs[0].latest_flush : 0,
-		rsp.ret);
+	pr_info_ratelimited("panthor-proxy: GROUP_SUBMIT session=%llu client_group=%u proxy_group=%u jobs=%u syncs=%u first_stream=0x%llx first_size=%u first_latest_flush=0x%x ret=%d\n",
+			    req->session_id, req->client_group_handle,
+			    rsp.proxy_group_handle, rsp.job_count, rsp.sync_count,
+			    req->job_count ? req->jobs[0].stream_addr : 0,
+			    req->job_count ? req->jobs[0].stream_size : 0,
+			    req->job_count ? req->jobs[0].latest_flush : 0,
+			    rsp.ret);
 
 out_send:
 	ret = panthor_proxy_send_rsp(channel, rx->seq,
@@ -2485,28 +2865,121 @@ panthor_proxy_find_handler(u32 type)
 	return NULL;
 }
 
+static u32
+panthor_proxy_handler_index(const struct panthor_proxy_msg_handler *handler)
+{
+	return handler ? (u32)(handler - panthor_proxy_handlers) :
+			 PANTHOR_PROXY_RPC_STATS_MAX;
+}
+
+static void
+panthor_proxy_rpc_stats_dump_snapshot(const struct panthor_proxy_rpc_stats *stats)
+{
+	u32 i;
+
+	if (!stats)
+		return;
+
+	pr_info("panthor-proxy: [MZH][PANTHOR_PROXY_RPC_STATS_SUMMARY] bad_rx=%llu unknown_type=%llu bad_len=%llu\n",
+		stats->bad_rx, stats->unknown_type, stats->bad_len);
+
+	for (i = 0; i < ARRAY_SIZE(panthor_proxy_handlers) &&
+		    i < PANTHOR_PROXY_RPC_STATS_MAX; i++) {
+		const struct panthor_proxy_rpc_stat *stat = &stats->op[i];
+		u64 avg_ns;
+
+		if (!stat->calls)
+			continue;
+
+		avg_ns = div64_u64(stat->total_ns, stat->calls);
+		pr_info("panthor-proxy: [MZH][PANTHOR_PROXY_RPC_STATS] op=%s type=0x%x calls=%llu total_ns=%llu avg_ns=%llu max_ns=%llu\n",
+			panthor_proxy_handlers[i].name,
+			panthor_proxy_handlers[i].req_type, stat->calls,
+			stat->total_ns, avg_ns, stat->max_ns);
+	}
+}
+
 static int panthor_proxy_rx_handler(const struct vmshm_comm_rx *rx, void *priv)
 {
 	const struct panthor_proxy_msg_handler *handler;
+	u64 start_ns = 0;
 
-	if (!rx)
+	if (!rx) {
+		panthor_proxy_rpc_stats_record_bad_rx();
 		return -EPROTO;
+	}
 
 	handler = panthor_proxy_find_handler(rx->type);
-	if (!handler)
+	if (!handler) {
+		panthor_proxy_rpc_stats_record_unknown_type();
 		return -ENOENT;
+	}
 
-	if (rx->len != handler->req_size)
+	if (rx->len != handler->req_size) {
+		panthor_proxy_rpc_stats_record_bad_len();
 		return -EPROTO;
+	}
 
+	if (panthor_proxy_rpc_stats_is_enabled())
+		start_ns = ktime_get_ns();
 	handler->handler(rx->proxy_channel, rx, rx->payload);
+	if (start_ns)
+		panthor_proxy_rpc_stats_record_op(
+			panthor_proxy_handler_index(handler),
+			ktime_get_ns() - start_ns);
 
 	return 0;
 }
 
+static int panthor_proxy_rpc_stats_set(const char *val,
+				       const struct kernel_param *kp)
+{
+	struct panthor_proxy_rpc_stats snapshot = { 0 };
+	unsigned long flags;
+	bool enabled;
+	bool dump = false;
+	int ret;
+
+	ret = kstrtobool(val, &enabled);
+	if (ret)
+		return ret;
+
+	spin_lock_irqsave(&panthor_proxy_rpc_stats_lock, flags);
+	if (enabled && !panthor_proxy_rpc_stats_enabled) {
+		memset(&panthor_proxy_rpc_stats_data, 0,
+		       sizeof(panthor_proxy_rpc_stats_data));
+	} else if (!enabled && panthor_proxy_rpc_stats_enabled) {
+		snapshot = panthor_proxy_rpc_stats_data;
+		dump = true;
+	}
+	WRITE_ONCE(panthor_proxy_rpc_stats_enabled, enabled);
+	spin_unlock_irqrestore(&panthor_proxy_rpc_stats_lock, flags);
+
+	if (dump)
+		panthor_proxy_rpc_stats_dump_snapshot(&snapshot);
+
+	return 0;
+}
+
+static const struct kernel_param_ops panthor_proxy_rpc_stats_param_ops = {
+	.set = panthor_proxy_rpc_stats_set,
+	.get = param_get_bool,
+};
+
+module_param_cb(rpc_stats, &panthor_proxy_rpc_stats_param_ops,
+		&panthor_proxy_rpc_stats_enabled, 0644);
+MODULE_PARM_DESC(rpc_stats,
+		 "Collect aggregated vmshm RPC handler latency stats");
+
 static int __init panthor_proxy_init(void)
 {
 	int ret, i;
+
+	mutex_init(&panthor_proxy_submit_sched.lock);
+	INIT_LIST_HEAD(&panthor_proxy_submit_sched.runnable_sessions);
+	INIT_WORK(&panthor_proxy_submit_sched.work,
+		  panthor_proxy_submit_sched_work);
+	atomic_set(&panthor_proxy_submit_sched.queued, 0);
 
 	for (i = 0; i < ARRAY_SIZE(panthor_proxy_handlers); i++) {
 		ret = proxy_comm_vmshm_register_handler(
@@ -2541,6 +3014,7 @@ static void __exit panthor_proxy_exit(void)
 			panthor_proxy_handlers[i].req_type,
 			panthor_proxy_rx_handler, NULL);
 	panthor_proxy_sessions_destroy_all();
+	cancel_work_sync(&panthor_proxy_submit_sched.work);
 }
 
 module_init(panthor_proxy_init);
