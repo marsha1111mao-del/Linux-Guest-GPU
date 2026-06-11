@@ -341,6 +341,15 @@ panthor_proxy_session_find_locked(u64 session_id)
 	return NULL;
 }
 
+static void panthor_proxy_log_session_access_denied(const char *op,
+						    u64 session_id,
+						    u32 owner_vmid,
+						    u32 requester_vmid)
+{
+	pr_warn_ratelimited("panthor-proxy: SESSION_ACCESS_DENIED op=%s session=%llu owner_vmid=%u requester_vmid=%u\n",
+			    op, session_id, owner_vmid, requester_vmid);
+}
+
 static int panthor_proxy_session_create(u32 owner_vmid, u64 *session_id)
 {
 	struct panthor_proxy_session *session;
@@ -519,8 +528,12 @@ static int panthor_proxy_session_destroy(u64 session_id, u32 requester_vmid)
 
 	mutex_lock(&panthor_proxy_sessions_lock);
 	session = panthor_proxy_session_find_locked(session_id);
-	if (session && session->owner_vmid != requester_vmid)
+	if (session && session->owner_vmid != requester_vmid) {
+		panthor_proxy_log_session_access_denied("destroy", session_id,
+							session->owner_vmid,
+							requester_vmid);
 		session = NULL;
+	}
 	if (session) {
 		session->closing = true;
 		list_del(&session->node);
@@ -564,8 +577,12 @@ panthor_proxy_session_lookup(u64 session_id, u32 requester_vmid)
 
 	mutex_lock(&panthor_proxy_sessions_lock);
 	session = panthor_proxy_session_find_locked(session_id);
-	if (session && session->owner_vmid != requester_vmid)
+	if (session && session->owner_vmid != requester_vmid) {
+		panthor_proxy_log_session_access_denied("lookup", session_id,
+							session->owner_vmid,
+							requester_vmid);
 		session = NULL;
+	}
 	if (session && session->closing)
 		session = NULL;
 	if (session)
