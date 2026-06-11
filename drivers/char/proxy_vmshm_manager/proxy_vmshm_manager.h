@@ -5,6 +5,8 @@
 #include <linux/types.h>
 
 int proxy_vmshm_manager_init(void *base, phys_addr_t gpa, size_t size);
+int proxy_vmshm_manager_register_domain(u32 owner_vmid, void *base,
+					phys_addr_t gpa, size_t size);
 void proxy_vmshm_manager_destroy(void);
 
 #if IS_ENABLED(CONFIG_PROXY_VMSHM_MANAGER_SELFTEST) || \

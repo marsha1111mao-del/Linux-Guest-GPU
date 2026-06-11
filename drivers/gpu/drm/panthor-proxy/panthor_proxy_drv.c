@@ -84,6 +84,7 @@ struct panthor_proxy_session {
 	struct list_head sched_node;
 	struct list_head submit_queue;
 	u64 session_id;
+	u32 owner_vmid;
 	struct panthor_vmshm_session *real_session;
 	struct mutex lock;
 	struct xarray vms;
@@ -340,12 +341,12 @@ panthor_proxy_session_find_locked(u64 session_id)
 	return NULL;
 }
 
-static int panthor_proxy_session_create(u64 *session_id)
+static int panthor_proxy_session_create(u32 owner_vmid, u64 *session_id)
 {
 	struct panthor_proxy_session *session;
 	int ret;
 
-	if (!session_id)
+	if (!owner_vmid || !session_id)
 		return -EINVAL;
 
 	session = kzalloc(sizeof(*session), GFP_KERNEL);
@@ -354,6 +355,7 @@ static int panthor_proxy_session_create(u64 *session_id)
 
 	INIT_LIST_HEAD(&session->sched_node);
 	INIT_LIST_HEAD(&session->submit_queue);
+	session->owner_vmid = owner_vmid;
 	mutex_init(&session->lock);
 	xa_init_flags(&session->vms, XA_FLAGS_ALLOC1);
 	xa_init_flags(&session->bos, XA_FLAGS_ALLOC1);
@@ -508,7 +510,7 @@ static bool panthor_proxy_syncobj_get(struct panthor_proxy_syncobj *syncobj)
 	return syncobj && refcount_inc_not_zero(&syncobj->refcnt);
 }
 
-static int panthor_proxy_session_destroy(u64 session_id)
+static int panthor_proxy_session_destroy(u64 session_id, u32 requester_vmid)
 {
 	struct panthor_proxy_session *session;
 
@@ -517,6 +519,8 @@ static int panthor_proxy_session_destroy(u64 session_id)
 
 	mutex_lock(&panthor_proxy_sessions_lock);
 	session = panthor_proxy_session_find_locked(session_id);
+	if (session && session->owner_vmid != requester_vmid)
+		session = NULL;
 	if (session) {
 		session->closing = true;
 		list_del(&session->node);
@@ -550,15 +554,18 @@ static void panthor_proxy_sessions_destroy_all(void)
 	}
 }
 
-static struct panthor_proxy_session *panthor_proxy_session_lookup(u64 session_id)
+static struct panthor_proxy_session *
+panthor_proxy_session_lookup(u64 session_id, u32 requester_vmid)
 {
 	struct panthor_proxy_session *session;
 
-	if (!session_id)
+	if (!session_id || !requester_vmid)
 		return NULL;
 
 	mutex_lock(&panthor_proxy_sessions_lock);
 	session = panthor_proxy_session_find_locked(session_id);
+	if (session && session->owner_vmid != requester_vmid)
+		session = NULL;
 	if (session && session->closing)
 		session = NULL;
 	if (session)
@@ -568,7 +575,7 @@ static struct panthor_proxy_session *panthor_proxy_session_lookup(u64 session_id
 	return session;
 }
 
-static bool panthor_proxy_session_exists(u64 session_id)
+static bool panthor_proxy_session_exists(u64 session_id, u32 requester_vmid)
 {
 	struct panthor_proxy_session *session;
 	bool exists;
@@ -576,7 +583,7 @@ static bool panthor_proxy_session_exists(u64 session_id)
 	if (!session_id)
 		return true;
 
-	session = panthor_proxy_session_lookup(session_id);
+	session = panthor_proxy_session_lookup(session_id, requester_vmid);
 	exists = session;
 	panthor_proxy_session_put(session);
 	return exists;
@@ -876,7 +883,6 @@ panthor_proxy_session_bo_create(struct panthor_proxy_session *session,
 {
 	u64 payload_size;
 	struct proxy_vmshm_alloc_params payload_params = {
-		.owner_vmid = PANTHOR_VMSHM_POC_CLIENT_VMID,
 		.type = PROXY_VMSHM_OBJ_GPU_BO,
 		.flags = PROXY_VMSHM_F_CONTIG,
 		.perms = PROXY_VMSHM_PERM_CPU_READ |
@@ -896,6 +902,8 @@ panthor_proxy_session_bo_create(struct panthor_proxy_session *session,
 
 	if (!session || !req || !rsp)
 		return -EINVAL;
+	if (!session->owner_vmid)
+		return -EINVAL;
 	if (!req->size)
 		return -EINVAL;
 	if (req->size > U64_MAX - (PAGE_SIZE - 1))
@@ -903,6 +911,7 @@ panthor_proxy_session_bo_create(struct panthor_proxy_session *session,
 
 	payload_size = ALIGN(req->size, PAGE_SIZE);
 	payload_params.size = payload_size;
+	payload_params.owner_vmid = session->owner_vmid;
 
 	bo = kzalloc(sizeof(*bo), GFP_KERNEL);
 	if (!bo)
@@ -1883,19 +1892,21 @@ panthor_proxy_handle_open_session(struct proxy_comm_vmshm_channel *channel,
 {
 	const struct panthor_vmshm_open_session_req *req = payload;
 	struct panthor_vmshm_open_session_rsp rsp = { 0 };
+	u32 owner_vmid = proxy_comm_vmshm_channel_client_vmid(channel);
 	int ret;
 
-	if (req->version != PANTHOR_VMSHM_ABI_VERSION || req->flags) {
+	if (req->version != PANTHOR_VMSHM_ABI_VERSION || req->flags ||
+	    !owner_vmid) {
 		rsp.ret = -EINVAL;
 		goto out_send;
 	}
 
-	ret = panthor_proxy_session_create(&rsp.session_id);
+	ret = panthor_proxy_session_create(owner_vmid, &rsp.session_id);
 	if (ret)
 		rsp.ret = ret;
 	else
-		pr_info("panthor-proxy: OPEN_SESSION session=%llu\n",
-			rsp.session_id);
+		pr_info("panthor-proxy: OPEN_SESSION session=%llu owner_vmid=%u\n",
+			rsp.session_id, owner_vmid);
 
 out_send:
 	ret = panthor_proxy_send_rsp(channel, rx->seq,
@@ -1913,12 +1924,14 @@ panthor_proxy_handle_close_session(struct proxy_comm_vmshm_channel *channel,
 {
 	const struct panthor_vmshm_close_session_req *req = payload;
 	struct panthor_vmshm_close_session_rsp rsp = { 0 };
+	u32 owner_vmid = proxy_comm_vmshm_channel_client_vmid(channel);
 	int ret;
 
-	if (req->flags || req->pad)
+	if (req->flags || req->pad || !owner_vmid)
 		rsp.ret = -EINVAL;
 	else
-		rsp.ret = panthor_proxy_session_destroy(req->session_id);
+		rsp.ret = panthor_proxy_session_destroy(req->session_id,
+							owner_vmid);
 	if (!rsp.ret)
 		pr_info("panthor-proxy: CLOSE_SESSION session=%llu\n",
 			req->session_id);
@@ -1941,7 +1954,7 @@ panthor_proxy_handle_dev_query(struct proxy_comm_vmshm_channel *channel,
 	int ret;
 
 	memset(&rsp, 0, sizeof(rsp));
-	if (!panthor_proxy_session_exists(req->session_id)) {
+	if (!panthor_proxy_session_exists(req->session_id, proxy_comm_vmshm_channel_client_vmid(channel))) {
 		rsp.type = req->type;
 		rsp.ret = -ENOENT;
 		goto out_send;
@@ -1977,7 +1990,7 @@ panthor_proxy_handle_vm_create(struct proxy_comm_vmshm_channel *channel,
 	struct panthor_proxy_session *session;
 	int ret;
 
-	session = panthor_proxy_session_lookup(req->session_id);
+	session = panthor_proxy_session_lookup(req->session_id, proxy_comm_vmshm_channel_client_vmid(channel));
 	if (!session) {
 		rsp.ret = -ENOENT;
 		goto out_send;
@@ -2011,7 +2024,7 @@ panthor_proxy_handle_vm_destroy(struct proxy_comm_vmshm_channel *channel,
 	struct panthor_proxy_session *session;
 	int ret;
 
-	session = panthor_proxy_session_lookup(req->session_id);
+	session = panthor_proxy_session_lookup(req->session_id, proxy_comm_vmshm_channel_client_vmid(channel));
 	if (!session) {
 		rsp.ret = -ENOENT;
 		goto out_send;
@@ -2045,7 +2058,7 @@ panthor_proxy_handle_vm_bind(struct proxy_comm_vmshm_channel *channel,
 	struct panthor_proxy_session *session;
 	int ret;
 
-	session = panthor_proxy_session_lookup(req->session_id);
+	session = panthor_proxy_session_lookup(req->session_id, proxy_comm_vmshm_channel_client_vmid(channel));
 	if (!session) {
 		rsp.ret = -ENOENT;
 		goto out_send;
@@ -2084,7 +2097,7 @@ panthor_proxy_handle_vm_get_state(struct proxy_comm_vmshm_channel *channel,
 		goto out_send;
 	}
 
-	session = panthor_proxy_session_lookup(req->session_id);
+	session = panthor_proxy_session_lookup(req->session_id, proxy_comm_vmshm_channel_client_vmid(channel));
 	if (!session) {
 		rsp.ret = -ENOENT;
 		goto out_send;
@@ -2118,7 +2131,7 @@ panthor_proxy_handle_bo_create(struct proxy_comm_vmshm_channel *channel,
 	struct panthor_proxy_session *session;
 	int ret;
 
-	session = panthor_proxy_session_lookup(req->session_id);
+	session = panthor_proxy_session_lookup(req->session_id, proxy_comm_vmshm_channel_client_vmid(channel));
 	if (!session) {
 		rsp.ret = -ENOENT;
 		goto out_send;
@@ -2158,7 +2171,7 @@ panthor_proxy_handle_bo_destroy(struct proxy_comm_vmshm_channel *channel,
 		goto out_send;
 	}
 
-	session = panthor_proxy_session_lookup(req->session_id);
+	session = panthor_proxy_session_lookup(req->session_id, proxy_comm_vmshm_channel_client_vmid(channel));
 	if (!session) {
 		rsp.ret = -ENOENT;
 		goto out_send;
@@ -2200,7 +2213,7 @@ panthor_proxy_handle_syncobj_create(struct proxy_comm_vmshm_channel *channel,
 		goto out_send;
 	}
 
-	session = panthor_proxy_session_lookup(req->session_id);
+	session = panthor_proxy_session_lookup(req->session_id, proxy_comm_vmshm_channel_client_vmid(channel));
 	if (!session) {
 		rsp.ret = -ENOENT;
 		goto out_send;
@@ -2239,7 +2252,7 @@ panthor_proxy_handle_syncobj_destroy(struct proxy_comm_vmshm_channel *channel,
 		goto out_send;
 	}
 
-	session = panthor_proxy_session_lookup(req->session_id);
+	session = panthor_proxy_session_lookup(req->session_id, proxy_comm_vmshm_channel_client_vmid(channel));
 	if (!session) {
 		rsp.ret = -ENOENT;
 		goto out_send;
@@ -2273,7 +2286,7 @@ panthor_proxy_handle_syncobj_wait(struct proxy_comm_vmshm_channel *channel,
 	struct panthor_proxy_session *session;
 	int ret;
 
-	session = panthor_proxy_session_lookup(req->session_id);
+	session = panthor_proxy_session_lookup(req->session_id, proxy_comm_vmshm_channel_client_vmid(channel));
 	if (!session) {
 		rsp.ret = -ENOENT;
 		goto out_send;
@@ -2304,7 +2317,7 @@ panthor_proxy_handle_syncobj_transfer(struct proxy_comm_vmshm_channel *channel,
 	struct panthor_proxy_session *session;
 	int ret;
 
-	session = panthor_proxy_session_lookup(req->session_id);
+	session = panthor_proxy_session_lookup(req->session_id, proxy_comm_vmshm_channel_client_vmid(channel));
 	if (!session) {
 		rsp.ret = -ENOENT;
 		goto out_send;
@@ -2338,7 +2351,7 @@ panthor_proxy_handle_syncobj_timeline_wait(
 	struct panthor_proxy_session *session;
 	int ret;
 
-	session = panthor_proxy_session_lookup(req->session_id);
+	session = panthor_proxy_session_lookup(req->session_id, proxy_comm_vmshm_channel_client_vmid(channel));
 	if (!session) {
 		rsp.ret = -ENOENT;
 		goto out_send;
@@ -2372,7 +2385,7 @@ panthor_proxy_handle_syncobj_array_op(
 	struct panthor_proxy_session *session;
 	int ret;
 
-	session = panthor_proxy_session_lookup(req->session_id);
+	session = panthor_proxy_session_lookup(req->session_id, proxy_comm_vmshm_channel_client_vmid(channel));
 	if (!session) {
 		rsp.ret = -ENOENT;
 		goto out_send;
@@ -2423,7 +2436,7 @@ panthor_proxy_handle_syncobj_timeline_array_op(
 	struct panthor_proxy_session *session;
 	int ret;
 
-	session = panthor_proxy_session_lookup(req->session_id);
+	session = panthor_proxy_session_lookup(req->session_id, proxy_comm_vmshm_channel_client_vmid(channel));
 	if (!session) {
 		rsp.ret = -ENOENT;
 		goto out_send;
@@ -2476,7 +2489,7 @@ panthor_proxy_handle_group_create(struct proxy_comm_vmshm_channel *channel,
 	struct panthor_proxy_session *session;
 	int ret;
 
-	session = panthor_proxy_session_lookup(req->session_id);
+	session = panthor_proxy_session_lookup(req->session_id, proxy_comm_vmshm_channel_client_vmid(channel));
 	if (!session) {
 		rsp.ret = -ENOENT;
 		goto out_send;
@@ -2516,7 +2529,7 @@ panthor_proxy_handle_group_destroy(struct proxy_comm_vmshm_channel *channel,
 		goto out_send;
 	}
 
-	session = panthor_proxy_session_lookup(req->session_id);
+	session = panthor_proxy_session_lookup(req->session_id, proxy_comm_vmshm_channel_client_vmid(channel));
 	if (!session) {
 		rsp.ret = -ENOENT;
 		goto out_send;
@@ -2553,7 +2566,7 @@ panthor_proxy_handle_group_get_state(struct proxy_comm_vmshm_channel *channel,
 		goto out_send;
 	}
 
-	session = panthor_proxy_session_lookup(req->session_id);
+	session = panthor_proxy_session_lookup(req->session_id, proxy_comm_vmshm_channel_client_vmid(channel));
 	if (!session) {
 		rsp.ret = -ENOENT;
 		goto out_send;
@@ -2584,7 +2597,7 @@ panthor_proxy_handle_group_submit(struct proxy_comm_vmshm_channel *channel,
 	struct panthor_proxy_session *session;
 	int ret;
 
-	session = panthor_proxy_session_lookup(req->session_id);
+	session = panthor_proxy_session_lookup(req->session_id, proxy_comm_vmshm_channel_client_vmid(channel));
 	if (!session) {
 		rsp.ret = -ENOENT;
 		goto out_send;
@@ -2619,7 +2632,7 @@ panthor_proxy_handle_tiler_heap_create(struct proxy_comm_vmshm_channel *channel,
 	struct panthor_proxy_session *session;
 	int ret;
 
-	session = panthor_proxy_session_lookup(req->session_id);
+	session = panthor_proxy_session_lookup(req->session_id, proxy_comm_vmshm_channel_client_vmid(channel));
 	if (!session) {
 		rsp.ret = -ENOENT;
 		goto out_send;
@@ -2659,7 +2672,7 @@ panthor_proxy_handle_tiler_heap_destroy(struct proxy_comm_vmshm_channel *channel
 		goto out_send;
 	}
 
-	session = panthor_proxy_session_lookup(req->session_id);
+	session = panthor_proxy_session_lookup(req->session_id, proxy_comm_vmshm_channel_client_vmid(channel));
 	if (!session) {
 		rsp.ret = -ENOENT;
 		goto out_send;

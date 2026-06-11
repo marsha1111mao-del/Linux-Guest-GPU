@@ -2149,7 +2149,6 @@ static int panthor_client_bo_create(struct panthor_client_file *pcfile,
 	struct panthor_vmshm_bo_create_rsp rsp;
 	struct client_vmshm_lookup_params lookup = {
 		.lookup = VMSHM_MANAGER_LOOKUP_HANDLE,
-		.requester_vmid = PANTHOR_VMSHM_POC_CLIENT_VMID,
 		.required_perms = PROXY_VMSHM_PERM_MMAP |
 				  PROXY_VMSHM_PERM_CPU_READ |
 				  PROXY_VMSHM_PERM_CPU_WRITE,
@@ -2185,6 +2184,12 @@ static int panthor_client_bo_create(struct panthor_client_file *pcfile,
 	}
 
 	lookup.handle = rsp.payload_handle;
+	lookup.requester_vmid = client_comm_vmshm_client_vmid();
+	if (!lookup.requester_vmid) {
+		kfree(bo);
+		panthor_client_bo_destroy_rpc(pcfile, rsp.client_bo_handle, NULL);
+		return -EPROTO;
+	}
 	ret = client_vmshm_manager_get(&lookup, &bo->payload_obj);
 	if (ret) {
 		kfree(bo);

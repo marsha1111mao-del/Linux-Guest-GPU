@@ -225,6 +225,7 @@ struct proxy_comm_vmshm_dev {
 	struct proxy_comm_vmshm_header *hdr;
 	phys_addr_t gpa;
 	resource_size_t size;
+	u32 client_vmid;
 	void __iomem *doorbell;
 	resource_size_t doorbell_size;
 	int irq;
@@ -1117,6 +1118,15 @@ u32 proxy_comm_vmshm_channel_max_payload(struct proxy_comm_vmshm_channel *channe
 }
 EXPORT_SYMBOL_GPL(proxy_comm_vmshm_channel_max_payload);
 
+u32 proxy_comm_vmshm_channel_client_vmid(struct proxy_comm_vmshm_channel *channel)
+{
+	struct proxy_comm_vmshm_dev *d =
+		proxy_comm_vmshm_dev_from_channel(channel);
+
+	return d ? d->client_vmid : 0;
+}
+EXPORT_SYMBOL_GPL(proxy_comm_vmshm_channel_client_vmid);
+
 int proxy_comm_vmshm_send_to_channel(struct proxy_comm_vmshm_channel *channel,
 				     const struct vmshm_comm_tx *tx)
 {
@@ -1909,6 +1919,11 @@ static int proxy_comm_vmshm_probe(struct platform_device *pdev)
 	INIT_LIST_HEAD(&d->node);
 	d->gpa = res->start;
 	d->size = resource_size(res);
+	if (pdev->dev.of_node)
+		of_property_read_u32(pdev->dev.of_node, "vmshm-client-vmid",
+				     &d->client_vmid);
+	if (!d->client_vmid)
+		d->client_vmid = 1;
 	d->minor = -1;
 	mutex_init(&d->lock);
 	atomic_set(&d->open_cnt, 0);
@@ -1922,8 +1937,8 @@ static int proxy_comm_vmshm_probe(struct platform_device *pdev)
 		return -EINVAL;
 	}
 
-	dev_info(&pdev->dev, "GPA 0x%pa size 0x%pa\n",
-		 &d->gpa, &d->size);
+	dev_info(&pdev->dev, "GPA 0x%pa size 0x%pa client_vmid=%u\n",
+		 &d->gpa, &d->size, d->client_vmid);
 
 	d->base = memremap(d->gpa, d->size, MEMREMAP_WB);
 	if (!d->base) {

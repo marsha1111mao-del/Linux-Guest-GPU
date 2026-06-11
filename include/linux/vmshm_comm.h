@@ -60,6 +60,7 @@ typedef int (*proxy_comm_vmshm_rx_handler_t)(const struct vmshm_comm_rx *rx,
 #if IS_ENABLED(CONFIG_PROXY_VMSHM_COMM)
 bool proxy_comm_vmshm_channel_ready(struct proxy_comm_vmshm_channel *channel);
 u32 proxy_comm_vmshm_channel_max_payload(struct proxy_comm_vmshm_channel *channel);
+u32 proxy_comm_vmshm_channel_client_vmid(struct proxy_comm_vmshm_channel *channel);
 int proxy_comm_vmshm_send_to_channel(struct proxy_comm_vmshm_channel *channel,
 				     const struct vmshm_comm_tx *tx);
 int proxy_comm_vmshm_register_handler(u32 type,
@@ -77,6 +78,12 @@ proxy_comm_vmshm_channel_ready(struct proxy_comm_vmshm_channel *channel)
 
 static inline u32
 proxy_comm_vmshm_channel_max_payload(struct proxy_comm_vmshm_channel *channel)
+{
+	return 0;
+}
+
+static inline u32
+proxy_comm_vmshm_channel_client_vmid(struct proxy_comm_vmshm_channel *channel)
 {
 	return 0;
 }
@@ -107,6 +114,7 @@ proxy_comm_vmshm_unregister_handler(u32 type,
 #if IS_ENABLED(CONFIG_CLIENT_VMSHM_COMM)
 bool client_comm_vmshm_ready(void);
 u32 client_comm_vmshm_max_payload(void);
+u32 client_comm_vmshm_client_vmid(void);
 int client_comm_vmshm_send_to_proxy(const struct vmshm_comm_tx *tx);
 int client_comm_vmshm_recv_from_proxy(struct vmshm_comm_rx *rx);
 int client_comm_vmshm_call(u32 req_type, u32 req_flags,
@@ -121,6 +129,11 @@ static inline bool client_comm_vmshm_ready(void)
 }
 
 static inline u32 client_comm_vmshm_max_payload(void)
+{
+	return 0;
+}
+
+static inline u32 client_comm_vmshm_client_vmid(void)
 {
 	return 0;
 }

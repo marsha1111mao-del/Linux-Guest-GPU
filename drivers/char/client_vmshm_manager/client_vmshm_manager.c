@@ -19,6 +19,7 @@
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/refcount.h>
 #include <linux/slab.h>
@@ -38,6 +39,7 @@ struct client_vmshm_manager_dev {
 	void *base;
 	phys_addr_t gpa;
 	resource_size_t size;
+	u32 client_vmid;
 	dev_t devt;
 	struct cdev cdev;
 	struct class *class;
@@ -126,7 +128,7 @@ int client_vmshm_manager_get(const struct client_vmshm_lookup_params *params,
 	req.handle = params->handle;
 	req.grant_id = params->grant_id;
 	req.lookup = params->lookup;
-	req.requester_vmid = params->requester_vmid;
+	req.requester_vmid = params->requester_vmid ?: d->client_vmid;
 	req.required_perms = params->required_perms;
 	req.flags = params->flags;
 
@@ -316,6 +318,11 @@ static int client_vmshm_probe(struct platform_device *pdev)
 
 	client_vmshm_mgr.gpa = res->start;
 	client_vmshm_mgr.size = resource_size(res);
+	if (pdev->dev.of_node)
+		of_property_read_u32(pdev->dev.of_node, "vmshm-client-vmid",
+				     &client_vmshm_mgr.client_vmid);
+	if (!client_vmshm_mgr.client_vmid)
+		client_vmshm_mgr.client_vmid = 1;
 	mutex_init(&client_vmshm_mgr.lock);
 	atomic_set(&client_vmshm_mgr.open_cnt, 0);
 
@@ -360,9 +367,9 @@ static int client_vmshm_probe(struct platform_device *pdev)
 		goto err_class_destroy;
 	}
 
-	dev_info(&pdev->dev, "/dev/%s registered GPA 0x%pa size 0x%pa\n",
+	dev_info(&pdev->dev, "/dev/%s registered GPA 0x%pa size 0x%pa client_vmid=%u\n",
 		 CLIENT_VMSHM_MANAGER_NAME, &client_vmshm_mgr.gpa,
-		 &client_vmshm_mgr.size);
+		 &client_vmshm_mgr.size, client_vmshm_mgr.client_vmid);
 	return 0;
 
 err_class_destroy:

@@ -17,6 +17,7 @@
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
@@ -44,12 +45,14 @@ static struct {
 	void *base;		/* memremap'd kernel VA (WB RAM) */
 	phys_addr_t gpa;	/* guest physical base */
 	resource_size_t size;	/* region size in bytes */
+	u32 owner_vmid;		/* security owner for the active debug window */
 	dev_t devt;		/* major:minor */
 	struct cdev cdev;
 	struct class *class;
 	struct device *dev;	/* char device under /sys/class/proxy_vmshm_manager */
 	struct mutex lock;	/* protects read/write fops */
 	atomic_t open_cnt;	/* open reference count */
+	bool chardev_registered;
 } vmshm_dev;
 
 #define PROXY_VMSHM_MANAGER_NAME "proxy_vmshm_manager"
@@ -229,6 +232,10 @@ static const struct file_operations vmshm_fops = {
 
 static int vmshm_probe(struct platform_device *pdev)
 {
+	void *base;
+	phys_addr_t gpa;
+	resource_size_t size;
+	u32 owner_vmid = 0;
 	struct resource *res;
 	int ret;
 
@@ -238,26 +245,29 @@ static int vmshm_probe(struct platform_device *pdev)
 		return -ENODEV;
 	}
 
-	vmshm_dev.gpa = res->start;
-	vmshm_dev.size = resource_size(res);
+	gpa = res->start;
+	size = resource_size(res);
+	if (pdev->dev.of_node)
+		of_property_read_u32(pdev->dev.of_node, "vmshm-client-vmid",
+				     &owner_vmid);
+	if (!owner_vmid)
+		owner_vmid = 1;
 
-	dev_info(&pdev->dev, "GPA 0x%pa size 0x%pa\n",
-		 &vmshm_dev.gpa, &vmshm_dev.size);
+	dev_info(&pdev->dev, "GPA 0x%pa size 0x%pa owner_vmid=%u\n",
+		 &gpa, &size, owner_vmid);
 
 	/* Map the shared memory region as Write-Back RAM */
-	vmshm_dev.base = memremap(vmshm_dev.gpa, vmshm_dev.size,
-				   MEMREMAP_WB);
-	if (!vmshm_dev.base) {
+	base = memremap(gpa, size, MEMREMAP_WB);
+	if (!base) {
 		dev_err(&pdev->dev, "memremap failed\n");
 		return -ENOMEM;
 	}
 
-	dev_info(&pdev->dev, "mapped -> kernel VA %p\n", vmshm_dev.base);
+	dev_info(&pdev->dev, "mapped -> kernel VA %p\n", base);
 
-	ret = proxy_vmshm_manager_init(vmshm_dev.base, vmshm_dev.gpa,
-				       vmshm_dev.size);
+	ret = proxy_vmshm_manager_register_domain(owner_vmid, base, gpa, size);
 	if (ret) {
-		dev_err(&pdev->dev, "proxy_manager_vmshm init failed (%d)\n", ret);
+		dev_err(&pdev->dev, "proxy_manager_vmshm domain init failed (%d)\n", ret);
 		goto err_unmap;
 	}
 
@@ -266,6 +276,17 @@ static int vmshm_probe(struct platform_device *pdev)
 		dev_err(&pdev->dev, "proxy_manager_vmshm selftest failed (%d)\n", ret);
 		goto err_manager_destroy;
 	}
+
+	if (vmshm_dev.chardev_registered) {
+		dev_info(&pdev->dev, "registered allocator-only domain owner_vmid=%u\n",
+			 owner_vmid);
+		return 0;
+	}
+
+	vmshm_dev.base = base;
+	vmshm_dev.gpa = gpa;
+	vmshm_dev.size = size;
+	vmshm_dev.owner_vmid = owner_vmid;
 
 	/* Allocate character device number */
 	ret = alloc_chrdev_region(&vmshm_dev.devt, 0, 1,
@@ -303,6 +324,7 @@ static int vmshm_probe(struct platform_device *pdev)
 
 	mutex_init(&vmshm_dev.lock);
 	atomic_set(&vmshm_dev.open_cnt, 0);
+	vmshm_dev.chardev_registered = true;
 
 	dev_info(&pdev->dev, "/dev/%s registered (major %d)\n",
 		 PROXY_VMSHM_MANAGER_NAME, MAJOR(vmshm_dev.devt));
@@ -317,8 +339,9 @@ err_unregister_chrdev:
 err_manager_destroy:
 	proxy_vmshm_manager_destroy();
 err_unmap:
-	memunmap(vmshm_dev.base);
-	vmshm_dev.base = NULL;
+	memunmap(base);
+	if (vmshm_dev.base == base)
+		vmshm_dev.base = NULL;
 	return ret;
 }
 
