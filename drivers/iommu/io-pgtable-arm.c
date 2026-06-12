@@ -11,10 +11,12 @@
 #include <linux/highmem.h>
 #include <linux/atomic.h>
 #include <linux/bitops.h>
+#include <linux/cc_platform.h>
 #include <linux/io-pgtable.h>
 #include <linux/kernel.h>
 #include <linux/ktime.h>
 #include <linux/module.h>
+#include <linux/set_memory.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
 #include <linux/types.h>
@@ -379,6 +381,57 @@ static long kvm_hypercall_gpa_to_hpa_batch(u64 addr_array, u64 count)
 			     addr_array, count, &res);
 
 	return res.a0;
+}
+
+static int panthor_realm_share_gpa2hpa_page(struct page *page)
+{
+	void *addr = page_address(page);
+	int ret;
+
+	if (!cc_platform_has(CC_ATTR_MEM_ENCRYPT))
+		return 0;
+
+	if (!addr)
+		return -EINVAL;
+
+	ret = set_memory_decrypted((unsigned long)addr, 1);
+	if (ret) {
+		pr_err("[MZH][GPA2HPA] failed to share Realm exchange page ret=%d; leaking page\n",
+		       ret);
+		return ret;
+	}
+
+	memset(addr, 0, PAGE_SIZE);
+	return 0;
+}
+
+static void panthor_realm_free_gpa2hpa_page(struct page *page)
+{
+	void *addr;
+	int ret;
+
+	if (!page)
+		return;
+
+	if (!cc_platform_has(CC_ATTR_MEM_ENCRYPT)) {
+		__free_page(page);
+		return;
+	}
+
+	addr = page_address(page);
+	if (!addr) {
+		pr_err("[MZH][GPA2HPA] cannot protect exchange page without direct map; leaking page\n");
+		return;
+	}
+
+	ret = set_memory_encrypted((unsigned long)addr, 1);
+	if (ret) {
+		pr_err("[MZH][GPA2HPA] failed to protect exchange page ret=%d; leaking page\n",
+		       ret);
+		return;
+	}
+
+	__free_page(page);
 }
 
 static int panthor_gpa_to_hpa_batch(struct arm_lpae_io_pgtable *data,
@@ -1503,8 +1556,7 @@ static void arm_panthor_lpae_free_pgtable(struct io_pgtable *iop)
 			stats->init_pte_free_hpas_ns);
 	}
 	panthor_gpa_hpa_cache_free(data);
-	if (data->panthor_gpa2hpa_page)
-		__free_page(data->panthor_gpa2hpa_page);
+	panthor_realm_free_gpa2hpa_page(data->panthor_gpa2hpa_page);
 	kfree(data);
 }
 
@@ -2276,6 +2328,11 @@ arm_64_panthor_lpae_alloc_pgtable_s1(struct io_pgtable_cfg *cfg, void *cookie)
 	data->panthor_gpa2hpa_page = alloc_page(GFP_KERNEL);
 	if (!data->panthor_gpa2hpa_page)
 		goto out_free_data;
+	ret = panthor_realm_share_gpa2hpa_page(data->panthor_gpa2hpa_page);
+	if (ret) {
+		data->panthor_gpa2hpa_page = NULL;
+		goto out_free_data;
+	}
 	/* Looking good; allocate a pgd */
 	data->pgd = __arm_lpae_alloc_pages(ARM_LPAE_PGD_SIZE(data), GFP_KERNEL,
 					   cfg, cookie);
@@ -2300,8 +2357,7 @@ out_free_data:
 		__arm_lpae_free_pages(data->pgd, ARM_LPAE_PGD_SIZE(data), cfg,
 				      cookie);
 	panthor_gpa_hpa_cache_free(data);
-	if (data->panthor_gpa2hpa_page)
-		__free_page(data->panthor_gpa2hpa_page);
+	panthor_realm_free_gpa2hpa_page(data->panthor_gpa2hpa_page);
 	kfree(data);
 	return NULL;
 }

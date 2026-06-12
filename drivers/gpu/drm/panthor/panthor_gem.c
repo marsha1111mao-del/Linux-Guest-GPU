@@ -4,8 +4,11 @@
 
 #include <linux/dma-buf.h>
 #include <linux/dma-mapping.h>
+#include <linux/cc_platform.h>
 #include <linux/err.h>
+#include <linux/mm.h>
 #include <linux/proxy_vmshm.h>
+#include <linux/set_memory.h>
 #include <linux/slab.h>
 
 #include <drm/panthor_drm.h>
@@ -14,15 +17,117 @@
 #include "panthor_gem.h"
 #include "panthor_mmu.h"
 
+static int panthor_gem_share_realm_gpu_pages(struct panthor_gem_object *bo)
+{
+	struct drm_gem_shmem_object *shmem = &bo->base;
+	struct drm_gem_object *obj = &shmem->base;
+	u32 page_count = PFN_UP(obj->size);
+	u32 i;
+	int ret;
+
+	if (!cc_platform_has(CC_ATTR_MEM_ENCRYPT) || panthor_gem_is_vmshm_backed(bo))
+		return 0;
+
+	if (obj->import_attach)
+		return -EINVAL;
+
+	if (bo->realm_gpu_shared)
+		return 0;
+
+	ret = drm_gem_shmem_pin(shmem);
+	if (ret)
+		return ret;
+	bo->realm_gpu_shared_pinned = true;
+
+	if (!shmem->pages) {
+		ret = -ENOMEM;
+		goto err_leak;
+	}
+
+	for (i = 0; i < page_count; i++) {
+		void *addr = page_address(shmem->pages[i]);
+
+		if (!addr) {
+			ret = -EINVAL;
+			goto err_leak;
+		}
+
+		ret = set_memory_decrypted((unsigned long)addr, 1);
+		if (ret)
+			goto err_leak;
+
+		bo->realm_gpu_shared_pages++;
+		memset(addr, 0, PAGE_SIZE);
+	}
+
+	bo->realm_gpu_shared = true;
+	return 0;
+
+err_leak:
+	drm_err(obj->dev,
+		"failed to share Realm GPU BO pages ret=%d; leaking backing pages\n",
+		ret);
+	shmem->pages = NULL;
+	shmem->pages_use_count = 0;
+	bo->realm_gpu_shared = false;
+	bo->realm_gpu_shared_pages = 0;
+	bo->realm_gpu_shared_pinned = false;
+	return ret;
+}
+
+static void panthor_gem_leak_realm_gpu_pages(struct panthor_gem_object *bo)
+{
+	struct drm_gem_shmem_object *shmem = &bo->base;
+
+	shmem->pages = NULL;
+	shmem->pages_use_count = 0;
+	bo->realm_gpu_shared = false;
+	bo->realm_gpu_shared_pages = 0;
+	bo->realm_gpu_shared_pinned = false;
+}
+
+static void panthor_gem_unshare_realm_gpu_pages(struct panthor_gem_object *bo)
+{
+	struct drm_gem_shmem_object *shmem = &bo->base;
+	struct drm_gem_object *obj = &shmem->base;
+
+	if (!bo->realm_gpu_shared && !bo->realm_gpu_shared_pinned)
+		return;
+
+	while (bo->realm_gpu_shared_pages) {
+		u32 idx = bo->realm_gpu_shared_pages - 1;
+		void *addr = page_address(shmem->pages[idx]);
+
+		if (!addr || set_memory_encrypted((unsigned long)addr, 1)) {
+			drm_err(obj->dev,
+				"failed to protect Realm GPU BO page %u; leaking BO\n",
+				idx);
+			panthor_gem_leak_realm_gpu_pages(bo);
+			return;
+		}
+
+		bo->realm_gpu_shared_pages--;
+	}
+
+	bo->realm_gpu_shared = false;
+
+	if (bo->realm_gpu_shared_pinned) {
+		bo->realm_gpu_shared_pinned = false;
+		drm_gem_shmem_unpin(shmem);
+	}
+}
+
 static void panthor_gem_free_object(struct drm_gem_object *obj)
 {
 	struct panthor_gem_object *bo = to_panthor_bo(obj);
 	struct drm_gem_object *vm_root_gem = bo->exclusive_vm_root_gem;
 	struct proxy_vmshm_object *vmshm_payload = bo->vmshm_payload;
 
+	bo->vmshm_payload = NULL;
+	panthor_gem_unshare_realm_gpu_pages(bo);
+
 	drm_gem_free_mmap_offset(&bo->base.base);
 	mutex_destroy(&bo->gpuva_list_lock);
-	bo->vmshm_payload = NULL;
 	drm_gem_shmem_free(&bo->base);
 	drm_gem_object_put(vm_root_gem);
 	proxy_vmshm_unpin(vmshm_payload);
@@ -101,6 +206,10 @@ struct panthor_kernel_bo *panthor_kernel_bo_create(struct panthor_device *ptdev,
 	bo = to_panthor_bo(&obj->base);
 	kbo->obj = &obj->base;
 	bo->flags = bo_flags;
+
+	ret = panthor_gem_share_realm_gpu_pages(bo);
+	if (ret)
+		goto err_put_obj;
 
 	/* The system and GPU MMU page size might differ, which becomes a
 	 * problem for FW sections that need to be mapped at explicit address
@@ -230,6 +339,10 @@ int panthor_gem_create_with_handle(struct drm_file *file,
 		bo->base.base.resv = bo->exclusive_vm_root_gem->resv;
 	}
 
+	ret = panthor_gem_share_realm_gpu_pages(bo);
+	if (ret)
+		goto err_put_object;
+
 	/*
 	 * Allocate an id of idr table where the obj is registered
 	 * and handle has the id what user can see.
@@ -241,6 +354,10 @@ int panthor_gem_create_with_handle(struct drm_file *file,
 	/* drop reference from allocate - handle holds it now. */
 	drm_gem_object_put(&shmem->base);
 
+	return ret;
+
+err_put_object:
+	drm_gem_object_put(&shmem->base);
 	return ret;
 }
 

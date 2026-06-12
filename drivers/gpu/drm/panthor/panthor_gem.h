@@ -49,6 +49,24 @@ struct panthor_gem_object {
 	u32 flags;
 
 	/**
+	 * @realm_gpu_shared: True when shmem pages were converted to
+	 * shared/decrypted memory for trusted local GPU access from a Realm.
+	 */
+	bool realm_gpu_shared;
+
+	/**
+	 * @realm_gpu_shared_pages: Number of pages converted for
+	 * @realm_gpu_shared.
+	 */
+	u32 realm_gpu_shared_pages;
+
+	/**
+	 * @realm_gpu_shared_pinned: True when the object holds a lifetime shmem
+	 * pin for @realm_gpu_shared.
+	 */
+	bool realm_gpu_shared_pinned;
+
+	/**
 	 * @vmshm_payload: vmshm-object backing for shared GPU virtualization BOs.
 	 *
 	 * When set, VM_BIND maps this payload directly instead of using the shmem

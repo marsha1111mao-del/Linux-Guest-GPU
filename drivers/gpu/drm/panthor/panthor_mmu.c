@@ -13,6 +13,7 @@
 #include <linux/iommu.h>
 #include <linux/atomic.h>
 #include <linux/bitfield.h>
+#include <linux/cc_platform.h>
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
 #include <linux/interrupt.h>
@@ -26,6 +27,7 @@
 #include <linux/proxy_vmshm.h>
 #include <linux/rwsem.h>
 #include <linux/sched.h>
+#include <linux/set_memory.h>
 #include <linux/shmem_fs.h>
 #include <linux/sizes.h>
 
@@ -431,6 +433,45 @@ struct panthor_vm_bind_job {
  */
 static struct kmem_cache *pt_cache;
 
+static int panthor_realm_share_pt(struct panthor_vm *vm, void *addr, size_t size)
+{
+	int ret;
+
+	if (!cc_platform_has(CC_ATTR_MEM_ENCRYPT))
+		return 0;
+
+	if (!IS_ALIGNED((unsigned long)addr, PAGE_SIZE) ||
+	    !IS_ALIGNED(size, PAGE_SIZE))
+		return -EINVAL;
+
+	ret = set_memory_decrypted((unsigned long)addr, size >> PAGE_SHIFT);
+	if (ret)
+		drm_err(&vm->ptdev->base,
+			"failed to share Realm GPU page table %px size=0x%zx ret=%d\n",
+			addr, size, ret);
+
+	return ret;
+}
+
+static bool panthor_realm_unshare_pt(struct panthor_vm *vm, void *addr,
+				     size_t size)
+{
+	int ret;
+
+	if (!cc_platform_has(CC_ATTR_MEM_ENCRYPT))
+		return true;
+
+	ret = set_memory_encrypted((unsigned long)addr, size >> PAGE_SHIFT);
+	if (ret) {
+		drm_err(&vm->ptdev->base,
+			"failed to protect Realm GPU page table %px size=0x%zx ret=%d; leaking page table\n",
+			addr, size, ret);
+		return false;
+	}
+
+	return true;
+}
+
 /**
  * alloc_pt() - Custom page table allocator
  * @cookie: Cookie passed at page table allocation time.
@@ -458,6 +499,13 @@ static void *alloc_pt(void *cookie, size_t size, gfp_t gfp)
 		p = alloc_pages_node(dev_to_node(vm->ptdev->base.dev),
 				     gfp | __GFP_ZERO, get_order(size));
 		page = p ? page_address(p) : NULL;
+		if (!page)
+			return NULL;
+
+		if (panthor_realm_share_pt(vm, page, size))
+			return NULL;
+
+		memset(page, 0, size);
 		vm->root_page_table = page;
 		return page;
 	}
@@ -479,6 +527,12 @@ static void *alloc_pt(void *cookie, size_t size, gfp_t gfp)
 
 	page = vm->op_ctx->rsvd_page_tables
 		       .pages[vm->op_ctx->rsvd_page_tables.ptr++];
+	if (panthor_realm_share_pt(vm, page, SZ_4K)) {
+		vm->op_ctx->rsvd_page_tables
+			.pages[vm->op_ctx->rsvd_page_tables.ptr - 1] = NULL;
+		return NULL;
+	}
+
 	memset(page, 0, SZ_4K);
 
 	/* Page table entries don't use virtual addresses, which trips out
@@ -504,12 +558,18 @@ static void free_pt(void *cookie, void *data, size_t size)
 	struct panthor_vm *vm = cookie;
 
 	if (unlikely(vm->root_page_table == data)) {
-		free_pages((unsigned long)data, get_order(size));
 		vm->root_page_table = NULL;
+		if (!panthor_realm_unshare_pt(vm, data, size))
+			return;
+
+		free_pages((unsigned long)data, get_order(size));
 		return;
 	}
 
 	if (drm_WARN_ON(&vm->ptdev->base, size != SZ_4K))
+		return;
+
+	if (!panthor_realm_unshare_pt(vm, data, SZ_4K))
 		return;
 
 	/* Return the page to the pt_cache. */
