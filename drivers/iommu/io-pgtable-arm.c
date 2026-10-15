@@ -16,14 +16,15 @@
 #include <linux/kernel.h>
 #include <linux/ktime.h>
 #include <linux/module.h>
-#include <linux/set_memory.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
 #include <linux/types.h>
 #include <linux/dma-mapping.h>
+#include <linux/dma-map-ops.h>
 #include <linux/arm-smccc.h>
 #include <linux/mutex.h>
 #include <asm/barrier.h>
+#include <asm/rsi_cmds.h>
 #include <linux/hashtable.h>
 #include "io-pgtable-arm.h"
 #include "iommu-pages.h"
@@ -138,6 +139,7 @@
 #define ARM_MALI_LPAE_MEMATTR_IMP_DEF 0x88ULL
 #define ARM_MALI_LPAE_MEMATTR_WRITE_ALLOC 0x8DULL
 #define PANTHOR_GPA2HPA_MAX_ENTRIES (PAGE_SIZE / sizeof(u64))
+#define PANTHOR_GPU_REVOKE_BATCH_ENTRIES 64
 
 enum panthor_gpa2hpa_cache_mode {
 	PANTHOR_GPA2HPA_CACHE_NONE,
@@ -218,6 +220,9 @@ struct panthor_passthrough_stats {
 	u64 init_pte_fill_ns;
 	u64 init_pte_sync_ns;
 	u64 init_pte_free_hpas_ns;
+	u64 gpu_revoke_calls;
+	u64 gpu_revoke_entries;
+	u64 gpu_revoke_failures;
 };
 
 struct arm_lpae_io_pgtable {
@@ -373,6 +378,23 @@ static void panthor_gpa_hpa_cache_free(struct arm_lpae_io_pgtable *data)
 	}
 }
 
+static void panthor_gpa_hpa_cache_remove(struct arm_lpae_io_pgtable *data,
+					 phys_addr_t gpa)
+{
+	struct panthor_gpa_hpa_mapping *entry;
+	struct hlist_node *tmp;
+	u64 gpa_page = gpa & PAGE_MASK;
+
+	hash_for_each_possible_safe(data->panthor_gpa_hpa_map, entry, tmp, node,
+				    gpa_page) {
+		if (entry->gpa_page == gpa_page) {
+			hash_del(&entry->node);
+			kfree(entry);
+			return;
+		}
+	}
+}
+
 static long kvm_hypercall_gpa_to_hpa_batch(u64 addr_array, u64 count)
 {
 	struct arm_smccc_res res;
@@ -383,10 +405,24 @@ static long kvm_hypercall_gpa_to_hpa_batch(u64 addr_array, u64 count)
 	return res.a0;
 }
 
+static long opencca_rmm_gpa_to_hpa_batch(u64 addr_array, u64 count)
+{
+	return rsi_opencca_gpa_to_hpa(addr_array, count);
+}
+
+static long opencca_rmm_gpu_revoke_batch(u64 addr_array, u64 count)
+{
+	return rsi_opencca_gpu_revoke(addr_array, count);
+}
+
+static bool panthor_rmm_gpa_to_hpa_enabled(void)
+{
+	return cc_platform_has(CC_ATTR_MEM_ENCRYPT);
+}
+
 static int panthor_realm_share_gpa2hpa_page(struct page *page)
 {
 	void *addr = page_address(page);
-	int ret;
 
 	if (!cc_platform_has(CC_ATTR_MEM_ENCRYPT))
 		return 0;
@@ -394,42 +430,14 @@ static int panthor_realm_share_gpa2hpa_page(struct page *page)
 	if (!addr)
 		return -EINVAL;
 
-	ret = set_memory_decrypted((unsigned long)addr, 1);
-	if (ret) {
-		pr_err("[MZH][GPA2HPA] failed to share Realm exchange page ret=%d; leaking page\n",
-		       ret);
-		return ret;
-	}
-
 	memset(addr, 0, PAGE_SIZE);
 	return 0;
 }
 
 static void panthor_realm_free_gpa2hpa_page(struct page *page)
 {
-	void *addr;
-	int ret;
-
 	if (!page)
 		return;
-
-	if (!cc_platform_has(CC_ATTR_MEM_ENCRYPT)) {
-		__free_page(page);
-		return;
-	}
-
-	addr = page_address(page);
-	if (!addr) {
-		pr_err("[MZH][GPA2HPA] cannot protect exchange page without direct map; leaking page\n");
-		return;
-	}
-
-	ret = set_memory_encrypted((unsigned long)addr, 1);
-	if (ret) {
-		pr_err("[MZH][GPA2HPA] failed to protect exchange page ret=%d; leaking page\n",
-		       ret);
-		return;
-	}
 
 	__free_page(page);
 }
@@ -439,6 +447,7 @@ static int panthor_gpa_to_hpa_batch(struct arm_lpae_io_pgtable *data,
 				    int num_entries, phys_addr_t *hpas,
 				    enum panthor_gpa2hpa_cache_mode cache_mode)
 {
+	static atomic_t realm_log_budget = ATOMIC_INIT(32);
 	u64 *array;
 	long ret;
 	bool use_cache = cache_mode != PANTHOR_GPA2HPA_CACHE_NONE;
@@ -492,25 +501,32 @@ static int panthor_gpa_to_hpa_batch(struct arm_lpae_io_pgtable *data,
 
 	data->panthor_stats.gpa2hpa_hvc_calls++;
 	data->panthor_stats.gpa2hpa_hvc_entries += miss_count;
-	flush_dcache_page(data->panthor_gpa2hpa_page);
+	arch_sync_dma_for_device(page_to_phys(data->panthor_gpa2hpa_page),
+				 miss_count * sizeof(*array), DMA_TO_DEVICE);
 	wmb();
 	panthor_pt_timing_accum(&data->panthor_stats.gpa2hpa_prep_ns,
 				phase_start);
 
 	phase_start = panthor_pt_timing_start(timing);
-	ret = kvm_hypercall_gpa_to_hpa_batch(
-		page_to_phys(data->panthor_gpa2hpa_page), miss_count);
+	if (panthor_rmm_gpa_to_hpa_enabled())
+		ret = opencca_rmm_gpa_to_hpa_batch(
+			page_to_phys(data->panthor_gpa2hpa_page), miss_count);
+	else
+		ret = kvm_hypercall_gpa_to_hpa_batch(
+			page_to_phys(data->panthor_gpa2hpa_page), miss_count);
 	rmb();
 	panthor_pt_timing_accum_max(&data->panthor_stats.gpa2hpa_hvc_ns,
 				    &data->panthor_stats.gpa2hpa_hvc_max_ns,
 				    phase_start);
 
 	if (ret) {
-		pr_err("[MZH][GPA2HPA] HVC failed ret=%ld gpa=%pa entries=%d\n",
-		       ret, &gpa, miss_count);
+		pr_err("[MZH][GPA2HPA] translation failed ret=%ld gpa=%pa entries=%d realm=%d\n",
+		       ret, &gpa, miss_count, panthor_rmm_gpa_to_hpa_enabled());
 		goto out_unlock_ret;
 	}
 
+	arch_sync_dma_for_cpu(page_to_phys(data->panthor_gpa2hpa_page),
+			      miss_count * sizeof(*array), DMA_FROM_DEVICE);
 	phase_start = panthor_pt_timing_start(timing);
 	for (i = 0; i < miss_count; i++) {
 		phys_addr_t in_gpa = hpas[i];
@@ -531,6 +547,11 @@ static int panthor_gpa_to_hpa_batch(struct arm_lpae_io_pgtable *data,
 
 		if (!use_cache)
 			hpa |= ((gpa + i * stride) & ~PAGE_MASK);
+
+		if (panthor_rmm_gpa_to_hpa_enabled() &&
+		    atomic_dec_if_positive(&realm_log_budget) >= 0)
+			pr_info("[MZH][GPA2HPA][realm] gpa=%pa hpa=%pa count=%d stride=0x%zx cache=%d\n",
+				&in_gpa, &hpa, miss_count, stride, cache_mode);
 
 		hpas[i] = hpa;
 	}
@@ -563,6 +584,64 @@ static int panthor_gpa_to_hpa(struct arm_lpae_io_pgtable *data,
 {
 	return panthor_gpa_to_hpa_batch(data, gpa, PAGE_SIZE, 1, hpa,
 					PANTHOR_GPA2HPA_CACHE_TABLE);
+}
+
+static void panthor_realm_gpu_revoke_hpas(struct arm_lpae_io_pgtable *data,
+					  const phys_addr_t *hpas,
+					  int num_entries)
+{
+	u64 *array;
+	int i;
+	long ret;
+
+	if (!panthor_rmm_gpa_to_hpa_enabled() || !data->panthor_gpa2hpa_page ||
+	    !num_entries)
+		return;
+
+	mutex_lock(&data->panthor_gpa2hpa_lock);
+	array = page_address(data->panthor_gpa2hpa_page);
+	for (i = 0; i < num_entries; i++)
+		array[i] = hpas[i] & PAGE_MASK;
+
+	data->panthor_stats.gpu_revoke_calls++;
+	data->panthor_stats.gpu_revoke_entries += num_entries;
+	arch_sync_dma_for_device(page_to_phys(data->panthor_gpa2hpa_page),
+				 num_entries * sizeof(*array), DMA_TO_DEVICE);
+	wmb();
+	ret = opencca_rmm_gpu_revoke_batch(
+		page_to_phys(data->panthor_gpa2hpa_page), num_entries);
+	if (ret) {
+		data->panthor_stats.gpu_revoke_failures++;
+		pr_err("[MZH][GPU_REVOKE] revoke failed ret=%ld entries=%d first_hpa=%pa\n",
+		       ret, num_entries, &hpas[0]);
+	}
+	mutex_unlock(&data->panthor_gpa2hpa_lock);
+}
+
+static void panthor_realm_gpu_revoke_hpa_range(struct arm_lpae_io_pgtable *data,
+					       phys_addr_t hpa, size_t size)
+{
+	phys_addr_t hpas[PANTHOR_GPU_REVOKE_BATCH_ENTRIES];
+
+	if (!panthor_rmm_gpa_to_hpa_enabled() || !hpa || !size)
+		return;
+
+	hpa &= PAGE_MASK;
+	size = max_t(size_t, PAGE_ALIGN(size), PAGE_SIZE);
+	while (size) {
+		int batch = min_t(int, size >> PAGE_SHIFT,
+				  PANTHOR_GPU_REVOKE_BATCH_ENTRIES);
+
+		if (!batch)
+			break;
+
+		for (int i = 0; i < batch; i++)
+			hpas[i] = hpa + (phys_addr_t)i * PAGE_SIZE;
+
+		panthor_realm_gpu_revoke_hpas(data, hpas, batch);
+		hpa += (phys_addr_t)batch * PAGE_SIZE;
+		size -= (size_t)batch * PAGE_SIZE;
+	}
 }
 
 static arm_lpae_iopte *
@@ -616,11 +695,39 @@ static phys_addr_t iopte_to_paddr(arm_lpae_iopte pte,
 	return (paddr | (paddr << (48 - 12))) & (ARM_LPAE_PTE_ADDR_MASK << 4);
 }
 
+static void panthor_realm_gpu_revoke_pte(struct arm_lpae_io_pgtable *data,
+					 arm_lpae_iopte pte, int lvl,
+					 const char *op)
+{
+	phys_addr_t hpa;
+	size_t size;
+
+	if (!iopte_leaf(pte, lvl, data->iop.fmt))
+		return;
+
+	hpa = iopte_to_paddr(pte, data);
+	size = ARM_LPAE_BLOCK_SIZE(lvl, data);
+	pr_debug("[MZH][GPU_REVOKE][%s] lvl=%d hpa=%pa size=%zx pte=%llx\n",
+		 op, lvl, &hpa, size, (u64)pte);
+	panthor_realm_gpu_revoke_hpa_range(data, hpa, size);
+}
+
 static bool selftest_running = false;
 
 static dma_addr_t __arm_lpae_dma_addr(void *pages)
 {
 	return (dma_addr_t)virt_to_phys(pages);
+}
+
+static bool cfg_is_panthor_realm_direct(struct io_pgtable_cfg *cfg)
+{
+	/*
+	 * Panthor is the only LPAE user in this tree that provides custom page
+	 * table alloc/free callbacks. In a Realm, those private page-table pages
+	 * must stay private and be exposed to the trusted local GPU only through
+	 * RMM-validated HPA entries, so bypass the DMA API bounce path here.
+	 */
+	return cfg->alloc && cfg->free && panthor_rmm_gpa_to_hpa_enabled();
 }
 
 static void *__arm_lpae_alloc_pages(size_t size, gfp_t gfp,
@@ -642,6 +749,12 @@ static void *__arm_lpae_alloc_pages(size_t size, gfp_t gfp,
 		return NULL;
 
 	if (!cfg->coherent_walk) {
+		if (cfg_is_panthor_realm_direct(cfg)) {
+			arch_sync_dma_for_device(virt_to_phys(pages), size,
+						 DMA_TO_DEVICE);
+			return pages;
+		}
+
 		dma = dma_map_single(dev, pages, size, DMA_TO_DEVICE);
 		if (dma_mapping_error(dev, dma))
 			goto out_free;
@@ -673,7 +786,7 @@ out_free:
 static void __arm_lpae_free_pages(void *pages, size_t size,
 				  struct io_pgtable_cfg *cfg, void *cookie)
 {
-	if (!cfg->coherent_walk)
+	if (!cfg->coherent_walk && !cfg_is_panthor_realm_direct(cfg))
 		dma_unmap_single(cfg->iommu_dev, __arm_lpae_dma_addr(pages),
 				 size, DMA_TO_DEVICE);
 
@@ -686,6 +799,13 @@ static void __arm_lpae_free_pages(void *pages, size_t size,
 static void __arm_lpae_sync_pte(arm_lpae_iopte *ptep, int num_entries,
 				struct io_pgtable_cfg *cfg)
 {
+	if (cfg_is_panthor_realm_direct(cfg)) {
+		arch_sync_dma_for_device(virt_to_phys(ptep),
+					 sizeof(*ptep) * num_entries,
+					 DMA_TO_DEVICE);
+		return;
+	}
+
 	dma_sync_single_for_device(cfg->iommu_dev, __arm_lpae_dma_addr(ptep),
 				   sizeof(*ptep) * num_entries, DMA_TO_DEVICE);
 }
@@ -744,8 +864,26 @@ static int arm_panthor_lpae_init_2m_block_or_pages(
 	data->panthor_stats.map_2m_attempts++;
 	curr = READ_ONCE(*ptep);
 	if (curr) {
-		ret = -EEXIST;
-		goto out_record_total;
+		arm_lpae_iopte *tblp;
+
+		if (iopte_leaf(curr, lvl, data->iop.fmt)) {
+			ret = -EEXIST;
+			goto out_record_total;
+		}
+
+		/*
+		 * Small mappings can leave an empty lower-level table after
+		 * unmap. As in arm_lpae_init_pte(), remove that table before
+		 * replacing the whole range with a block (or a fresh fallback
+		 * table). Its presence alone is not a live mapping conflict.
+		 * Panthor descriptors contain HPAs, so use its own walker.
+		 */
+		tblp = ptep - ARM_LPAE_LVL_IDX(iova, lvl, data);
+		if (__arm_panthor_lpae_unmap(data, NULL, iova, SZ_2M, 1,
+					    lvl, tblp) != SZ_2M) {
+			ret = -EINVAL;
+			goto out_record_total;
+		}
 	}
 
 	phase_start = panthor_pt_timing_start(timing);
@@ -854,6 +992,8 @@ static int arm_panthor_lpae_init_2m_block_or_pages(
 	}
 
 out_free_hpas:
+	if (ret)
+		panthor_realm_gpu_revoke_hpas(data, hpas, pages_per_block);
 	phase_start = panthor_pt_timing_start(timing);
 	kfree(hpas);
 	panthor_pt_timing_accum(&data->panthor_stats.map_2m_free_hpas_ns,
@@ -947,6 +1087,8 @@ static int __arm_panthor_lpae_init_pte(struct arm_lpae_io_pgtable *data,
 				phase_start);
 
 out_free_hpas:
+	if (ret)
+		panthor_realm_gpu_revoke_hpas(data, hpas, num_entries);
 	phase_start = panthor_pt_timing_start(timing);
 	kfree(hpas);
 	panthor_pt_timing_accum(&data->panthor_stats.init_pte_free_hpas_ns,
@@ -1000,8 +1142,8 @@ static int arm_panthor_lpae_init_pte(struct arm_lpae_io_pgtable *data,
 			size_t sz = ARM_LPAE_BLOCK_SIZE(lvl, data);
 
 			tblp = ptep - ARM_LPAE_LVL_IDX(iova, lvl, data);
-			if (__arm_lpae_unmap(data, NULL, iova + i * sz, sz, 1,
-					     lvl, tblp) != sz) {
+			if (__arm_panthor_lpae_unmap(data, NULL, iova + i * sz,
+						     sz, 1, lvl, tblp) != sz) {
 				WARN_ON(1);
 				return -EINVAL;
 			}
@@ -1116,12 +1258,17 @@ arm_panthor_lpae_install_table(arm_lpae_iopte *table, arm_lpae_iopte *ptep,
 	if (ret) {
 		pr_err("[MZH][TABLE] store mapping failed ret=%d gpa=%pa hpa=%pa table=%px\n",
 		       ret, &gpa, &hpa, table);
+		panthor_realm_gpu_revoke_hpa_range(data, hpa, PAGE_SIZE);
+		panthor_gpa_hpa_cache_remove(data, gpa);
 		goto out_record_total;
 	}
 	//cptep=L0[ptep]
 	panthor_old = cmpxchg64_relaxed(ptep, curr, panthor_new);
-	if (panthor_old != curr)
+	if (panthor_old != curr) {
 		remove_mapping(data, panthor_new & ARM_LPAE_PTE_ADDR_MASK);
+		panthor_realm_gpu_revoke_hpa_range(data, hpa, PAGE_SIZE);
+		panthor_gpa_hpa_cache_remove(data, gpa);
+	}
 	*oldp = panthor_old;
 	if (cfg->coherent_walk || (panthor_old & ARM_LPAE_PTE_SW_SYNC))
 		goto out_record_total;
@@ -1458,8 +1605,6 @@ static void __arm_panthor_lpae_free_pgtable(struct arm_lpae_io_pgtable *data,
 {
 	arm_lpae_iopte *start, *end;
 	unsigned long table_size;
-	phys_addr_t hpa = 0;
-	int ret;
 
 	if (lvl == data->start_level)
 		table_size = ARM_LPAE_PGD_SIZE(data);
@@ -1467,36 +1612,33 @@ static void __arm_panthor_lpae_free_pgtable(struct arm_lpae_io_pgtable *data,
 		table_size = ARM_LPAE_GRANULE(data);
 
 	start = ptep;
-	if (lvl != data->start_level) {
-		ret = panthor_gpa_to_hpa(data, __pa(start), &hpa);
-		if (ret)
-			pr_err("[MZH][PTFREE] failed to translate table %px ret=%d\n",
-			       start, ret);
-	}
 
-	/* Only leaf entries at the last level */
-	if (lvl == ARM_LPAE_MAX_LEVELS - 1)
-		end = ptep;
-	else
-		end = (void *)ptep + table_size;
+	end = (void *)ptep + table_size;
 
 	while (ptep != end) {
 		arm_lpae_iopte pte = *ptep++;
+		phys_addr_t child_hpa;
+		arm_lpae_iopte *child;
 
-		if (!pte || iopte_leaf(pte, lvl, data->iop.fmt))
+		if (!pte)
 			continue;
 
-		arm_lpae_iopte *child =
-			panthor_table_from_pte(data, pte, lvl, 0, "free");
+		if (iopte_leaf(pte, lvl, data->iop.fmt)) {
+			panthor_realm_gpu_revoke_pte(data, pte, lvl, "free-leaf");
+			continue;
+		}
+
+		child_hpa = iopte_to_paddr(pte, data);
+		child = panthor_table_from_pte(data, pte, lvl, 0, "free");
 		if (!child)
 			continue;
 
-		__arm_panthor_lpae_free_pgtable(
-			data, lvl + 1, child);
+		__arm_panthor_lpae_free_pgtable(data, lvl + 1, child);
+		remove_mapping(data, child_hpa & ARM_LPAE_PTE_ADDR_MASK);
+		panthor_realm_gpu_revoke_hpa_range(data, child_hpa, PAGE_SIZE);
+		panthor_gpa_hpa_cache_remove(data, __pa(child));
 	}
 
-	if (hpa)
-		remove_mapping(data, hpa & ARM_LPAE_PTE_ADDR_MASK);
 	__arm_lpae_free_pages(start, table_size, &data->iop.cfg,
 			      data->iop.cookie);
 }
@@ -1515,13 +1657,18 @@ static void arm_panthor_lpae_free_pgtable(struct io_pgtable *iop)
 	struct panthor_passthrough_stats *stats = &data->panthor_stats;
 	bool timing = panthor_pt_timing_active();
 
+	panthor_realm_gpu_revoke_hpa_range(data, data->iop.cfg.arm_lpae_s1_cfg.ttbr,
+					   ARM_LPAE_PGD_SIZE(data));
+	panthor_gpa_hpa_cache_remove(data, __pa(data->pgd));
 	__arm_panthor_lpae_free_pgtable(data, data->start_level, data->pgd);
 	if (timing && (stats->gpa2hpa_batch_calls || stats->map_2m_attempts))
-		pr_info("[MZH][PANTHOR_PT_STATS] gpa2hpa_batches=%llu entries=%llu hvc_calls=%llu hvc_entries=%llu cache_hits=%llu cache_misses=%llu 2m_attempts=%llu 2m_blocks=%llu 2m_fallback_tables=%llu 2m_hpa_unaligned=%llu 2m_hpa_discontig=%llu\n",
+		pr_info("[MZH][PANTHOR_PT_STATS] gpa2hpa_batches=%llu entries=%llu hvc_calls=%llu hvc_entries=%llu cache_hits=%llu cache_misses=%llu gpu_revoke_calls=%llu gpu_revoke_entries=%llu gpu_revoke_failures=%llu 2m_attempts=%llu 2m_blocks=%llu 2m_fallback_tables=%llu 2m_hpa_unaligned=%llu 2m_hpa_discontig=%llu\n",
 			stats->gpa2hpa_batch_calls, stats->gpa2hpa_entries,
 			stats->gpa2hpa_hvc_calls, stats->gpa2hpa_hvc_entries,
 			stats->gpa2hpa_cache_hits,
-			stats->gpa2hpa_cache_misses, stats->map_2m_attempts,
+			stats->gpa2hpa_cache_misses, stats->gpu_revoke_calls,
+			stats->gpu_revoke_entries, stats->gpu_revoke_failures,
+			stats->map_2m_attempts,
 			stats->map_2m_blocks, stats->map_2m_fallback_tables,
 			stats->map_2m_hpa_unaligned,
 			stats->map_2m_hpa_discontig);
@@ -1678,6 +1825,11 @@ static size_t arm_panthor_lpae_split_blk_unmap(
 		if (!tablep)
 			return 0;
 	} else if (unmap_idx_start >= 0) {
+		phys_addr_t revoke_hpa = iopte_to_paddr(blk_pte, data) +
+			(phys_addr_t)unmap_idx_start * split_sz;
+
+		panthor_realm_gpu_revoke_hpa_range(data, revoke_hpa,
+						   (size_t)num_entries * split_sz);
 		if (gather)
 			for (i = 0; i < num_entries; i++)
 				io_pgtable_tlb_add_page(&data->iop, gather,
@@ -1787,8 +1939,13 @@ static size_t __arm_panthor_lpae_unmap(struct arm_lpae_io_pgtable *data,
 			if (WARN_ON(!pte))
 				break;
 
-			if (!iopte_leaf(pte, lvl, iop->fmt)) {
+			if (iopte_leaf(pte, lvl, iop->fmt)) {
+				panthor_realm_gpu_revoke_pte(data, pte, lvl,
+							    "unmap-leaf");
+			} else {
 				arm_lpae_iopte *child;
+				phys_addr_t child_hpa = iopte_to_paddr(pte,
+								       data);
 
 				__arm_lpae_clear_pte(&ptep[i], &iop->cfg, 1);
 
@@ -1803,6 +1960,11 @@ static size_t __arm_panthor_lpae_unmap(struct arm_lpae_io_pgtable *data,
 					break;
 				__arm_panthor_lpae_free_pgtable(
 					data, lvl + 1, child);
+				remove_mapping(data,
+					       child_hpa & ARM_LPAE_PTE_ADDR_MASK);
+				panthor_realm_gpu_revoke_hpa_range(
+					data, child_hpa, PAGE_SIZE);
+				panthor_gpa_hpa_cache_remove(data, __pa(child));
 			}
 		}
 
@@ -2232,8 +2394,8 @@ out_free_data:
 static struct io_pgtable *
 arm_64_panthor_lpae_alloc_pgtable_s1(struct io_pgtable_cfg *cfg, void *cookie)
 {
-	u64 gpa_ttbr;
-	phys_addr_t ttbr_hpa;
+	u64 gpa_ttbr = 0;
+	phys_addr_t ttbr_hpa = 0;
 	int ret = 0;
 	u64 reg;
 	struct arm_lpae_io_pgtable *data;
@@ -2353,6 +2515,11 @@ arm_64_panthor_lpae_alloc_pgtable_s1(struct io_pgtable_cfg *cfg, void *cookie)
 	return &data->iop;
 
 out_free_data:
+	if (ttbr_hpa) {
+		panthor_realm_gpu_revoke_hpa_range(data, ttbr_hpa,
+						   ARM_LPAE_PGD_SIZE(data));
+		panthor_gpa_hpa_cache_remove(data, gpa_ttbr);
+	}
 	if (data->pgd)
 		__arm_lpae_free_pages(data->pgd, ARM_LPAE_PGD_SIZE(data), cfg,
 				      cookie);

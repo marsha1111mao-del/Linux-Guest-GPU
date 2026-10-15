@@ -180,6 +180,15 @@ struct panthor_device {
 		 * is suspended.
 		 */
 		struct page *dummy_latest_flush;
+
+		/**
+		 * @realm_latest_flush: Realm-safe LATEST_FLUSH shadow page.
+		 *
+		 * Realm passthrough guests keep GPU MMIO in the guest kernel
+		 * only. Userspace gets this zero-filled page instead of a direct
+		 * MMIO PFN, making Panfrost submit conservative cache flushes.
+		 */
+		struct page *realm_latest_flush;
 	} pm;
 };
 

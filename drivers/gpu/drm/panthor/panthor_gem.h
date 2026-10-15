@@ -49,14 +49,15 @@ struct panthor_gem_object {
 	u32 flags;
 
 	/**
-	 * @realm_gpu_shared: True when shmem pages were converted to
-	 * shared/decrypted memory for trusted local GPU access from a Realm.
+	 * @realm_gpu_shared: True when shmem pages are pinned for trusted local
+	 * GPU access from a Realm. The pages stay private; Panthor receives
+	 * RMM-validated HPA entries in its GPU page tables.
 	 */
 	bool realm_gpu_shared;
 
 	/**
-	 * @realm_gpu_shared_pages: Number of pages converted for
-	 * @realm_gpu_shared.
+	 * @realm_gpu_shared_pages: Legacy conversion counter. Realm passthrough
+	 * keeps it at zero because pages are no longer decrypted/shared.
 	 */
 	u32 realm_gpu_shared_pages;
 
@@ -109,6 +110,12 @@ struct panthor_gem_object *to_panthor_bo(struct drm_gem_object *obj)
 {
 	return container_of(to_drm_gem_shmem_obj(obj), struct panthor_gem_object, base);
 }
+
+bool panthor_gem_realm_gpu_enabled(void);
+int panthor_gem_sync_realm_bo_for_device(struct panthor_gem_object *bo,
+					 size_t offset, size_t len);
+int panthor_gem_sync_realm_bo_for_cpu(struct panthor_gem_object *bo,
+				      size_t offset, size_t len);
 
 struct drm_gem_object *panthor_gem_create_object(struct drm_device *ddev, size_t size);
 
@@ -179,6 +186,13 @@ struct panthor_kernel_bo *
 panthor_kernel_bo_create(struct panthor_device *ptdev, struct panthor_vm *vm,
 			 size_t size, u32 bo_flags, u32 vm_map_flags,
 			 u64 gpu_va);
+
+int panthor_kernel_bo_sync_for_device(struct panthor_device *ptdev,
+				      struct panthor_kernel_bo *bo,
+				      size_t offset, size_t len);
+int panthor_kernel_bo_sync_for_cpu(struct panthor_device *ptdev,
+				   struct panthor_kernel_bo *bo,
+				   size_t offset, size_t len);
 
 void panthor_kernel_bo_destroy(struct panthor_kernel_bo *bo);
 

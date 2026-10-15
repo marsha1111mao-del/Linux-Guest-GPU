@@ -67,7 +67,13 @@
 #define PANTHOR_VMSHM_MAX_VM_BIND_SYNCS	8
 #define PANTHOR_VMSHM_MAX_SYNCOBJ_WAIT_HANDLES	16
 #define PANTHOR_VMSHM_MAX_GROUP_QUEUES	16
-#define PANTHOR_VMSHM_MAX_GROUP_SUBMITS	4
+/* PanVK emits one sync-only queue submit per signalled CS subqueue.  With the
+ * three CS subqueues used by a compute/graphical queue, a command-buffer submit
+ * plus its signal submits can therefore contain six queue submits.  Six is
+ * also the largest count that fits in a 476-byte vmshm RPC payload together
+ * with the maximum sixteen sync operations.
+ */
+#define PANTHOR_VMSHM_MAX_GROUP_SUBMITS	6
 #define PANTHOR_VMSHM_MAX_GROUP_SUBMIT_SYNCS	16
 #define PANTHOR_VMSHM_VM_BIND_FAILED_OP_NONE	((__u32)~0U)
 /* vmshm_comm uses 512-byte message slots with a 36-byte transport header. */
@@ -489,7 +495,7 @@ int panthor_vmshm_group_submit(struct panthor_vmshm_session *session,
 			       const struct drm_panthor_sync_op *syncs,
 			       const __u32 *sync_starts,
 			       const __u32 *sync_counts,
-			       __u32 job_count);
+			       __u32 job_count, unsigned int trace_seq);
 int panthor_vmshm_tiler_heap_create(struct panthor_vmshm_session *session,
 				    struct drm_panthor_tiler_heap_create *args);
 int panthor_vmshm_tiler_heap_destroy(struct panthor_vmshm_session *session,
@@ -671,7 +677,7 @@ panthor_vmshm_group_submit(struct panthor_vmshm_session *session,
 			   const struct drm_panthor_sync_op *syncs,
 			   const __u32 *sync_starts,
 			   const __u32 *sync_counts,
-			   __u32 job_count)
+				   __u32 job_count, unsigned int trace_seq)
 {
 	return -ENODEV;
 }

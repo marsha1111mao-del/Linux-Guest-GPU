@@ -3,12 +3,14 @@
 /* Copyright 2023 Collabora ltd. */
 
 #include <linux/dma-buf.h>
+#include <linux/dma-map-ops.h>
 #include <linux/dma-mapping.h>
 #include <linux/cc_platform.h>
 #include <linux/err.h>
+#include <linux/highmem.h>
 #include <linux/mm.h>
+#include <linux/overflow.h>
 #include <linux/proxy_vmshm.h>
-#include <linux/set_memory.h>
 #include <linux/slab.h>
 
 #include <drm/panthor_drm.h>
@@ -17,15 +19,24 @@
 #include "panthor_gem.h"
 #include "panthor_mmu.h"
 
+bool panthor_gem_realm_gpu_enabled(void)
+{
+	return cc_platform_has(CC_ATTR_MEM_ENCRYPT);
+}
+
+static bool panthor_gem_realm_private_bo(struct panthor_gem_object *bo)
+{
+	return panthor_gem_realm_gpu_enabled() &&
+	       !bo->base.base.import_attach && !panthor_gem_is_vmshm_backed(bo);
+}
+
 static int panthor_gem_share_realm_gpu_pages(struct panthor_gem_object *bo)
 {
 	struct drm_gem_shmem_object *shmem = &bo->base;
 	struct drm_gem_object *obj = &shmem->base;
-	u32 page_count = PFN_UP(obj->size);
-	u32 i;
 	int ret;
 
-	if (!cc_platform_has(CC_ATTR_MEM_ENCRYPT) || panthor_gem_is_vmshm_backed(bo))
+	if (!panthor_gem_realm_gpu_enabled() || panthor_gem_is_vmshm_backed(bo))
 		return 0;
 
 	if (obj->import_attach)
@@ -34,87 +45,166 @@ static int panthor_gem_share_realm_gpu_pages(struct panthor_gem_object *bo)
 	if (bo->realm_gpu_shared)
 		return 0;
 
+	/*
+	 * A Realm passthrough BO stays private. The trusted local GPU receives
+	 * RMM-validated HPA entries in its own page tables, so the pages must not
+	 * be converted to shared/decrypted memory for the host.
+	 */
 	ret = drm_gem_shmem_pin(shmem);
 	if (ret)
 		return ret;
 	bo->realm_gpu_shared_pinned = true;
 
-	if (!shmem->pages) {
-		ret = -ENOMEM;
-		goto err_leak;
-	}
-
-	for (i = 0; i < page_count; i++) {
-		void *addr = page_address(shmem->pages[i]);
-
-		if (!addr) {
-			ret = -EINVAL;
-			goto err_leak;
-		}
-
-		ret = set_memory_decrypted((unsigned long)addr, 1);
-		if (ret)
-			goto err_leak;
-
-		bo->realm_gpu_shared_pages++;
-		memset(addr, 0, PAGE_SIZE);
-	}
-
 	bo->realm_gpu_shared = true;
 	return 0;
-
-err_leak:
-	drm_err(obj->dev,
-		"failed to share Realm GPU BO pages ret=%d; leaking backing pages\n",
-		ret);
-	shmem->pages = NULL;
-	shmem->pages_use_count = 0;
-	bo->realm_gpu_shared = false;
-	bo->realm_gpu_shared_pages = 0;
-	bo->realm_gpu_shared_pinned = false;
-	return ret;
-}
-
-static void panthor_gem_leak_realm_gpu_pages(struct panthor_gem_object *bo)
-{
-	struct drm_gem_shmem_object *shmem = &bo->base;
-
-	shmem->pages = NULL;
-	shmem->pages_use_count = 0;
-	bo->realm_gpu_shared = false;
-	bo->realm_gpu_shared_pages = 0;
-	bo->realm_gpu_shared_pinned = false;
 }
 
 static void panthor_gem_unshare_realm_gpu_pages(struct panthor_gem_object *bo)
 {
 	struct drm_gem_shmem_object *shmem = &bo->base;
-	struct drm_gem_object *obj = &shmem->base;
 
 	if (!bo->realm_gpu_shared && !bo->realm_gpu_shared_pinned)
 		return;
 
-	while (bo->realm_gpu_shared_pages) {
-		u32 idx = bo->realm_gpu_shared_pages - 1;
-		void *addr = page_address(shmem->pages[idx]);
-
-		if (!addr || set_memory_encrypted((unsigned long)addr, 1)) {
-			drm_err(obj->dev,
-				"failed to protect Realm GPU BO page %u; leaking BO\n",
-				idx);
-			panthor_gem_leak_realm_gpu_pages(bo);
-			return;
-		}
-
-		bo->realm_gpu_shared_pages--;
-	}
-
 	bo->realm_gpu_shared = false;
+	bo->realm_gpu_shared_pages = 0;
 
 	if (bo->realm_gpu_shared_pinned) {
 		bo->realm_gpu_shared_pinned = false;
 		drm_gem_shmem_unpin(shmem);
 	}
+}
+
+static int
+panthor_gem_sync_realm_private_bo(struct panthor_gem_object *bo,
+				  size_t offset, size_t len,
+				  enum dma_data_direction dir)
+{
+	struct drm_gem_shmem_object *shmem = &bo->base;
+	size_t end;
+
+	if (!panthor_gem_realm_private_bo(bo))
+		return 0;
+
+	if (!len)
+		return 0;
+
+	if (check_add_overflow(offset, len, &end) || end > bo->base.base.size)
+		return -EINVAL;
+
+	if (!shmem->pages)
+		return -EINVAL;
+
+	while (offset < end) {
+		pgoff_t page_idx = offset >> PAGE_SHIFT;
+		size_t page_off = offset & (PAGE_SIZE - 1);
+		size_t chunk = min_t(size_t, PAGE_SIZE - page_off, end - offset);
+		struct page *page = shmem->pages[page_idx];
+		phys_addr_t phys;
+
+		if (!page)
+			return -EINVAL;
+
+		phys = page_to_phys(page) + page_off;
+		if (dir == DMA_FROM_DEVICE)
+			arch_sync_dma_for_cpu(phys, chunk, dir);
+		else
+			arch_sync_dma_for_device(phys, chunk, dir);
+
+		offset += chunk;
+	}
+
+	return 0;
+}
+
+int panthor_gem_sync_realm_bo_for_device(struct panthor_gem_object *bo,
+					 size_t offset, size_t len)
+{
+	if (!panthor_gem_realm_private_bo(bo))
+		return 0;
+
+	dma_wmb();
+	return panthor_gem_sync_realm_private_bo(bo, offset, len,
+						 DMA_TO_DEVICE);
+}
+
+int panthor_gem_sync_realm_bo_for_cpu(struct panthor_gem_object *bo,
+				      size_t offset, size_t len)
+{
+	int ret;
+
+	if (!panthor_gem_realm_private_bo(bo))
+		return 0;
+
+	ret = panthor_gem_sync_realm_private_bo(bo, offset, len,
+						DMA_FROM_DEVICE);
+	if (ret)
+		return ret;
+
+	dma_rmb();
+	return 0;
+}
+
+int panthor_kernel_bo_sync_for_device(struct panthor_device *ptdev,
+				      struct panthor_kernel_bo *kbo,
+				      size_t offset, size_t len)
+{
+	struct panthor_gem_object *bo;
+	size_t end;
+	int ret;
+
+	if (IS_ERR_OR_NULL(kbo) || !len)
+		return 0;
+
+	if (check_add_overflow(offset, len, &end) ||
+	    end > panthor_kernel_bo_size(kbo))
+		return -EINVAL;
+
+	bo = to_panthor_bo(kbo->obj);
+	if (!panthor_gem_realm_private_bo(bo))
+		return 0;
+
+	if (kbo->kmap)
+		flush_kernel_vmap_range((char *)kbo->kmap + offset, len);
+	dma_wmb();
+
+	ret = panthor_gem_sync_realm_private_bo(bo, offset, len,
+						DMA_TO_DEVICE);
+	if (ret)
+		return ret;
+
+	return 0;
+}
+
+int panthor_kernel_bo_sync_for_cpu(struct panthor_device *ptdev,
+				   struct panthor_kernel_bo *kbo,
+				   size_t offset, size_t len)
+{
+	struct panthor_gem_object *bo;
+	size_t end;
+	int ret;
+
+	if (IS_ERR_OR_NULL(kbo) || !len)
+		return 0;
+
+	if (check_add_overflow(offset, len, &end) ||
+	    end > panthor_kernel_bo_size(kbo))
+		return -EINVAL;
+
+	bo = to_panthor_bo(kbo->obj);
+	if (!panthor_gem_realm_private_bo(bo))
+		return 0;
+
+	ret = panthor_gem_sync_realm_private_bo(bo, offset, len,
+						DMA_FROM_DEVICE);
+	if (ret)
+		return ret;
+
+	dma_rmb();
+	if (kbo->kmap)
+		invalidate_kernel_vmap_range((char *)kbo->kmap + offset, len);
+
+	return 0;
 }
 
 static void panthor_gem_free_object(struct drm_gem_object *obj)
@@ -227,6 +317,20 @@ struct panthor_kernel_bo *panthor_kernel_bo_create(struct panthor_device *ptdev,
 	if (ret)
 		goto err_free_va;
 
+	if (panthor_gem_realm_private_bo(bo)) {
+		phys_addr_t first_gpa = 0;
+		phys_addr_t first_hpa = panthor_vm_iova_to_phys(vm,
+								kbo->va_node.start);
+
+		if (obj->pages && obj->pages[0])
+			first_gpa = page_to_phys(obj->pages[0]);
+
+		drm_err(&ptdev->base,
+			"[MZH][PANTHOR_KBO_MAP] gpuva=%#llx size=%zu bo_flags=%#x map_flags=%#x first_gpa=%pa first_iova_hpa=%pa\n",
+			(unsigned long long)kbo->va_node.start, size,
+			bo_flags, vm_map_flags, &first_gpa, &first_hpa);
+	}
+
 	kbo->vm = panthor_vm_get(vm);
 	bo->exclusive_vm_root_gem = panthor_vm_root_gem(vm);
 	drm_gem_object_get(bo->exclusive_vm_root_gem);
@@ -299,7 +403,10 @@ struct drm_gem_object *panthor_gem_create_object(struct drm_device *ddev,
 		return ERR_PTR(-ENOMEM);
 
 	obj->base.base.funcs = &panthor_gem_funcs;
-	obj->base.map_wc = !ptdev->coherent;
+	obj->base.map_wc = !ptdev->coherent && !panthor_gem_realm_gpu_enabled();
+	if (panthor_gem_realm_gpu_enabled())
+		drm_info_once(ddev,
+			      "Realm trusted-GPU: Panthor GEM CPU mappings use cached attributes");
 	mutex_init(&obj->gpuva_list_lock);
 	drm_gem_gpuva_set_lock(&obj->base.base, &obj->gpuva_list_lock);
 

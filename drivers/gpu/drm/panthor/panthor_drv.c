@@ -7,6 +7,7 @@
 #include <linux/atomic.h>
 #include <linux/kstrtox.h>
 #include <linux/ktime.h>
+#include <linux/hex.h>
 #include <linux/math64.h>
 #include <linux/module.h>
 #include <linux/of_platform.h>
@@ -539,6 +540,8 @@ struct panthor_vmshm_session {
 };
 
 #define PANTHOR_BO_FLAGS DRM_PANTHOR_BO_NO_MMAP
+#define PANTHOR_VMSHM_STREAM_TRACE_LIMIT	512
+#define PANTHOR_VMSHM_STREAM_TRACE_MAX_BYTES	SZ_64K
 
 static void panthor_vmshm_release_gem_handles(struct panthor_vmshm_session *session)
 {
@@ -2208,13 +2211,19 @@ int panthor_vmshm_group_get_state(struct panthor_vmshm_session *session,
 }
 EXPORT_SYMBOL_GPL(panthor_vmshm_group_get_state);
 
+static u32 panthor_vmshm_stream_hash(const void *data, size_t len);
+static void
+panthor_vmshm_trace_submit_stream(struct panthor_vm *vm,
+				  const struct drm_panthor_queue_submit *job,
+				  unsigned int trace_seq, u32 job_index);
+
 int panthor_vmshm_group_submit(struct panthor_vmshm_session *session,
 			       __u32 group_handle,
 			       const struct drm_panthor_queue_submit *jobs,
 			       const struct drm_panthor_sync_op *syncs,
 			       const __u32 *sync_starts,
 			       const __u32 *sync_counts,
-			       __u32 job_count)
+			       __u32 job_count, unsigned int trace_seq)
 {
 	struct panthor_file *pfile;
 	struct panthor_submit_ctx ctx;
@@ -2279,11 +2288,19 @@ int panthor_vmshm_group_submit(struct panthor_vmshm_session *session,
 	if (job_count > 0) {
 		struct panthor_vm *vm = panthor_job_vm(ctx.jobs[0].job);
 
+		for (i = 0; i < job_count; i++)
+			panthor_vmshm_trace_submit_stream(vm, &jobs[i],
+							  trace_seq, i);
+
 		drm_exec_until_all_locked(&ctx.exec)
 		{
 			ret = panthor_vm_prepare_mapped_bos_resvs(&ctx.exec, vm,
 								  job_count);
 		}
+		if (ret)
+			goto out_cleanup_submit_ctx;
+
+		ret = panthor_vm_sync_mapped_bos(vm, DMA_TO_DEVICE);
 		if (ret)
 			goto out_cleanup_submit_ctx;
 	}
@@ -2302,6 +2319,98 @@ out_dev_exit:
 	return ret;
 }
 EXPORT_SYMBOL_GPL(panthor_vmshm_group_submit);
+
+static u32 panthor_vmshm_stream_hash(const void *data, size_t len)
+{
+	const u8 *p = data;
+	u32 hash = 0x811c9dc5;
+
+	while (len--) {
+		hash ^= *p++;
+		hash *= 0x01000193;
+	}
+
+	return hash;
+}
+
+static void
+panthor_vmshm_trace_submit_stream(struct panthor_vm *vm,
+				  const struct drm_panthor_queue_submit *job,
+				  unsigned int trace_seq, u32 job_index)
+{
+	struct panthor_gem_object *bo;
+	char first32[3 * 32 + 1] = { 0 };
+	size_t payload_size, scanned_len, prefix_len;
+	u64 bo_offset = 0;
+	void *kva;
+	u32 hash;
+
+	if (!trace_seq || trace_seq > PANTHOR_VMSHM_STREAM_TRACE_LIMIT)
+		return;
+
+	bo = panthor_vm_get_bo_for_va(vm, job->stream_addr, &bo_offset);
+	if (IS_ERR(bo)) {
+		pr_info("panthor-vmshm: STREAM_TRACE seq=%u job=%u queue=%u stream=0x%llx size=%u stage=lookup result=error ret=%ld\n",
+			trace_seq, job_index, job->queue_index,
+			(unsigned long long)job->stream_addr,
+			job->stream_size, PTR_ERR(bo));
+		return;
+	}
+
+	if (!bo->vmshm_payload) {
+		pr_info("panthor-vmshm: STREAM_TRACE seq=%u job=%u queue=%u stream=0x%llx size=%llu stage=backing result=non-vmshm bo_offset=0x%llx payload_size=%llu\n",
+			trace_seq, job_index, job->queue_index,
+			(unsigned long long)job->stream_addr,
+			(unsigned long long)job->stream_size,
+			(unsigned long long)bo_offset,
+			(unsigned long long)bo->base.base.size);
+		goto out_put_bo;
+	}
+
+	payload_size = proxy_vmshm_obj_size(bo->vmshm_payload);
+	if (bo_offset >= payload_size ||
+	    job->stream_size > payload_size - bo_offset) {
+		pr_info("panthor-vmshm: STREAM_TRACE seq=%u job=%u queue=%u stream=0x%llx size=%u stage=range result=error payload=0x%llx bo_offset=0x%llx payload_size=%llu\n",
+			trace_seq, job_index, job->queue_index,
+			(unsigned long long)job->stream_addr,
+			job->stream_size,
+			(unsigned long long)proxy_vmshm_obj_handle(bo->vmshm_payload),
+			(unsigned long long)bo_offset,
+			(unsigned long long)payload_size);
+		goto out_put_bo;
+	}
+
+	kva = proxy_vmshm_obj_kva(bo->vmshm_payload);
+	if (!kva) {
+		pr_info("panthor-vmshm: STREAM_TRACE seq=%u job=%u queue=%u stream=0x%llx size=%u stage=kva result=null payload=0x%llx bo_offset=0x%llx payload_size=%llu\n",
+			trace_seq, job_index, job->queue_index,
+			(unsigned long long)job->stream_addr,
+			job->stream_size,
+			(unsigned long long)proxy_vmshm_obj_handle(bo->vmshm_payload),
+			(unsigned long long)bo_offset,
+			(unsigned long long)payload_size);
+		goto out_put_bo;
+	}
+
+	scanned_len = min_t(size_t, job->stream_size,
+			    PANTHOR_VMSHM_STREAM_TRACE_MAX_BYTES);
+	hash = panthor_vmshm_stream_hash(kva + bo_offset, scanned_len);
+	prefix_len = min_t(size_t, scanned_len, 32);
+	hex_dump_to_buffer(kva + bo_offset, prefix_len, 32, 1,
+			   first32, sizeof(first32), false);
+
+	pr_info("panthor-vmshm: STREAM_TRACE seq=%u job=%u queue=%u stream=0x%llx size=%u scanned=%llu payload=0x%llx generation=%u bo_offset=0x%llx payload_size=%llu hash=0x%08x first32=%s\n",
+		trace_seq, job_index, job->queue_index,
+		(unsigned long long)job->stream_addr, job->stream_size,
+		(unsigned long long)scanned_len,
+		(unsigned long long)proxy_vmshm_obj_handle(bo->vmshm_payload),
+		proxy_vmshm_obj_generation(bo->vmshm_payload),
+		(unsigned long long)bo_offset,
+		(unsigned long long)payload_size, hash, first32);
+
+out_put_bo:
+	drm_gem_object_put(&bo->base.base);
+}
 
 int panthor_vmshm_tiler_heap_create(struct panthor_vmshm_session *session,
 				    struct drm_panthor_tiler_heap_create *args)
@@ -2583,6 +2692,10 @@ static int panthor_ioctl_group_submit(struct drm_device *ddev, void *data,
 		panthor_submit_stats_accum(&stats.prepare_resvs_ns,
 					   stats_phase_start);
 
+		if (ret)
+			goto out_cleanup_submit_ctx;
+
+		ret = panthor_vm_sync_mapped_bos(vm, DMA_TO_DEVICE);
 		if (ret)
 			goto out_cleanup_submit_ctx;
 	}

@@ -473,6 +473,8 @@ int panthor_fw_glb_wait_acks(struct panthor_device *ptdev, u32 req_mask, u32 *ac
 			     u32 timeout_ms);
 
 void panthor_fw_ring_csg_doorbells(struct panthor_device *ptdev, u32 csg_slot);
+void panthor_fw_sync_shared_for_cpu(struct panthor_device *ptdev,
+				    const char *where);
 
 struct panthor_kernel_bo *
 panthor_fw_alloc_queue_iface_mem(struct panthor_device *ptdev,

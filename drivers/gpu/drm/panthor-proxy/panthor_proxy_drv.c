@@ -38,6 +38,9 @@
 #define PANTHOR_PROXY_MAX_HEAPS_PER_SESSION	512
 #define PANTHOR_PROXY_RPC_STATS_MAX	32
 #define PANTHOR_PROXY_SUBMIT_SCHED_MAX_DEPTH	256
+#define PANTHOR_PROXY_SUBMIT_TRACE_LIMIT	512
+#define PANTHOR_PROXY_VM_BIND_TRACE_LIMIT	2048
+#define PANTHOR_PROXY_BO_CREATE_SLOW_NS		100000000ULL
 #define PANTHOR_PROXY_SYNC_OP_FLAGS_MASK \
 	(DRM_PANTHOR_SYNC_OP_HANDLE_TYPE_MASK | DRM_PANTHOR_SYNC_OP_SIGNAL)
 
@@ -129,6 +132,7 @@ struct panthor_proxy_submit_req {
 	struct panthor_proxy_session *session;
 	struct panthor_vmshm_group_submit_req req;
 	struct panthor_vmshm_group_submit_rsp rsp;
+	unsigned int trace_seq;
 	wait_queue_head_t wait;
 	bool done;
 	int ret;
@@ -145,6 +149,8 @@ static DEFINE_MUTEX(panthor_proxy_sessions_lock);
 static LIST_HEAD(panthor_proxy_sessions);
 static atomic64_t panthor_proxy_next_session_id = ATOMIC64_INIT(0);
 static atomic_t panthor_proxy_active_sessions = ATOMIC_INIT(0);
+static atomic_t panthor_proxy_submit_trace_seq = ATOMIC_INIT(0);
+static atomic_t panthor_proxy_vm_bind_trace_seq = ATOMIC_INIT(0);
 static DEFINE_SPINLOCK(panthor_proxy_rpc_stats_lock);
 static struct panthor_proxy_submit_scheduler panthor_proxy_submit_sched;
 static bool panthor_proxy_rpc_stats_enabled;
@@ -161,7 +167,8 @@ static int
 panthor_proxy_session_group_submit(
 	struct panthor_proxy_session *session,
 	const struct panthor_vmshm_group_submit_req *req,
-	struct panthor_vmshm_group_submit_rsp *rsp);
+	struct panthor_vmshm_group_submit_rsp *rsp,
+	unsigned int trace_seq);
 static void
 panthor_proxy_submit_sched_fail_session(struct panthor_proxy_session *session,
 					int ret);
@@ -695,7 +702,8 @@ static void panthor_proxy_submit_sched_work(struct work_struct *work)
 			return;
 
 		submit->ret = panthor_proxy_session_group_submit(
-			submit->session, &submit->req, &submit->rsp);
+			submit->session, &submit->req, &submit->rsp,
+			submit->trace_seq);
 
 		panthor_proxy_session_put(submit->session);
 		WRITE_ONCE(submit->done, true);
@@ -706,11 +714,13 @@ static void panthor_proxy_submit_sched_work(struct work_struct *work)
 static int
 panthor_proxy_submit_sched_run(struct panthor_proxy_session *session,
 			       const struct panthor_vmshm_group_submit_req *req,
-			       struct panthor_vmshm_group_submit_rsp *rsp)
+				       struct panthor_vmshm_group_submit_rsp *rsp,
+				       unsigned int trace_seq)
 {
 	struct panthor_proxy_submit_req submit = {
 		.session = session,
 		.req = *req,
+		.trace_seq = trace_seq,
 	};
 	int queued;
 
@@ -1642,10 +1652,71 @@ panthor_proxy_check_vm_bind_sync_op(
 						 sync_op->timeline_value);
 }
 
+static const char *
+panthor_proxy_vm_bind_op_type_name(u32 flags)
+{
+	switch (flags & DRM_PANTHOR_VM_BIND_OP_TYPE_MASK) {
+	case DRM_PANTHOR_VM_BIND_OP_TYPE_MAP:
+		return "map";
+	case DRM_PANTHOR_VM_BIND_OP_TYPE_UNMAP:
+		return "unmap";
+	case DRM_PANTHOR_VM_BIND_OP_TYPE_SYNC_ONLY:
+		return "sync-only";
+	default:
+		return "invalid";
+	}
+}
+
+static void
+panthor_proxy_trace_vm_bind(const struct panthor_proxy_session *session,
+			    const struct panthor_vmshm_vm_bind_req *req,
+			    const struct drm_panthor_vm_bind_op *ops,
+			    struct panthor_proxy_syncobj * const *syncobjs,
+			    u32 proxy_vm_id, int ret, u32 failed_op,
+			    unsigned int trace_seq)
+{
+	unsigned int op_count, sync_count, i;
+
+	if (trace_seq > PANTHOR_PROXY_VM_BIND_TRACE_LIMIT)
+		return;
+
+	op_count = min(req->op_count, (u32)PANTHOR_VMSHM_MAX_VM_BIND_OPS);
+	sync_count = min(req->sync_count, (u32)PANTHOR_VMSHM_MAX_VM_BIND_SYNCS);
+
+	pr_info("panthor-proxy: VM_BIND_TRACE seq=%u stage=translated session=%llu client_vm=%u proxy_vm=%u async=%u req_flags=0x%x ops=%u syncs=%u ret=%d failed_op=%u\n",
+		trace_seq, session->session_id, req->client_vm_id,
+		proxy_vm_id,
+		!!(req->flags & DRM_PANTHOR_VM_BIND_ASYNC), req->flags,
+		req->op_count, req->sync_count, ret, failed_op);
+
+	for (i = 0; i < op_count; i++) {
+		const struct panthor_vmshm_vm_bind_op *in = &req->ops[i];
+
+		pr_info("panthor-proxy: VM_BIND_TRACE seq=%u stage=op op=%u type=%s flags=0x%x client_bo=%u proxy_bo=%u bo_offset=0x%llx va=0x%llx size=0x%llx sync=%u/%u\n",
+			trace_seq, i,
+			panthor_proxy_vm_bind_op_type_name(in->flags),
+			in->flags, in->client_bo_handle, ops[i].bo_handle,
+			(unsigned long long)in->bo_offset,
+			(unsigned long long)in->va,
+			(unsigned long long)in->size,
+			in->sync_start, in->sync_count);
+	}
+
+	for (i = 0; i < sync_count; i++) {
+		const struct panthor_vmshm_vm_bind_sync *in = &req->syncs[i];
+
+		pr_info("panthor-proxy: VM_BIND_TRACE seq=%u stage=sync sync=%u flags=0x%x client_syncobj=%u proxy_syncobj=%u timeline=%llu\n",
+			trace_seq, i, in->flags, in->client_syncobj_handle,
+			syncobjs[i] ? syncobjs[i]->proxy_syncobj_handle : 0,
+			(unsigned long long)in->timeline_value);
+	}
+}
+
 static int
 panthor_proxy_session_vm_bind(struct panthor_proxy_session *session,
 			      const struct panthor_vmshm_vm_bind_req *req,
-			      struct panthor_vmshm_vm_bind_rsp *rsp)
+			      struct panthor_vmshm_vm_bind_rsp *rsp,
+			      unsigned int trace_seq)
 {
 	struct drm_panthor_vm_bind_op ops[PANTHOR_VMSHM_MAX_VM_BIND_OPS] = { 0 };
 	struct drm_panthor_sync_op syncs[PANTHOR_VMSHM_MAX_VM_BIND_SYNCS] = { 0 };
@@ -1757,6 +1828,9 @@ panthor_proxy_session_vm_bind(struct panthor_proxy_session *session,
 out_unlock:
 	mutex_unlock(&session->lock);
 
+	panthor_proxy_trace_vm_bind(session, req, ops, syncobjs, proxy_vm_id,
+				    ret, failed_op, trace_seq);
+
 	for (i = 0; i < req->sync_count; i++)
 		panthor_proxy_syncobj_put(session, syncobjs[i]);
 
@@ -1770,7 +1844,8 @@ static int
 panthor_proxy_session_group_submit(
 	struct panthor_proxy_session *session,
 	const struct panthor_vmshm_group_submit_req *req,
-	struct panthor_vmshm_group_submit_rsp *rsp)
+	struct panthor_vmshm_group_submit_rsp *rsp,
+	unsigned int trace_seq)
 {
 	struct drm_panthor_queue_submit jobs[PANTHOR_VMSHM_MAX_GROUP_SUBMITS] = { 0 };
 	struct drm_panthor_sync_op syncs[PANTHOR_VMSHM_MAX_GROUP_SUBMIT_SYNCS] = { 0 };
@@ -1838,7 +1913,7 @@ panthor_proxy_session_group_submit(
 					 proxy_group_handle, jobs,
 					 req->sync_count ? syncs : NULL,
 					 sync_starts, sync_counts,
-					 req->job_count);
+					 req->job_count, trace_seq);
 
 out_unlock:
 	mutex_unlock(&session->lock);
@@ -2073,7 +2148,10 @@ panthor_proxy_handle_vm_bind(struct proxy_comm_vmshm_channel *channel,
 		.failed_op = PANTHOR_VMSHM_VM_BIND_FAILED_OP_NONE,
 	};
 	struct panthor_proxy_session *session;
+	unsigned int trace_seq;
 	int ret;
+
+	trace_seq = atomic_inc_return(&panthor_proxy_vm_bind_trace_seq);
 
 	session = panthor_proxy_session_lookup(req->session_id, proxy_comm_vmshm_channel_client_vmid(channel));
 	if (!session) {
@@ -2081,14 +2159,15 @@ panthor_proxy_handle_vm_bind(struct proxy_comm_vmshm_channel *channel,
 		goto out_send;
 	}
 
-	ret = panthor_proxy_session_vm_bind(session, req, &rsp);
+	ret = panthor_proxy_session_vm_bind(session, req, &rsp, trace_seq);
 	panthor_proxy_session_put(session);
 	if (ret)
 		rsp.ret = ret;
 
-	pr_info_ratelimited("panthor-proxy: VM_BIND session=%llu client_vm=%u proxy_vm=%u ops=%u ret=%d failed_op=%u\n",
+	pr_info_ratelimited("panthor-proxy: VM_BIND session=%llu client_vm=%u proxy_vm=%u async=%u flags=0x%x ops=%u ret=%d failed_op=%u\n",
 			    req->session_id, req->client_vm_id, rsp.proxy_vm_id,
-			    req->op_count, rsp.ret, rsp.failed_op);
+			    !!(req->flags & DRM_PANTHOR_VM_BIND_ASYNC),
+			    req->flags, req->op_count, rsp.ret, rsp.failed_op);
 
 out_send:
 	ret = panthor_proxy_send_rsp(channel, rx->seq,
@@ -2146,8 +2225,10 @@ panthor_proxy_handle_bo_create(struct proxy_comm_vmshm_channel *channel,
 	const struct panthor_vmshm_bo_create_req *req = payload;
 	struct panthor_vmshm_bo_create_rsp rsp = { 0 };
 	struct panthor_proxy_session *session;
+	u64 start_ns;
 	int ret;
 
+	start_ns = ktime_get_ns();
 	session = panthor_proxy_session_lookup(req->session_id, proxy_comm_vmshm_channel_client_vmid(channel));
 	if (!session) {
 		rsp.ret = -ENOENT;
@@ -2158,19 +2239,32 @@ panthor_proxy_handle_bo_create(struct proxy_comm_vmshm_channel *channel,
 	panthor_proxy_session_put(session);
 	if (ret)
 		rsp.ret = ret;
+	else if (ktime_get_ns() - start_ns > PANTHOR_PROXY_BO_CREATE_SLOW_NS)
+		pr_warn_ratelimited("panthor-proxy: BO_CREATE slow seq=%llu session=%llu client_bo=%u proxy_bo=%u size=0x%llx payload=0x%llx payload_size=0x%llx duration_ns=%llu\n",
+				    rx->seq, req->session_id,
+				    rsp.client_bo_handle, rsp.proxy_bo_handle,
+				    rsp.size, rsp.payload_handle,
+				    rsp.payload_size,
+				    ktime_get_ns() - start_ns);
 	else
-		pr_info_ratelimited("panthor-proxy: BO_CREATE session=%llu client_bo=%u proxy_bo=%u size=0x%llx payload=0x%llx payload_size=0x%llx\n",
-				    req->session_id, rsp.client_bo_handle,
-				    rsp.proxy_bo_handle, rsp.size,
-				    rsp.payload_handle, rsp.payload_size);
+		pr_info_ratelimited("panthor-proxy: BO_CREATE seq=%llu session=%llu client_bo=%u proxy_bo=%u size=0x%llx payload=0x%llx payload_size=0x%llx\n",
+				    rx->seq, req->session_id,
+				    rsp.client_bo_handle, rsp.proxy_bo_handle,
+				    rsp.size, rsp.payload_handle,
+				    rsp.payload_size);
 
 out_send:
+	if (rsp.ret)
+		pr_warn("panthor-proxy: BO_CREATE failed seq=%llu session=%llu size=0x%llx ret=%d\n",
+				    rx->seq, req->session_id, req->size,
+				    rsp.ret);
+
 	ret = panthor_proxy_send_rsp(channel, rx->seq,
 				     PANTHOR_VMSHM_MSG_BO_CREATE_RSP,
 				     rsp.ret, &rsp, sizeof(rsp));
 	if (ret)
-		pr_warn_ratelimited("panthor-proxy: BO_CREATE response send failed (%d)\n",
-				    ret);
+		pr_warn("panthor-proxy: BO_CREATE response send failed seq=%llu ret=%d\n",
+				    rx->seq, ret);
 }
 
 static void
@@ -2612,7 +2706,38 @@ panthor_proxy_handle_group_submit(struct proxy_comm_vmshm_channel *channel,
 	const struct panthor_vmshm_group_submit_req *req = payload;
 	struct panthor_vmshm_group_submit_rsp rsp = { 0 };
 	struct panthor_proxy_session *session;
+	unsigned int trace_seq;
 	int ret;
+
+	trace_seq = atomic_inc_return(&panthor_proxy_submit_trace_seq);
+	if (trace_seq <= PANTHOR_PROXY_SUBMIT_TRACE_LIMIT)
+		pr_info("panthor-proxy: GROUP_SUBMIT_TRACE seq=%u stage=request session=%llu client_group=%u jobs=%u syncs=%u j0=%u:%u:0x%llx:0x%x:%u/%u j1=%u:%u:0x%llx:0x%x:%u/%u j2=%u:%u:0x%llx:0x%x:%u/%u j3=%u:%u:0x%llx:0x%x:%u/%u j4=%u:%u:0x%llx:0x%x:%u/%u j5=%u:%u:0x%llx:0x%x:%u/%u\n",
+			trace_seq, req->session_id, req->client_group_handle,
+			req->job_count, req->sync_count,
+			req->jobs[0].queue_index, req->jobs[0].stream_size,
+			(unsigned long long)req->jobs[0].stream_addr,
+			req->jobs[0].latest_flush,
+			req->jobs[0].sync_start, req->jobs[0].sync_count,
+			req->jobs[1].queue_index, req->jobs[1].stream_size,
+			(unsigned long long)req->jobs[1].stream_addr,
+			req->jobs[1].latest_flush,
+			req->jobs[1].sync_start, req->jobs[1].sync_count,
+			req->jobs[2].queue_index, req->jobs[2].stream_size,
+			(unsigned long long)req->jobs[2].stream_addr,
+			req->jobs[2].latest_flush,
+			req->jobs[2].sync_start, req->jobs[2].sync_count,
+			req->jobs[3].queue_index, req->jobs[3].stream_size,
+			(unsigned long long)req->jobs[3].stream_addr,
+			req->jobs[3].latest_flush,
+			req->jobs[3].sync_start, req->jobs[3].sync_count,
+			req->jobs[4].queue_index, req->jobs[4].stream_size,
+			(unsigned long long)req->jobs[4].stream_addr,
+			req->jobs[4].latest_flush,
+			req->jobs[4].sync_start, req->jobs[4].sync_count,
+			req->jobs[5].queue_index, req->jobs[5].stream_size,
+			(unsigned long long)req->jobs[5].stream_addr,
+			req->jobs[5].latest_flush,
+			req->jobs[5].sync_start, req->jobs[5].sync_count);
 
 	session = panthor_proxy_session_lookup(req->session_id, proxy_comm_vmshm_channel_client_vmid(channel));
 	if (!session) {
@@ -2620,8 +2745,13 @@ panthor_proxy_handle_group_submit(struct proxy_comm_vmshm_channel *channel,
 		goto out_send;
 	}
 
-	rsp.ret = panthor_proxy_submit_sched_run(session, req, &rsp);
+	rsp.ret = panthor_proxy_submit_sched_run(session, req, &rsp, trace_seq);
 	panthor_proxy_session_put(session);
+	if (trace_seq <= PANTHOR_PROXY_SUBMIT_TRACE_LIMIT)
+		pr_info("panthor-proxy: GROUP_SUBMIT_TRACE seq=%u stage=response session=%llu client_group=%u proxy_group=%u jobs=%u syncs=%u ret=%d\n",
+			trace_seq, req->session_id, req->client_group_handle,
+			rsp.proxy_group_handle, rsp.job_count, rsp.sync_count,
+			rsp.ret);
 	pr_info_ratelimited("panthor-proxy: GROUP_SUBMIT session=%llu client_group=%u proxy_group=%u jobs=%u syncs=%u first_stream=0x%llx first_size=%u first_latest_flush=0x%x ret=%d\n",
 			    req->session_id, req->client_group_handle,
 			    rsp.proxy_group_handle, rsp.job_count, rsp.sync_count,

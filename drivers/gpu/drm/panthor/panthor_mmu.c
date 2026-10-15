@@ -27,7 +27,6 @@
 #include <linux/proxy_vmshm.h>
 #include <linux/rwsem.h>
 #include <linux/sched.h>
-#include <linux/set_memory.h>
 #include <linux/shmem_fs.h>
 #include <linux/sizes.h>
 
@@ -435,8 +434,6 @@ static struct kmem_cache *pt_cache;
 
 static int panthor_realm_share_pt(struct panthor_vm *vm, void *addr, size_t size)
 {
-	int ret;
-
 	if (!cc_platform_has(CC_ATTR_MEM_ENCRYPT))
 		return 0;
 
@@ -444,30 +441,14 @@ static int panthor_realm_share_pt(struct panthor_vm *vm, void *addr, size_t size
 	    !IS_ALIGNED(size, PAGE_SIZE))
 		return -EINVAL;
 
-	ret = set_memory_decrypted((unsigned long)addr, size >> PAGE_SHIFT);
-	if (ret)
-		drm_err(&vm->ptdev->base,
-			"failed to share Realm GPU page table %px size=0x%zx ret=%d\n",
-			addr, size, ret);
-
-	return ret;
+	return 0;
 }
 
 static bool panthor_realm_unshare_pt(struct panthor_vm *vm, void *addr,
 				     size_t size)
 {
-	int ret;
-
 	if (!cc_platform_has(CC_ATTR_MEM_ENCRYPT))
 		return true;
-
-	ret = set_memory_encrypted((unsigned long)addr, size >> PAGE_SHIFT);
-	if (ret) {
-		drm_err(&vm->ptdev->base,
-			"failed to protect Realm GPU page table %px size=0x%zx ret=%d; leaking page table\n",
-			addr, size, ret);
-		return false;
-	}
 
 	return true;
 }
@@ -1205,6 +1186,67 @@ panthor_vm_map_vmshm_spans(struct panthor_vm *vm, u64 iova, int prot,
 	return panthor_vm_flush_range(vm, start_iova, size);
 }
 
+static int panthor_vm_map_shmem_pages(struct panthor_vm *vm,
+				      struct panthor_gem_object *bo,
+				      u64 iova, int prot, u64 offset, u64 size)
+{
+	struct drm_gem_shmem_object *shmem = &bo->base;
+	u64 start_iova = iova, expected_iova = iova;
+	u64 end;
+	int ret;
+
+	if (!size)
+		return 0;
+
+	if (!shmem->pages || !IS_ALIGNED(offset | size, PAGE_SIZE))
+		return -EINVAL;
+	if (size > U64_MAX - offset)
+		return -EOVERFLOW;
+
+	end = offset + size;
+	while (offset < end) {
+		unsigned long page_idx = offset >> PAGE_SHIFT;
+		unsigned long max_page_idx = end >> PAGE_SHIFT;
+		phys_addr_t paddr, next;
+		size_t len = PAGE_SIZE;
+
+		if (page_idx >= PFN_UP(bo->base.base.size) ||
+		    !shmem->pages[page_idx]) {
+			ret = -EINVAL;
+			goto err_unmap;
+		}
+
+		paddr = page_to_phys(shmem->pages[page_idx]);
+		next = paddr + PAGE_SIZE;
+
+		while (++page_idx < max_page_idx) {
+			if (!shmem->pages[page_idx] ||
+			    page_to_phys(shmem->pages[page_idx]) != next)
+				break;
+
+			len += PAGE_SIZE;
+			next += PAGE_SIZE;
+		}
+
+		ret = panthor_vm_map_paddr_range(vm, start_iova, &expected_iova,
+						 paddr, prot, len);
+		if (ret)
+			goto err_unmap;
+
+		offset += len;
+	}
+
+	return panthor_vm_flush_range(vm, start_iova, expected_iova - start_iova);
+
+err_unmap:
+	if (expected_iova != start_iova)
+		drm_WARN_ON(&vm->ptdev->base,
+			    panthor_vm_unmap_pages(vm, start_iova,
+						   expected_iova - start_iova));
+
+	return ret;
+}
+
 static int flags_to_prot(u32 flags)
 {
 	int prot = 0;
@@ -1278,6 +1320,20 @@ void panthor_vm_free_va(struct panthor_vm *vm, struct drm_mm_node *va_node)
 	mutex_lock(&vm->mm_lock);
 	drm_mm_remove_node(va_node);
 	mutex_unlock(&vm->mm_lock);
+}
+
+phys_addr_t panthor_vm_iova_to_phys(struct panthor_vm *vm, u64 va)
+{
+	struct io_pgtable_ops *ops;
+
+	if (!vm)
+		return 0;
+
+	ops = vm->pgtbl_ops;
+	if (!ops || !ops->iova_to_phys)
+		return 0;
+
+	return ops->iova_to_phys(ops, va);
 }
 
 static void panthor_vm_bo_put(struct drm_gpuvm_bo *vm_bo)
@@ -1412,6 +1468,7 @@ static int panthor_vm_prepare_map_op_ctx(struct panthor_vm_op_ctx *op_ctx,
 	struct drm_gpuvm_bo *preallocated_vm_bo;
 	struct sg_table *sgt = NULL;
 	bool vmshm_backed;
+	bool realm_native_shmem;
 	u64 pt_count;
 	int ret;
 	unsigned int max_spans = 0;
@@ -1440,6 +1497,8 @@ static int panthor_vm_prepare_map_op_ctx(struct panthor_vm_op_ctx *op_ctx,
 	op_ctx->va.addr = va;
 	op_ctx->map.bo_offset = offset;
 	vmshm_backed = panthor_gem_is_vmshm_backed(bo);
+	realm_native_shmem = cc_platform_has(CC_ATTR_MEM_ENCRYPT) &&
+			     !vmshm_backed && !bo->base.base.import_attach;
 
 	ret = panthor_vm_op_ctx_prealloc_vmas(op_ctx);
 	if (ret)
@@ -1475,7 +1534,7 @@ static int panthor_vm_prepare_map_op_ctx(struct panthor_vm_op_ctx *op_ctx,
 			goto err_cleanup;
 	}
 
-	if (!vmshm_backed) {
+	if (!vmshm_backed && !realm_native_shmem) {
 		sgt = drm_gem_shmem_get_pages_sgt(&bo->base);
 		if (IS_ERR(sgt)) {
 			if (!bo->base.base.import_attach)
@@ -2284,6 +2343,12 @@ static int panthor_gpuva_sm_step_map(struct drm_gpuva_op *op, void *priv)
 						 op_ctx->map.vmshm_span_count,
 						 op->map.gem.offset,
 						 op->map.va.range);
+	else if (cc_platform_has(CC_ATTR_MEM_ENCRYPT) &&
+		 !bo->base.base.import_attach)
+		ret = panthor_vm_map_shmem_pages(vm, bo, op->map.va.addr,
+						 flags_to_prot(vma->flags),
+						 op->map.gem.offset,
+						 op->map.va.range);
 	else
 		ret = panthor_vm_map_pages(vm, op->map.va.addr,
 					   flags_to_prot(vma->flags),
@@ -2920,6 +2985,46 @@ int panthor_vm_prepare_mapped_bos_resvs(struct drm_exec *exec,
 		return ret;
 
 	return drm_gpuvm_prepare_objects(&vm->base, exec, slot_count);
+}
+
+int panthor_vm_sync_mapped_bos(struct panthor_vm *vm,
+			       enum dma_data_direction dir)
+{
+	struct drm_gpuva *gpuva;
+	int ret = 0;
+
+	if (!cc_platform_has(CC_ATTR_MEM_ENCRYPT))
+		return 0;
+
+	drm_gpuvm_resv_assert_held(&vm->base);
+
+	drm_gpuvm_for_each_va(gpuva, &vm->base) {
+		struct panthor_gem_object *bo;
+		u64 bo_offset, range;
+
+		if (!gpuva->gem.obj || !gpuva->va.range)
+			continue;
+
+		bo = to_panthor_bo(gpuva->gem.obj);
+		bo_offset = gpuva->gem.offset;
+		range = gpuva->va.range;
+
+		if (dir == DMA_FROM_DEVICE)
+			ret = panthor_gem_sync_realm_bo_for_cpu(bo, bo_offset,
+								range);
+		else
+			ret = panthor_gem_sync_realm_bo_for_device(bo,
+								   bo_offset,
+								   range);
+		if (ret) {
+			drm_warn(&vm->ptdev->base,
+				 "Realm mapped BO sync failed dir=%d va=0x%llx size=0x%llx ret=%d\n",
+				 dir, gpuva->va.addr, gpuva->va.range, ret);
+			return ret;
+		}
+	}
+
+	return 0;
 }
 
 /**

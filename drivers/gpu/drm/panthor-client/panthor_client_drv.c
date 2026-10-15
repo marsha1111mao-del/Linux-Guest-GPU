@@ -7,8 +7,12 @@
  */
 
 #include <linux/bits.h>
+#include <linux/delay.h>
 #include <linux/dma-mapping.h>
+#include <linux/dma-fence.h>
 #include <linux/client_vmshm.h>
+#include <linux/fdtable.h>
+#include <linux/file.h>
 #include <linux/fs.h>
 #include <linux/ktime.h>
 #include <linux/limits.h>
@@ -20,8 +24,10 @@
 #include <linux/proxy_vmshm.h>
 #include <linux/refcount.h>
 #include <linux/slab.h>
+#include <linux/sync_file.h>
 #include <linux/uaccess.h>
 #include <linux/vmshm_comm.h>
+#include <linux/workqueue.h>
 #include <linux/panthor_vmshm.h>
 #include <linux/xarray.h>
 
@@ -45,11 +51,13 @@
 #define PANTHOR_CLIENT_BO_MMAP_OFFSET_BASE	(1ULL << 32)
 #define PANTHOR_CLIENT_SYNC_OP_FLAGS_MASK \
 	(DRM_PANTHOR_SYNC_OP_HANDLE_TYPE_MASK | DRM_PANTHOR_SYNC_OP_SIGNAL)
+#define PANTHOR_CLIENT_SYNC_FILE_WAIT_NSEC	(60ULL * NSEC_PER_SEC)
 
 struct panthor_client_device {
 	struct drm_device drm;
 	struct platform_device *platform;
 	struct page *flush_id_page;
+	struct workqueue_struct *sync_file_wq;
 };
 
 struct panthor_client_bo {
@@ -102,6 +110,16 @@ struct panthor_client_file {
 	struct xarray groups;
 	struct xarray heaps;
 	u64 next_mmap_offset;
+};
+
+struct panthor_client_sync_fence {
+	struct dma_fence base;
+	struct work_struct work;
+	spinlock_t lock;
+	u64 session_id;
+	u32 client_syncobj_handle;
+	struct file *session_file;
+	struct mutex snapshot_lock;
 };
 
 struct panthor_client_syncobj_wait_legacy {
@@ -1033,7 +1051,7 @@ static int panthor_client_syncobj_wait(struct panthor_client_file *pcfile,
 {
 	struct panthor_client_syncobj *syncobjs[PANTHOR_VMSHM_MAX_SYNCOBJ_WAIT_HANDLES] = { 0 };
 	struct panthor_vmshm_syncobj_wait_req req = { 0 };
-	struct panthor_vmshm_syncobj_wait_rsp rsp;
+	struct panthor_vmshm_syncobj_wait_rsp rsp = { 0 };
 	u32 handles[PANTHOR_VMSHM_MAX_SYNCOBJ_WAIT_HANDLES];
 	void __user *user_handles;
 	u32 possible_flags;
@@ -1106,6 +1124,351 @@ out_put_syncobjs:
 	for (i = 0; i < args->count_handles; i++)
 		panthor_client_syncobj_put(syncobjs[i]);
 
+	return ret;
+}
+
+static const char *
+panthor_client_sync_fence_driver_name(struct dma_fence *fence)
+{
+	return "panthor-client";
+}
+
+static const char *
+panthor_client_sync_fence_timeline_name(struct dma_fence *fence)
+{
+	return "proxy-syncobj";
+}
+
+static void
+panthor_client_sync_fence_release(struct dma_fence *fence)
+{
+	struct panthor_client_sync_fence *sync_fence =
+		container_of(fence, struct panthor_client_sync_fence, base);
+
+	mutex_destroy(&sync_fence->snapshot_lock);
+	dma_fence_free(&sync_fence->base);
+}
+
+static const struct dma_fence_ops panthor_client_sync_fence_ops = {
+	.get_driver_name = panthor_client_sync_fence_driver_name,
+	.get_timeline_name = panthor_client_sync_fence_timeline_name,
+	.release = panthor_client_sync_fence_release,
+};
+
+static void panthor_client_sync_fence_work(struct work_struct *work)
+{
+	struct panthor_client_sync_fence *sync_fence =
+		container_of(work, struct panthor_client_sync_fence, work);
+	struct panthor_vmshm_syncobj_wait_req req = {
+		.session_id = sync_fence->session_id,
+		.count_handles = 1,
+		.flags = DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL,
+		.timeout_rel_nsec = PANTHOR_CLIENT_SYNC_FILE_WAIT_NSEC,
+	};
+	struct panthor_vmshm_syncobj_wait_rsp rsp = { 0 };
+	u64 start_ns = ktime_get_ns();
+	u64 elapsed_ns;
+	unsigned int segments = 0;
+	int wait_ret = 0;
+	int ret;
+
+	req.handles[0] = sync_fence->client_syncobj_handle;
+
+	for (;;) {
+		/*
+		 * All client RPCs share one transport mutex, and the proxy
+		 * dispatches them serially. A blocking wait here prevents the
+		 * importing/submitting thread from publishing work which may
+		 * be needed to complete this fence. Poll the immutable snapshot
+		 * and sleep outside the RPC instead.
+		 */
+		req.timeout_rel_nsec = 0;
+		segments++;
+		ret = panthor_client_rpc_syncobj_wait(&req, &rsp);
+		if (!ret && !rsp.ret)
+			break;
+
+		/*
+		 * An unsignaled snapshot returns -ETIME. Transport timeouts
+		 * retain the existing bounded retry policy.
+		 */
+		if (ret == -ETIMEDOUT || ret == -ETIME ||
+		    (!ret && (rsp.ret == -ETIMEDOUT || rsp.ret == -ETIME))) {
+			elapsed_ns = ktime_get_ns() - start_ns;
+			if (elapsed_ns < PANTHOR_CLIENT_SYNC_FILE_WAIT_NSEC) {
+				usleep_range(1000, 2000);
+				continue;
+			}
+		}
+
+		wait_ret = ret ? ret : rsp.ret;
+		dma_fence_set_error(&sync_fence->base, wait_ret);
+		break;
+	}
+
+	if (wait_ret)
+		pr_warn_ratelimited("panthor-client: sync-file proxy wait failed session=%llu client_sync=%u ret=%d rsp_ret=%d segments=%u\n",
+				    sync_fence->session_id,
+				    sync_fence->client_syncobj_handle, ret,
+				    rsp.ret, segments);
+	else
+		pr_info_ratelimited("panthor-client: SYNC_FILE_WAIT_DONE session=%llu client_sync=%u segments=%u elapsed_ms=%llu\n",
+				    sync_fence->session_id,
+				    sync_fence->client_syncobj_handle,
+				    segments,
+				    (ktime_get_ns() - start_ns) / NSEC_PER_MSEC);
+	mutex_lock(&sync_fence->snapshot_lock);
+	dma_fence_signal(&sync_fence->base);
+	/*
+	 * This handle is a private snapshot, not the user's mutable syncobj.
+	 * Keep the DRM file/session alive until the wait and destroy complete.
+	 */
+	ret = panthor_client_syncobj_destroy_rpc_session(
+		sync_fence->session_id, sync_fence->client_syncobj_handle, NULL);
+	if (ret)
+		pr_warn("panthor-client: sync-file snapshot destroy failed session=%llu snapshot_sync=%u ret=%d\n",
+			sync_fence->session_id,
+			sync_fence->client_syncobj_handle, ret);
+	sync_fence->client_syncobj_handle = 0;
+	mutex_unlock(&sync_fence->snapshot_lock);
+	fput(sync_fence->session_file);
+	dma_fence_put(&sync_fence->base);
+}
+
+static int
+panthor_client_syncobj_snapshot(u64 session_id, u32 source_handle,
+				u32 *snapshot_handle)
+{
+	struct panthor_vmshm_syncobj_create_req create = {
+		.session_id = session_id,
+	};
+	struct panthor_vmshm_syncobj_create_rsp created;
+	struct panthor_vmshm_syncobj_transfer_req transfer = {
+		.session_id = session_id,
+		.src_handle = source_handle,
+	};
+	struct panthor_vmshm_syncobj_transfer_rsp transferred;
+	int ret;
+
+	ret = panthor_client_rpc_syncobj_create(&create, &created);
+	if (ret)
+		return ret;
+	if (created.ret)
+		return created.ret;
+	if (!created.client_syncobj_handle || !created.proxy_syncobj_handle)
+		return -EPROTO;
+
+	/*
+	 * Binary transfer takes a reference to the fence present at transfer
+	 * time. The private destination cannot be reset/replaced by userspace,
+	 * so the worker waits for this fence even after the source is reused.
+	 */
+	transfer.dst_handle = created.client_syncobj_handle;
+	ret = panthor_client_rpc_syncobj_transfer(&transfer, &transferred);
+	if (!ret)
+		ret = transferred.ret;
+	if (ret) {
+		panthor_client_syncobj_destroy_rpc_session(
+			session_id, created.client_syncobj_handle, NULL);
+		return ret;
+	}
+
+	*snapshot_handle = created.client_syncobj_handle;
+	return 0;
+}
+
+static int
+panthor_client_syncobj_export_sync_file(struct panthor_client_file *pcfile,
+					struct drm_syncobj_handle *args,
+					struct file *filp)
+{
+	struct panthor_client_sync_fence *sync_fence;
+	struct panthor_client_syncobj *syncobj;
+	struct sync_file *sync_file;
+	u32 snapshot_handle;
+	int fd;
+	int ret;
+
+	if (!pcfile || !args || args->pad ||
+	    args->flags != DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE)
+		return -EINVAL;
+	if (!panthor_client || !panthor_client->sync_file_wq)
+		return -ENODEV;
+
+	mutex_lock(&pcfile->lock);
+	syncobj = xa_load(&pcfile->syncobjs, args->handle);
+	if (!syncobj || !panthor_client_syncobj_get(syncobj)) {
+		mutex_unlock(&pcfile->lock);
+		return -ENOENT;
+	}
+	mutex_unlock(&pcfile->lock);
+
+	fd = get_unused_fd_flags(O_CLOEXEC);
+	if (fd < 0) {
+		ret = fd;
+		goto out_put_syncobj;
+	}
+
+	sync_fence = kzalloc(sizeof(*sync_fence), GFP_KERNEL);
+	if (!sync_fence) {
+		ret = -ENOMEM;
+		goto out_put_fd;
+	}
+
+	ret = panthor_client_syncobj_snapshot(pcfile->session_id,
+					     syncobj->client_handle,
+					     &snapshot_handle);
+	if (ret) {
+		kfree(sync_fence);
+		goto out_put_fd;
+	}
+
+	sync_fence->session_id = pcfile->session_id;
+	sync_fence->client_syncobj_handle = snapshot_handle;
+	sync_fence->session_file = get_file(filp);
+	mutex_init(&sync_fence->snapshot_lock);
+	spin_lock_init(&sync_fence->lock);
+	INIT_WORK(&sync_fence->work, panthor_client_sync_fence_work);
+	dma_fence_init(&sync_fence->base, &panthor_client_sync_fence_ops,
+		       &sync_fence->lock, dma_fence_context_alloc(1), 1);
+
+	/* The work item and the sync_file each own a fence reference. */
+	dma_fence_get(&sync_fence->base);
+	if (!queue_work(panthor_client->sync_file_wq, &sync_fence->work)) {
+		ret = -EWOULDBLOCK;
+		dma_fence_put(&sync_fence->base);
+		panthor_client_syncobj_destroy_rpc_session(
+			pcfile->session_id, snapshot_handle, NULL);
+		fput(sync_fence->session_file);
+		goto out_put_export_ref;
+	}
+
+	sync_file = sync_file_create(&sync_fence->base);
+	if (!sync_file) {
+		ret = -ENOMEM;
+		goto out_put_export_ref;
+	}
+
+	args->fd = fd;
+	fd_install(fd, sync_file->file);
+	pr_info_ratelimited("panthor-client: SYNCOBJ_EXPORT_SYNC_FILE session=%llu client_sync=%u proxy_sync=%u snapshot_sync=%u fd=%d\n",
+			    pcfile->session_id, syncobj->client_handle,
+			    syncobj->proxy_handle, snapshot_handle, fd);
+	ret = 0;
+	goto out_put_export_ref;
+
+out_put_fd:
+	put_unused_fd(fd);
+	goto out_put_syncobj;
+out_put_export_ref:
+	dma_fence_put(&sync_fence->base);
+	if (ret)
+		put_unused_fd(fd);
+out_put_syncobj:
+	panthor_client_syncobj_put(syncobj);
+	return ret;
+}
+
+static int
+panthor_client_syncobj_signal_proxy(u64 session_id,
+				    struct panthor_client_syncobj *syncobj)
+{
+	struct panthor_vmshm_syncobj_array_req req = {
+		.session_id = session_id,
+		.count_handles = 1,
+	};
+	struct panthor_vmshm_syncobj_array_rsp rsp;
+	int ret;
+
+	req.handles[0] = syncobj->client_handle;
+	ret = panthor_client_rpc_syncobj_array(
+		PANTHOR_VMSHM_MSG_SYNCOBJ_SIGNAL_REQ,
+		PANTHOR_VMSHM_MSG_SYNCOBJ_SIGNAL_RSP, &req, &rsp);
+	if (!ret && rsp.ret)
+		ret = rsp.ret;
+
+	return ret;
+}
+
+/* Import installs the captured proxy fence before returning to userspace. */
+static int
+panthor_client_syncobj_import_sync_file(struct panthor_client_file *pcfile,
+					struct drm_syncobj_handle *args)
+{
+	struct panthor_client_sync_fence *sync_fence;
+	struct panthor_client_syncobj *syncobj;
+	struct panthor_vmshm_syncobj_transfer_req req = { 0 };
+	struct panthor_vmshm_syncobj_transfer_rsp rsp;
+	struct dma_fence *fence;
+	int status;
+	int ret;
+
+	if (!pcfile || !args || args->pad ||
+	    args->flags != DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE)
+		return -EINVAL;
+
+	mutex_lock(&pcfile->lock);
+	syncobj = xa_load(&pcfile->syncobjs, args->handle);
+	if (!syncobj || !panthor_client_syncobj_get(syncobj)) {
+		mutex_unlock(&pcfile->lock);
+		return -ENOENT;
+	}
+	mutex_unlock(&pcfile->lock);
+
+	fence = sync_file_get_fence(args->fd);
+	if (!fence) {
+		ret = -EINVAL;
+		goto out_put_syncobj;
+	}
+	if (fence->ops != &panthor_client_sync_fence_ops) {
+		ret = -EOPNOTSUPP;
+		goto out_put_fence;
+	}
+
+	sync_fence = container_of(fence, struct panthor_client_sync_fence,
+				  base);
+	if (sync_fence->session_id != pcfile->session_id) {
+		ret = -EOPNOTSUPP;
+		goto out_put_fence;
+	}
+
+	/*
+	 * Serialize against snapshot destruction. A pending fence must replace
+	 * the destination now, not signal it from a worker later: that would
+	 * leave an old signaled fence visible to subsequent GPU submissions,
+	 * or overwrite a newer fence after userspace resets/reuses the target.
+	 */
+	mutex_lock(&sync_fence->snapshot_lock);
+	status = dma_fence_get_status(fence);
+	if (status < 0) {
+		ret = status;
+	} else if (status == 1) {
+		ret = panthor_client_syncobj_signal_proxy(pcfile->session_id,
+							 syncobj);
+	} else if (!sync_fence->client_syncobj_handle) {
+		ret = -EPROTO;
+	} else {
+		req.session_id = pcfile->session_id;
+		req.src_handle = sync_fence->client_syncobj_handle;
+		req.dst_handle = syncobj->client_handle;
+		ret = panthor_client_rpc_syncobj_transfer(&req, &rsp);
+		if (!ret)
+			ret = rsp.ret;
+	}
+	mutex_unlock(&sync_fence->snapshot_lock);
+
+	if (ret)
+		pr_warn("panthor-client: SYNCOBJ_IMPORT_SYNC_FILE failed session=%llu client_sync=%u status=%d ret=%d\n",
+			pcfile->session_id, syncobj->client_handle, status, ret);
+	else
+		pr_info_ratelimited("panthor-client: SYNCOBJ_IMPORT_SYNC_FILE session=%llu client_sync=%u status=%d\n",
+				    pcfile->session_id, syncobj->client_handle,
+				    status);
+
+out_put_fence:
+	dma_fence_put(fence);
+out_put_syncobj:
+	panthor_client_syncobj_put(syncobj);
 	return ret;
 }
 
@@ -1785,13 +2148,38 @@ panthor_client_group_submit(struct panthor_client_file *pcfile,
 	u32 i;
 	int ret;
 
-	if (!pcfile || !args || args->pad || !args->group_handle)
-		return -EINVAL;
+	if (!pcfile || !args || args->pad || !args->group_handle) {
+		ret = -EINVAL;
+		pr_info_ratelimited(
+			"panthor-client: GROUP_SUBMIT_DIAG stage=args ret=%d session=%llu group=%u pad=%u jobs=%u job_stride=%u job_array=0x%llx\n",
+			ret, pcfile ? pcfile->session_id : 0,
+			args ? args->group_handle : 0,
+			args ? args->pad : 0,
+			args ? args->queue_submits.count : 0,
+			args ? args->queue_submits.stride : 0,
+			args ? (unsigned long long)args->queue_submits.array : 0);
+		return ret;
+	}
+
+	pr_info_ratelimited(
+		"panthor-client: GROUP_SUBMIT_DIAG stage=enter session=%llu group=%u jobs=%u job_stride=%u job_array=0x%llx\n",
+		pcfile->session_id, args->group_handle,
+		args->queue_submits.count, args->queue_submits.stride,
+		(unsigned long long)args->queue_submits.array);
 
 	ret = panthor_client_copy_group_submit(args, jobs, syncs, sync_starts,
 					       sync_counts, &sync_count);
-	if (ret)
+	if (ret) {
+		pr_info_ratelimited(
+			"panthor-client: GROUP_SUBMIT_DIAG stage=copy ret=%d session=%llu group=%u jobs=%u syncs_copied=%u first_queue=%u first_size=%u first_addr=0x%llx first_sync_flags=0x%x first_sync_handle=%u first_sync_value=%llu\n",
+			ret, pcfile->session_id, args->group_handle,
+			args->queue_submits.count, sync_count,
+			jobs[0].queue_index, jobs[0].stream_size,
+			(unsigned long long)jobs[0].stream_addr,
+			syncs[0].flags, syncs[0].handle,
+			(unsigned long long)syncs[0].timeline_value);
 		return ret;
+	}
 
 	req.session_id = pcfile->session_id;
 	req.job_count = args->queue_submits.count;
@@ -1810,11 +2198,19 @@ panthor_client_group_submit(struct panthor_client_file *pcfile,
 	group = xa_load(&pcfile->groups, args->group_handle);
 	if (!group) {
 		ret = -ENOENT;
+		pr_info_ratelimited(
+			"panthor-client: GROUP_SUBMIT_DIAG stage=group_lookup ret=%d session=%llu group=%u jobs=%u syncs=%u\n",
+			ret, pcfile->session_id, args->group_handle,
+			req.job_count, req.sync_count);
 		goto out_unlock;
 	}
 	if (!panthor_client_group_get(group)) {
 		group = NULL;
 		ret = -ENOENT;
+		pr_info_ratelimited(
+			"panthor-client: GROUP_SUBMIT_DIAG stage=group_ref ret=%d session=%llu group=%u jobs=%u syncs=%u\n",
+			ret, pcfile->session_id, args->group_handle,
+			req.job_count, req.sync_count);
 		goto out_unlock;
 	}
 	req.client_group_handle = group->client_handle;
@@ -1825,6 +2221,13 @@ panthor_client_group_submit(struct panthor_client_file *pcfile,
 
 		if (!syncobj || !panthor_client_syncobj_get(syncobj)) {
 			ret = -ENOENT;
+			pr_info_ratelimited(
+				"panthor-client: GROUP_SUBMIT_DIAG stage=sync_lookup ret=%d session=%llu group=%u index=%u flags=0x%x handle=%u timeline_value=%llu client_sync=%u jobs=%u\n",
+				ret, pcfile->session_id, args->group_handle,
+				i, syncs[i].flags, syncs[i].handle,
+				(unsigned long long)syncs[i].timeline_value,
+				syncobj ? syncobj->client_handle : 0,
+				req.job_count);
 			goto out_unlock;
 		}
 
@@ -1836,15 +2239,40 @@ panthor_client_group_submit(struct panthor_client_file *pcfile,
 	mutex_unlock(&pcfile->lock);
 
 	ret = panthor_client_rpc_group_submit(&req, &rsp);
-	if (ret)
+	if (ret) {
+		pr_info_ratelimited(
+			"panthor-client: GROUP_SUBMIT_DIAG stage=rpc ret=%d session=%llu group=%u jobs=%u syncs=%u first_queue=%u first_size=%u first_addr=0x%llx first_sync_flags=0x%x first_client_sync=%u first_sync_value=%llu\n",
+			ret, pcfile->session_id, args->group_handle,
+			req.job_count, req.sync_count,
+			req.jobs[0].queue_index, req.jobs[0].stream_size,
+			(unsigned long long)req.jobs[0].stream_addr,
+			req.sync_count ? req.syncs[0].flags : 0,
+			req.sync_count ? req.syncs[0].client_syncobj_handle : 0,
+			req.sync_count ?
+				(unsigned long long)req.syncs[0].timeline_value : 0);
 		goto out_put_refs;
+	}
 	if (rsp.ret) {
 		ret = rsp.ret;
+		pr_info_ratelimited(
+			"panthor-client: GROUP_SUBMIT_DIAG stage=proxy_rsp ret=%d session=%llu group=%u jobs=%u syncs=%u rsp_group=%u rsp_jobs=%u rsp_syncs=%u first_sync_flags=0x%x first_client_sync=%u first_sync_value=%llu\n",
+			ret, pcfile->session_id, args->group_handle,
+			req.job_count, req.sync_count,
+			rsp.proxy_group_handle, rsp.job_count, rsp.sync_count,
+			req.sync_count ? req.syncs[0].flags : 0,
+			req.sync_count ? req.syncs[0].client_syncobj_handle : 0,
+			req.sync_count ?
+				(unsigned long long)req.syncs[0].timeline_value : 0);
 		goto out_put_refs;
 	}
 	if (rsp.job_count != req.job_count || rsp.sync_count != req.sync_count ||
 	    !rsp.proxy_group_handle) {
 		ret = -EPROTO;
+		pr_info_ratelimited(
+			"panthor-client: GROUP_SUBMIT_DIAG stage=rsp_mismatch ret=%d session=%llu group=%u req_jobs=%u rsp_jobs=%u req_syncs=%u rsp_syncs=%u rsp_group=%u\n",
+			ret, pcfile->session_id, args->group_handle,
+			req.job_count, rsp.job_count, req.sync_count,
+			rsp.sync_count, rsp.proxy_group_handle);
 		goto out_put_refs;
 	}
 
@@ -2146,7 +2574,7 @@ static int panthor_client_bo_create(struct panthor_client_file *pcfile,
 				    struct drm_panthor_bo_create *args)
 {
 	struct panthor_vmshm_bo_create_req req = { 0 };
-	struct panthor_vmshm_bo_create_rsp rsp;
+	struct panthor_vmshm_bo_create_rsp rsp = { 0 };
 	struct client_vmshm_lookup_params lookup = {
 		.lookup = VMSHM_MANAGER_LOOKUP_HANDLE,
 		.required_perms = PROXY_VMSHM_PERM_MMAP |
@@ -2154,14 +2582,16 @@ static int panthor_client_bo_create(struct panthor_client_file *pcfile,
 				  PROXY_VMSHM_PERM_CPU_WRITE,
 	};
 	struct panthor_client_bo *bo;
+	const char *stage = "args_validation";
 	int ret;
 
 	if (!pcfile)
 		return -EINVAL;
-	if (!args->size || args->pad)
-		return -EINVAL;
-	if (args->flags & ~DRM_PANTHOR_BO_NO_MMAP)
-		return -EINVAL;
+	if (!args->size || args->pad ||
+	    (args->flags & ~DRM_PANTHOR_BO_NO_MMAP)) {
+		ret = -EINVAL;
+		goto out_error;
+	}
 
 	req.session_id = pcfile->session_id;
 	req.size = args->size;
@@ -2169,18 +2599,27 @@ static int panthor_client_bo_create(struct panthor_client_file *pcfile,
 	req.client_exclusive_vm_id = args->exclusive_vm_id;
 
 	ret = panthor_client_rpc_bo_create(&req, &rsp);
+	stage = "rpc_call";
 	if (ret)
-		return ret;
-	if (rsp.ret)
-		return rsp.ret;
+		goto out_error;
+	stage = "rsp_ret";
+	if (rsp.ret) {
+		ret = rsp.ret;
+		goto out_error;
+	}
 	if (!rsp.client_bo_handle || !rsp.proxy_bo_handle || !rsp.size ||
-	    !rsp.payload_handle || !rsp.payload_size)
-		return -EPROTO;
+	    !rsp.payload_handle || !rsp.payload_size) {
+		stage = "rsp_validation";
+		ret = -EPROTO;
+		goto out_error;
+	}
 
 	bo = kzalloc(sizeof(*bo), GFP_KERNEL);
 	if (!bo) {
 		panthor_client_bo_destroy_rpc(pcfile, rsp.client_bo_handle, NULL);
-		return -ENOMEM;
+		stage = "kzalloc";
+		ret = -ENOMEM;
+		goto out_error;
 	}
 
 	lookup.handle = rsp.payload_handle;
@@ -2188,13 +2627,16 @@ static int panthor_client_bo_create(struct panthor_client_file *pcfile,
 	if (!lookup.requester_vmid) {
 		kfree(bo);
 		panthor_client_bo_destroy_rpc(pcfile, rsp.client_bo_handle, NULL);
-		return -EPROTO;
+		stage = "requester_vmid";
+		ret = -EPROTO;
+		goto out_error;
 	}
 	ret = client_vmshm_manager_get(&lookup, &bo->payload_obj);
 	if (ret) {
 		kfree(bo);
 		panthor_client_bo_destroy_rpc(pcfile, rsp.client_bo_handle, NULL);
-		return ret;
+		stage = "manager_get";
+		goto out_error;
 	}
 
 	bo->session_id = pcfile->session_id;
@@ -2214,7 +2656,9 @@ static int panthor_client_bo_create(struct panthor_client_file *pcfile,
 		client_vmshm_manager_put(bo->payload_obj);
 		kfree(bo);
 		panthor_client_bo_destroy_rpc(pcfile, rsp.client_bo_handle, NULL);
-		return -EPROTO;
+		stage = "descriptor_validation";
+		ret = -EPROTO;
+		goto out_error;
 	}
 
 	mutex_lock(&pcfile->lock);
@@ -2224,7 +2668,8 @@ static int panthor_client_bo_create(struct panthor_client_file *pcfile,
 		client_vmshm_manager_put(bo->payload_obj);
 		kfree(bo);
 		panthor_client_bo_destroy_rpc(pcfile, rsp.client_bo_handle, NULL);
-		return ret;
+		stage = "xa_insert";
+		goto out_error;
 	}
 
 	args->size = rsp.size;
@@ -2235,12 +2680,20 @@ static int panthor_client_bo_create(struct panthor_client_file *pcfile,
 			    rsp.proxy_bo_handle, rsp.size, rsp.payload_handle,
 			    rsp.payload_size);
 	return 0;
+
+out_error:
+	pr_warn("panthor-client: BO_CREATE failed stage=%s session=%llu req_size=0x%llx flags=0x%x ret=%d rsp_ret=%d client_bo=%u proxy_bo=%u payload=0x%llx payload_size=0x%llx\n",
+		stage, pcfile->session_id, args->size, args->flags, ret,
+		rsp.ret, rsp.client_bo_handle, rsp.proxy_bo_handle,
+		rsp.payload_handle, rsp.payload_size);
+	return ret;
 }
 
 static int panthor_client_bo_mmap_offset(struct panthor_client_file *pcfile,
 					 struct drm_panthor_bo_mmap_offset *args)
 {
 	struct panthor_client_bo *bo;
+	u64 size, payload_handle;
 
 	if (!pcfile)
 		return -EINVAL;
@@ -2267,11 +2720,13 @@ static int panthor_client_bo_mmap_offset(struct panthor_client_file *pcfile,
 	}
 
 	args->offset = bo->mmap_offset;
+	size = bo->size;
+	payload_handle = bo->payload_handle;
 	mutex_unlock(&pcfile->lock);
 
 	pr_info("panthor-client: BO_MMAP_OFFSET session=%llu client_bo=%u offset=0x%llx size=0x%llx payload=0x%llx\n",
-		pcfile->session_id, args->handle, args->offset, bo->size,
-		bo->payload_handle);
+		pcfile->session_id, args->handle, args->offset, size,
+		payload_handle);
 	return 0;
 }
 
@@ -2455,10 +2910,41 @@ static long panthor_client_ioctl(struct file *filp, unsigned int cmd,
 	}
 	if (cmd == DRM_IOCTL_PRIME_HANDLE_TO_FD ||
 	    cmd == DRM_IOCTL_PRIME_FD_TO_HANDLE ||
-	    cmd == DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD ||
-	    cmd == DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE ||
 	    cmd == DRM_IOCTL_SYNCOBJ_EVENTFD)
+	{
+		pr_info_ratelimited("panthor-client: reject unsupported DMA-BUF/syncobj eventfd ioctl cmd=0x%x\n",
+				    cmd);
 		return -EOPNOTSUPP;
+	}
+	if (cmd == DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD) {
+		struct drm_syncobj_handle handle;
+		int ret;
+
+		if (copy_from_user(&handle, (void __user *)arg, sizeof(handle)))
+			return -EFAULT;
+		ret = panthor_client_syncobj_export_sync_file(pcfile, &handle,
+							     filp);
+		if (ret)
+			return ret;
+		if (copy_to_user((void __user *)arg, &handle, sizeof(handle))) {
+			close_fd(handle.fd);
+			return -EFAULT;
+		}
+		return 0;
+	}
+	if (cmd == DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE) {
+		struct drm_syncobj_handle handle;
+		int ret;
+
+		if (copy_from_user(&handle, (void __user *)arg, sizeof(handle)))
+			return -EFAULT;
+		ret = panthor_client_syncobj_import_sync_file(pcfile, &handle);
+		if (ret)
+			return ret;
+		if (copy_to_user((void __user *)arg, &handle, sizeof(handle)))
+			return -EFAULT;
+		return 0;
+	}
 	if (cmd == DRM_IOCTL_GEM_CLOSE) {
 		struct drm_gem_close close;
 
@@ -3016,10 +3502,17 @@ static int __init panthor_client_init(void)
 	}
 
 	panthor_client->platform = pdev;
+	panthor_client->sync_file_wq =
+		alloc_workqueue("panthor-client-sync-file", WQ_UNBOUND, 0);
+	if (!panthor_client->sync_file_wq) {
+		ret = -ENOMEM;
+		goto err_release_devres;
+	}
+
 	panthor_client->flush_id_page = alloc_page(GFP_KERNEL | __GFP_ZERO);
 	if (!panthor_client->flush_id_page) {
 		ret = -ENOMEM;
-		goto err_release_devres;
+		goto err_destroy_workqueues;
 	}
 
 	ret = drm_dev_register(&panthor_client->drm, 0);
@@ -3040,6 +3533,9 @@ static int __init panthor_client_init(void)
 err_free_flush_id_page:
 	__free_page(panthor_client->flush_id_page);
 	panthor_client->flush_id_page = NULL;
+err_destroy_workqueues:
+	destroy_workqueue(panthor_client->sync_file_wq);
+	panthor_client->sync_file_wq = NULL;
 err_release_devres:
 	devres_release_group(&pdev->dev, NULL);
 err_unregister_platform:
@@ -3056,6 +3552,12 @@ static void __exit panthor_client_exit(void)
 
 	pdev = panthor_client->platform;
 	drm_dev_unregister(&panthor_client->drm);
+
+	if (panthor_client->sync_file_wq) {
+		destroy_workqueue(panthor_client->sync_file_wq);
+		panthor_client->sync_file_wq = NULL;
+	}
+
 	__free_page(panthor_client->flush_id_page);
 	panthor_client->flush_id_page = NULL;
 	devres_release_group(&pdev->dev, NULL);

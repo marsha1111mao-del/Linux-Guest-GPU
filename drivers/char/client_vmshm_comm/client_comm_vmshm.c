@@ -31,6 +31,7 @@
 #include <linux/spinlock.h>
 #include <linux/uaccess.h>
 #include <linux/vmshm_comm.h>
+#include <linux/vmshm_manager.h>
 #include <linux/workqueue.h>
 
 #define CLIENT_COMM_VMSHM_NAME		"client_comm_vmshm"
@@ -54,8 +55,9 @@
 #define PROXY_COMM_VMSHM_INIT_RETRIES	1000
 #define PROXY_COMM_VMSHM_QUEUE_MAGIC	0x51564350U /* "PCVQ" */
 #define CLIENT_COMM_VMSHM_RPC_WAIT_US	1000
-#define CLIENT_COMM_VMSHM_RPC_RETRIES	1000
-#define CLIENT_COMM_VMSHM_RPC_TIMEOUT_MS	1000
+#define CLIENT_COMM_VMSHM_RPC_MIN_TIMEOUT_MS	100
+#define CLIENT_COMM_VMSHM_RPC_DEFAULT_TIMEOUT_MS	10000
+#define CLIENT_COMM_VMSHM_RPC_MAX_TIMEOUT_MS	60000
 #define CLIENT_COMM_VMSHM_PERF_RTT_ITERS	1000
 #define CLIENT_COMM_VMSHM_PERF_BURST_ITERS	1024
 #define CLIENT_COMM_VMSHM_PERF_BURST_DEPTH	64
@@ -265,6 +267,8 @@ static DEFINE_SPINLOCK(client_comm_vmshm_rpc_stats_lock);
 static bool client_comm_vmshm_rpc_stats_enabled;
 static struct client_comm_vmshm_rpc_stat
 	client_comm_vmshm_rpc_stats[CLIENT_COMM_VMSHM_RPC_STATS_MAX];
+static unsigned int client_comm_vmshm_rpc_timeout_ms =
+	CLIENT_COMM_VMSHM_RPC_DEFAULT_TIMEOUT_MS;
 
 static bool client_comm_vmshm_rpc_stats_is_enabled(void)
 {
@@ -280,6 +284,8 @@ static const char *client_comm_vmshm_req_name(u32 type)
 		return "PERF_NOOP";
 	case VMSHM_COMM_PERF_REPORT_REQ:
 		return "PERF_REPORT";
+	case VMSHM_MANAGER_MSG_GET_OBJECT_REQ:
+		return "MANAGER_GET_OBJECT";
 	case PANTHOR_VMSHM_MSG_OPEN_SESSION_REQ:
 		return "OPEN_SESSION";
 	case PANTHOR_VMSHM_MSG_CLOSE_SESSION_REQ:
@@ -490,6 +496,49 @@ module_param_cb(rpc_stats, &client_comm_vmshm_rpc_stats_param_ops,
 		&client_comm_vmshm_rpc_stats_enabled, 0644);
 MODULE_PARM_DESC(rpc_stats,
 		 "Collect aggregated client-side vmshm RPC latency stats");
+
+static int
+client_comm_vmshm_rpc_timeout_param_set(const char *val,
+					const struct kernel_param *kp)
+{
+	unsigned int timeout_ms = client_comm_vmshm_rpc_timeout_ms;
+	int ret;
+
+	ret = kstrtouint(val, 0, &timeout_ms);
+	if (ret)
+		return ret;
+
+	if (timeout_ms < CLIENT_COMM_VMSHM_RPC_MIN_TIMEOUT_MS)
+		timeout_ms = CLIENT_COMM_VMSHM_RPC_MIN_TIMEOUT_MS;
+	if (timeout_ms > CLIENT_COMM_VMSHM_RPC_MAX_TIMEOUT_MS)
+		timeout_ms = CLIENT_COMM_VMSHM_RPC_MAX_TIMEOUT_MS;
+
+	WRITE_ONCE(client_comm_vmshm_rpc_timeout_ms, timeout_ms);
+	return 0;
+}
+
+static int
+client_comm_vmshm_rpc_timeout_param_get(char *buffer,
+					const struct kernel_param *kp)
+{
+	return sprintf(buffer, "%u\n",
+		       READ_ONCE(client_comm_vmshm_rpc_timeout_ms));
+}
+
+static const struct kernel_param_ops client_comm_vmshm_rpc_timeout_param_ops = {
+	.set = client_comm_vmshm_rpc_timeout_param_set,
+	.get = client_comm_vmshm_rpc_timeout_param_get,
+};
+
+module_param_cb(rpc_timeout_ms, &client_comm_vmshm_rpc_timeout_param_ops,
+		&client_comm_vmshm_rpc_timeout_ms, 0644);
+MODULE_PARM_DESC(rpc_timeout_ms,
+		 "Client vmshm RPC response timeout in milliseconds (100..60000)");
+
+static unsigned int client_comm_vmshm_rpc_timeout(void)
+{
+	return READ_ONCE(client_comm_vmshm_rpc_timeout_ms);
+}
 
 static void client_comm_vmshm_rx_work(struct work_struct *work);
 
@@ -922,8 +971,9 @@ found_waiter:
 		spin_unlock(&d->waiters_lock);
 
 		if (!waiter)
-			pr_debug("client_comm_vmshm: dropping unexpected rsp type=0x%x reply_to=%llu\n",
-				 rx.type, rx.reply_to);
+			pr_info_ratelimited("client_comm_vmshm: dropping unexpected rsp type=0x%x reply_to=%llu status=%d len=%u\n",
+					    rx.type, rx.reply_to, rx.status,
+					    rx.len);
 	}
 }
 
@@ -950,7 +1000,9 @@ int client_comm_vmshm_call(u32 req_type, u32 req_flags,
 		.len = req_len,
 	};
 	u64 seq;
-	int ret, i;
+	int ret;
+	unsigned int timeout_ms;
+	unsigned long rpc_poll_deadline;
 	bool stats_enabled = client_comm_vmshm_rpc_stats_is_enabled();
 	u64 total_start_ns = 0, lock_start_ns = 0, send_start_ns;
 	u64 wait_start_ns, recv_start_ns;
@@ -977,6 +1029,7 @@ int client_comm_vmshm_call(u32 req_type, u32 req_flags,
 
 	seq = (u64)atomic64_inc_return(&d->next_seq);
 	tx.seq = seq;
+	timeout_ms = client_comm_vmshm_rpc_timeout();
 
 	if (d->irq_notify) {
 		struct client_comm_vmshm_waiter waiter = {
@@ -1009,7 +1062,7 @@ int client_comm_vmshm_call(u32 req_type, u32 req_flags,
 			goto out_unlock;
 		}
 
-		timeout = msecs_to_jiffies(CLIENT_COMM_VMSHM_RPC_TIMEOUT_MS);
+		timeout = msecs_to_jiffies(timeout_ms);
 		wait_start_ns = stats_enabled ? ktime_get_ns() : 0;
 		if (!wait_for_completion_timeout(&waiter.done, timeout)) {
 			bool completed;
@@ -1023,6 +1076,10 @@ int client_comm_vmshm_call(u32 req_type, u32 req_flags,
 			spin_unlock(&d->waiters_lock);
 
 			ret = completed ? waiter.status : -ETIMEDOUT;
+			if (ret == -ETIMEDOUT)
+				pr_warn_ratelimited("client_comm_vmshm: RPC timeout op=%s req_type=0x%x seq=%llu timeout_ms=%u\n",
+						    client_comm_vmshm_req_name(req_type),
+						    req_type, seq, timeout_ms);
 			if (!ret && rsp_rx)
 				*rsp_rx = waiter.rsp_rx;
 			goto out_unlock;
@@ -1043,7 +1100,8 @@ int client_comm_vmshm_call(u32 req_type, u32 req_flags,
 	if (ret)
 		goto out_unlock;
 
-	for (i = 0; i < CLIENT_COMM_VMSHM_RPC_RETRIES; i++) {
+	rpc_poll_deadline = jiffies + msecs_to_jiffies(timeout_ms);
+	while (time_before(jiffies, rpc_poll_deadline)) {
 		struct vmshm_comm_rx rx = {
 			.payload = rsp_payload,
 			.payload_capacity = rsp_payload_capacity,
@@ -1076,6 +1134,9 @@ int client_comm_vmshm_call(u32 req_type, u32 req_flags,
 	}
 
 	ret = -ETIMEDOUT;
+	pr_warn_ratelimited("client_comm_vmshm: RPC poll timeout op=%s req_type=0x%x seq=%llu timeout_ms=%u\n",
+			    client_comm_vmshm_req_name(req_type), req_type,
+			    seq, timeout_ms);
 
 out_unlock:
 	mutex_unlock(&d->rpc_lock);
@@ -1206,7 +1267,7 @@ static int client_comm_vmshm_perf_burst_batch(struct client_comm_vmshm_dev *d,
 			goto out_remove;
 	}
 
-	timeout = msecs_to_jiffies(CLIENT_COMM_VMSHM_RPC_TIMEOUT_MS);
+	timeout = msecs_to_jiffies(client_comm_vmshm_rpc_timeout());
 	for (i = 0; i < depth; i++) {
 		if (!wait_for_completion_timeout(&waiters[i].done, timeout)) {
 			ret = -ETIMEDOUT;

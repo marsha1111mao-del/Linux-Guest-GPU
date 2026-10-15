@@ -332,8 +332,9 @@ static int client_vmshm_probe(struct platform_device *pdev)
 		return -EINVAL;
 	}
 
+	/* Match the proxy payload window and default Panthor BO mmap. */
 	client_vmshm_mgr.base = memremap(client_vmshm_mgr.gpa,
-					client_vmshm_mgr.size, MEMREMAP_WB);
+					client_vmshm_mgr.size, MEMREMAP_WC);
 	if (!client_vmshm_mgr.base) {
 		dev_err(&pdev->dev, "memremap failed\n");
 		return -ENOMEM;

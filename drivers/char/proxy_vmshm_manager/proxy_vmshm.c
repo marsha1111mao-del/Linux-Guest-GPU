@@ -42,7 +42,7 @@
 /* ---------- device state ---------- */
 
 static struct {
-	void *base;		/* memremap'd kernel VA (WB RAM) */
+	void *base;		/* memremap'd kernel VA (WC shared payload) */
 	phys_addr_t gpa;	/* guest physical base */
 	resource_size_t size;	/* region size in bytes */
 	u32 owner_vmid;		/* security owner for the active debug window */
@@ -181,7 +181,8 @@ static int vmshm_mmap(struct file *filp, struct vm_area_struct *vma)
 	if (vma_size > vmshm_dev.size - offset)
 		return -EINVAL;
 
-	/* Map with WB attributes (vma->vm_page_prot default) */
+	/* Keep debug mappings consistent with the shared payload window. */
+	vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
 	if (remap_pfn_range(vma, vma->vm_start,
 			    (vmshm_dev.gpa >> PAGE_SHIFT) + vma->vm_pgoff,
 			    vma_size, vma->vm_page_prot))
@@ -256,14 +257,19 @@ static int vmshm_probe(struct platform_device *pdev)
 	dev_info(&pdev->dev, "GPA 0x%pa size 0x%pa owner_vmid=%u\n",
 		 &gpa, &size, owner_vmid);
 
-	/* Map the shared memory region as Write-Back RAM */
-	base = memremap(gpa, size, MEMREMAP_WB);
+	/*
+	 * Match the client's default BO mapping (Normal non-cacheable/WC).
+	 * WB aliases can retain the allocator's zeroes while the client writes
+	 * command/data bytes through WC, and later write those zeroes back.
+	 * The communication ring is a separate mapping with its own protocol.
+	 */
+	base = memremap(gpa, size, MEMREMAP_WC);
 	if (!base) {
 		dev_err(&pdev->dev, "memremap failed\n");
 		return -ENOMEM;
 	}
 
-	dev_info(&pdev->dev, "mapped -> kernel VA %p\n", base);
+	dev_info(&pdev->dev, "mapped -> kernel VA %p attr=WC\n", base);
 
 	ret = proxy_vmshm_manager_register_domain(owner_vmid, base, gpa, size);
 	if (ret) {

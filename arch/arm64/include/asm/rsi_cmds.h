@@ -157,4 +157,26 @@ static inline unsigned long rsi_attestation_token_continue(phys_addr_t granule,
 	return res.a0;
 }
 
+static inline unsigned long rsi_opencca_gpa_to_hpa(phys_addr_t array,
+						   unsigned long count)
+{
+	struct arm_smccc_res res;
+
+	arm_smccc_smc(SMC_RSI_OPENCCA_GPA_TO_HPA, array, count,
+		      0, 0, 0, 0, 0, &res);
+
+	return res.a0;
+}
+
+static inline unsigned long rsi_opencca_gpu_revoke(phys_addr_t array,
+						   unsigned long count)
+{
+	struct arm_smccc_res res;
+
+	arm_smccc_smc(SMC_RSI_OPENCCA_GPU_REVOKE, array, count,
+		      0, 0, 0, 0, 0, &res);
+
+	return res.a0;
+}
+
 #endif /* __ASM_RSI_CMDS_H */

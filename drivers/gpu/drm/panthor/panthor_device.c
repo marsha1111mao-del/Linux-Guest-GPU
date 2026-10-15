@@ -4,6 +4,7 @@
 /* Copyright 2023 Collabora ltd. */
 
 #include <linux/clk.h>
+#include <linux/cc_platform.h>
 #include <linux/mm.h>
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
@@ -192,6 +193,22 @@ int panthor_device_init(struct panthor_device *ptdev)
 	 */
 	*dummy_page_virt = 1;
 
+	if (cc_platform_has(CC_ATTR_MEM_ENCRYPT)) {
+		p = alloc_page(GFP_KERNEL | __GFP_ZERO);
+		if (!p)
+			return -ENOMEM;
+
+		ptdev->pm.realm_latest_flush = p;
+		ret = drmm_add_action_or_reset(&ptdev->base,
+					       panthor_device_free_page,
+					       ptdev->pm.realm_latest_flush);
+		if (ret)
+			return ret;
+
+		drm_info(&ptdev->base,
+			 "Realm trusted-GPU: using shadow LATEST_FLUSH_ID mmap page\n");
+	}
+
 	INIT_WORK(&ptdev->reset.work, panthor_device_reset_work);
 	ptdev->reset.wq = alloc_ordered_workqueue("panthor-reset-wq", 0);
 	if (!ptdev->reset.wq)
@@ -369,11 +386,15 @@ static vm_fault_t panthor_mmio_vm_fault(struct vm_fault *vmf)
 
 	switch (offset) {
 	case DRM_PANTHOR_USER_FLUSH_ID_MMIO_OFFSET:
-		if (active)
+		if (ptdev->pm.realm_latest_flush) {
+			pfn = page_to_pfn(ptdev->pm.realm_latest_flush);
+			active = false;
+		} else if (active) {
 			pfn = __phys_to_pfn(ptdev->phys_addr +
 					    CSF_GPU_LATEST_FLUSH_ID);
-		else
+		} else {
 			pfn = page_to_pfn(ptdev->pm.dummy_latest_flush);
+		}
 		break;
 
 	default:

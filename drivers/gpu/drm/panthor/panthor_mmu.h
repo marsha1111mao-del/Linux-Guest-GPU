@@ -6,6 +6,7 @@
 #define __PANTHOR_MMU_H__
 
 #include <linux/dma-resv.h>
+#include <linux/dma-direction.h>
 
 struct drm_exec;
 struct drm_sched_job;
@@ -25,6 +26,7 @@ void panthor_mmu_resume(struct panthor_device *ptdev);
 int panthor_vm_map_bo_range(struct panthor_vm *vm, struct panthor_gem_object *bo,
 			    u64 offset, u64 size, u64 va, u32 flags);
 int panthor_vm_unmap_range(struct panthor_vm *vm, u64 va, u64 size);
+phys_addr_t panthor_vm_iova_to_phys(struct panthor_vm *vm, u64 va);
 struct panthor_gem_object *
 panthor_vm_get_bo_for_va(struct panthor_vm *vm, u64 va, u64 *bo_offset);
 
@@ -47,6 +49,8 @@ struct panthor_vm *panthor_vm_create(struct panthor_device *ptdev, bool for_mcu,
 int panthor_vm_prepare_mapped_bos_resvs(struct drm_exec *exec,
 					struct panthor_vm *vm,
 					u32 slot_count);
+int panthor_vm_sync_mapped_bos(struct panthor_vm *vm,
+			       enum dma_data_direction dir);
 int panthor_vm_add_bos_resvs_deps_to_job(struct panthor_vm *vm,
 					 struct drm_sched_job *job);
 void panthor_vm_add_job_fence_to_bos_resvs(struct panthor_vm *vm,

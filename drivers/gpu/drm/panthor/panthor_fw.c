@@ -5,6 +5,7 @@
 #include <asm/arch_timer.h>
 #endif
 
+#include <linux/cc_platform.h>
 #include <linux/clk.h>
 #include <linux/dma-mapping.h>
 #include <linux/firmware.h>
@@ -412,8 +413,79 @@ static void panthor_fw_init_section_mem(struct panthor_device *ptdev,
 			       section->data.size);
 	}
 
+	/*
+	 * Firmware sections are written through a vmap alias. On non-coherent
+	 * systems that alias is write-combine, so order those writes before the
+	 * page-level clean used by the Realm direct path.
+	 */
+	flush_kernel_vmap_range(section->mem->kmap,
+				panthor_kernel_bo_size(section->mem));
+	dma_wmb();
+
 	if (!was_mapped)
 		panthor_kernel_bo_vunmap(section->mem);
+}
+
+static int panthor_fw_sync_section_for_device(struct panthor_device *ptdev,
+					      struct panthor_fw_section *section)
+{
+	size_t size = panthor_kernel_bo_size(section->mem);
+	struct sg_table *sgt;
+
+	if (!panthor_gem_realm_gpu_enabled()) {
+		struct panthor_gem_object *bo = to_panthor_bo(section->mem->obj);
+		struct drm_gem_shmem_object *shmem = &bo->base;
+
+		sgt = drm_gem_shmem_get_pages_sgt(shmem);
+		if (IS_ERR(sgt))
+			return PTR_ERR(sgt);
+
+		dma_sync_sgtable_for_device(ptdev->base.dev, sgt,
+					    DMA_TO_DEVICE);
+		return 0;
+	}
+
+	return panthor_kernel_bo_sync_for_device(ptdev, section->mem, 0, size);
+}
+
+static int panthor_fw_sync_section_for_cpu(struct panthor_device *ptdev,
+					   struct panthor_fw_section *section)
+{
+	size_t size = panthor_kernel_bo_size(section->mem);
+
+	return panthor_kernel_bo_sync_for_cpu(ptdev, section->mem, 0, size);
+}
+
+static void panthor_fw_sync_shared_for_device(struct panthor_device *ptdev,
+					      const char *where)
+{
+	struct panthor_fw_section *section = ptdev->fw->shared_section;
+	int ret;
+
+	if (!panthor_gem_realm_gpu_enabled() || !section || !section->mem)
+		return;
+
+	ret = panthor_fw_sync_section_for_device(ptdev, section);
+	if (ret)
+		drm_warn(&ptdev->base,
+			 "Failed to sync Realm MCU shared iface before %s ret=%d",
+			 where, ret);
+}
+
+void panthor_fw_sync_shared_for_cpu(struct panthor_device *ptdev,
+				    const char *where)
+{
+	struct panthor_fw_section *section = ptdev->fw->shared_section;
+	int ret;
+
+	if (!panthor_gem_realm_gpu_enabled() || !section || !section->mem)
+		return;
+
+	ret = panthor_fw_sync_section_for_cpu(ptdev, section);
+	if (ret)
+		drm_warn(&ptdev->base,
+			 "Failed to sync Realm MCU shared iface before %s ret=%d",
+			 where, ret);
 }
 
 /**
@@ -457,6 +529,13 @@ struct panthor_kernel_bo *panthor_fw_alloc_queue_iface_mem(
 	}
 
 	memset(mem->kmap, 0, panthor_kernel_bo_size(mem));
+	ret = panthor_kernel_bo_sync_for_device(ptdev, mem, 0,
+						panthor_kernel_bo_size(mem));
+	if (ret) {
+		panthor_kernel_bo_destroy(mem);
+		return ERR_PTR(ret);
+	}
+
 	*input = mem->kmap;
 	*output = mem->kmap + SZ_4K;
 	*input_fw_va = panthor_kernel_bo_gpuva(mem);
@@ -589,13 +668,15 @@ static int panthor_fw_load_section_entry(struct panthor_device *ptdev,
 	if (section_size) {
 		u32 cache_mode = hdr.flags &
 				 CSF_FW_BINARY_IFACE_ENTRY_RD_CACHE_MODE_MASK;
-		struct panthor_gem_object *bo;
 		u32 vm_map_flags = 0;
-		struct sg_table *sgt;
 		u64 va = hdr.va.start;
 
-		if (!(hdr.flags & CSF_FW_BINARY_IFACE_ENTRY_RD_WR))
+		if (!(hdr.flags & CSF_FW_BINARY_IFACE_ENTRY_RD_WR) &&
+		    !cc_platform_has(CC_ATTR_MEM_ENCRYPT))
 			vm_map_flags |= DRM_PANTHOR_VM_BIND_OP_MAP_READONLY;
+		else if (!(hdr.flags & CSF_FW_BINARY_IFACE_ENTRY_RD_WR))
+			drm_info_once(&ptdev->base,
+				      "Realm trusted-GPU: firmware MCU sections are mapped writable for HPA-backed page-table validation");
 
 		if (!(hdr.flags & CSF_FW_BINARY_IFACE_ENTRY_RD_EX))
 			vm_map_flags |= DRM_PANTHOR_VM_BIND_OP_MAP_NOEXEC;
@@ -617,6 +698,15 @@ static int panthor_fw_load_section_entry(struct panthor_device *ptdev,
 		if (IS_ERR(section->mem))
 			return PTR_ERR(section->mem);
 
+		if (cc_platform_has(CC_ATTR_MEM_ENCRYPT)) {
+			struct panthor_gem_object *fw_bo =
+				to_panthor_bo(section->mem->obj);
+
+			fw_bo->base.map_wc = false;
+			drm_info_once(&ptdev->base,
+				      "Realm trusted-GPU: firmware MCU sections use cached CPU mappings with explicit sync");
+		}
+
 		if (drm_WARN_ON(&ptdev->base,
 				section->mem->va_node.start != hdr.va.start))
 			return -EINVAL;
@@ -629,13 +719,9 @@ static int panthor_fw_load_section_entry(struct panthor_device *ptdev,
 
 		panthor_fw_init_section_mem(ptdev, section);
 
-		bo = to_panthor_bo(section->mem->obj);
-		sgt = drm_gem_shmem_get_pages_sgt(&bo->base);
-		if (IS_ERR(sgt))
-			return PTR_ERR(sgt);
-
-		dma_sync_sgtable_for_device(ptdev->base.dev, sgt,
-					    DMA_TO_DEVICE);
+		ret = panthor_fw_sync_section_for_device(ptdev, section);
+		if (ret)
+			return ret;
 	}
 
 	if (hdr.va.start == CSF_MCU_SHARED_REGION_START)
@@ -650,18 +736,15 @@ static void panthor_reload_fw_sections(struct panthor_device *ptdev,
 	struct panthor_fw_section *section;
 
 	list_for_each_entry(section, &ptdev->fw->sections, node) {
-		struct sg_table *sgt;
+		int ret;
 
 		if (!full_reload &&
 		    !(section->flags & CSF_FW_BINARY_IFACE_ENTRY_RD_WR))
 			continue;
 
 		panthor_fw_init_section_mem(ptdev, section);
-		sgt = drm_gem_shmem_get_pages_sgt(
-			&to_panthor_bo(section->mem->obj)->base);
-		if (!drm_WARN_ON(&ptdev->base, IS_ERR_OR_NULL(sgt)))
-			dma_sync_sgtable_for_device(ptdev->base.dev, sgt,
-						    DMA_TO_DEVICE);
+		ret = panthor_fw_sync_section_for_device(ptdev, section);
+		drm_WARN_ON(&ptdev->base, ret);
 	}
 }
 
@@ -934,9 +1017,17 @@ static int panthor_fw_init_ifaces(struct panthor_device *ptdev)
 {
 	struct panthor_fw_global_iface *glb_iface = &ptdev->fw->iface.global;
 	unsigned int i;
+	int ret;
 
 	if (!ptdev->fw->shared_section->mem->kmap)
 		return -EINVAL;
+
+	if (cc_platform_has(CC_ATTR_MEM_ENCRYPT)) {
+		ret = panthor_fw_sync_section_for_cpu(ptdev,
+						      ptdev->fw->shared_section);
+		if (ret)
+			return ret;
+	}
 
 	spin_lock_init(&glb_iface->lock);
 	glb_iface->control = ptdev->fw->shared_section->mem->kmap;
@@ -1006,6 +1097,7 @@ static void panthor_fw_init_global_iface(struct panthor_device *ptdev)
 			       GLB_CFG_ALLOC_EN | GLB_CFG_POWEROFF_TIMER |
 				       GLB_CFG_PROGRESS_TIMER);
 
+	panthor_fw_sync_shared_for_device(ptdev, "global init doorbell");
 	gpu_write(ptdev, CSF_DOORBELL(CSF_GLB_DOORBELL_ID), 1);
 
 	/* Kick the watchdog. */
@@ -1028,8 +1120,67 @@ static void panthor_job_irq_handler(struct panthor_device *ptdev, u32 status)
 }
 PANTHOR_IRQ_HANDLER(job, JOB, panthor_job_irq_handler);
 
+static u64 panthor_fw_read_as_reg64(struct panthor_device *ptdev, u32 lo,
+				    u32 hi)
+{
+	return gpu_read(ptdev, lo) | ((u64)gpu_read(ptdev, hi) << 32);
+}
+
+static void panthor_fw_dump_boot_iface(struct panthor_device *ptdev)
+{
+	struct panthor_fw_section *section = ptdev->fw->shared_section;
+	struct panthor_fw_global_control_iface *control;
+	const struct panthor_fw_global_output_iface *output = NULL;
+	struct panthor_fw_global_input_iface *input = NULL;
+	int ret;
+
+	if (!section || !section->mem || !section->mem->kmap)
+		return;
+
+	ret = panthor_fw_sync_section_for_cpu(ptdev, section);
+	if (ret) {
+		drm_err(&ptdev->base, "Failed to sync MCU shared iface ret=%d",
+			ret);
+		return;
+	}
+
+	control = section->mem->kmap;
+	drm_err(&ptdev->base,
+		"MCU shared iface: version=0x%08x features=0x%08x input_va=0x%08x output_va=0x%08x group_num=%u group_stride=0x%x perfcnt_size=%u instr_features=0x%08x",
+		control->version, control->features, control->input_va,
+		control->output_va, control->group_num, control->group_stride,
+		control->perfcnt_size, control->instr_features);
+
+	if (control->input_va)
+		input = iface_fw_to_cpu_addr(ptdev, control->input_va);
+	if (control->output_va)
+		output = iface_fw_to_cpu_addr(ptdev, control->output_va);
+
+	if (input)
+		drm_err(&ptdev->base,
+			"MCU shared input: req=0x%08x ack_irq_mask=0x%08x doorbell_req=0x%08x progress_timer=0x%08x poweroff_timer=0x%08x core_en_mask=0x%016llx",
+			input->req, input->ack_irq_mask, input->doorbell_req,
+			input->progress_timer, input->poweroff_timer,
+			input->core_en_mask);
+	else
+		drm_err(&ptdev->base,
+			"MCU shared input: unavailable input_va=0x%08x",
+			control->input_va);
+
+	if (output)
+		drm_err(&ptdev->base,
+			"MCU shared output: ack=0x%08x doorbell_ack=0x%08x halt_status=0x%08x perfcnt_status=0x%08x perfcnt_insert=0x%08x",
+			output->ack, output->doorbell_ack, output->halt_status,
+			output->perfcnt_status, output->perfcnt_insert);
+	else
+		drm_err(&ptdev->base,
+			"MCU shared output: unavailable output_va=0x%08x",
+			control->output_va);
+}
+
 static int panthor_fw_start(struct panthor_device *ptdev)
 {
+	unsigned int timeout_ms = cc_platform_has(CC_ATTR_MEM_ENCRYPT) ? 5000 : 1000;
 	bool timedout = false;
 
 	ptdev->fw->booted = false;
@@ -1037,7 +1188,7 @@ static int panthor_fw_start(struct panthor_device *ptdev)
 	gpu_write(ptdev, MCU_CONTROL, MCU_CONTROL_AUTO);
 
 	if (!wait_event_timeout(ptdev->fw->req_waitqueue, ptdev->fw->booted,
-				msecs_to_jiffies(1000))) {
+				msecs_to_jiffies(timeout_ms))) {
 		if (!ptdev->fw->booted &&
 		    !(gpu_read(ptdev, JOB_INT_STAT) & JOB_INT_GLOBAL_IF))
 			timedout = true;
@@ -1052,9 +1203,34 @@ static int panthor_fw_start(struct panthor_device *ptdev)
 		};
 		u32 status = gpu_read(ptdev, MCU_STATUS);
 
-		drm_err(&ptdev->base, "Failed to boot MCU (status=%s)",
+		drm_err(&ptdev->base,
+			"Failed to boot MCU (status=%s timeout_ms=%u job_raw=0x%08x job_stat=0x%08x job_mask=0x%08x gpu_raw=0x%08x gpu_stat=0x%08x mmu_raw=0x%08x mmu_stat=0x%08x)",
 			status < ARRAY_SIZE(status_str) ? status_str[status] :
-							  "unknown");
+							  "unknown",
+			timeout_ms,
+			gpu_read(ptdev, JOB_INT_RAWSTAT),
+			gpu_read(ptdev, JOB_INT_STAT),
+			gpu_read(ptdev, JOB_INT_MASK),
+			gpu_read(ptdev, GPU_INT_RAWSTAT),
+			gpu_read(ptdev, GPU_INT_STAT),
+			gpu_read(ptdev, MMU_INT_RAWSTAT),
+			gpu_read(ptdev, MMU_INT_STAT));
+		drm_err(&ptdev->base,
+			"MCU AS0 diag: status=0x%08x faultstatus=0x%08x faultaddr=0x%016llx faultextra=0x%016llx transtab=0x%016llx memattr=0x%016llx transcfg=0x%016llx command=0x%08x",
+			gpu_read(ptdev, AS_STATUS(0)),
+			gpu_read(ptdev, AS_FAULTSTATUS(0)),
+			panthor_fw_read_as_reg64(ptdev, AS_FAULTADDRESS_LO(0),
+						 AS_FAULTADDRESS_HI(0)),
+			panthor_fw_read_as_reg64(ptdev, AS_FAULTEXTRA_LO(0),
+						 AS_FAULTEXTRA_HI(0)),
+			panthor_fw_read_as_reg64(ptdev, AS_TRANSTAB_LO(0),
+						 AS_TRANSTAB_HI(0)),
+			panthor_fw_read_as_reg64(ptdev, AS_MEMATTR_LO(0),
+						 AS_MEMATTR_HI(0)),
+			panthor_fw_read_as_reg64(ptdev, AS_TRANSCFG_LO(0),
+						 AS_TRANSCFG_HI(0)),
+			gpu_read(ptdev, AS_COMMAND(0)));
+		panthor_fw_dump_boot_iface(ptdev);
 		return -ETIMEDOUT;
 	}
 
@@ -1090,12 +1266,17 @@ void panthor_fw_pre_reset(struct panthor_device *ptdev, bool on_hang)
 		struct panthor_fw_global_iface *glb_iface =
 			panthor_fw_get_glb_iface(ptdev);
 		u32 status;
+		int ret;
 
 		panthor_fw_update_reqs(glb_iface, req, GLB_HALT, GLB_HALT);
+		panthor_fw_sync_shared_for_device(ptdev, "halt doorbell");
 		gpu_write(ptdev, CSF_DOORBELL(CSF_GLB_DOORBELL_ID), 1);
-		if (!readl_poll_timeout(ptdev->iomem + MCU_STATUS, status,
-					status == MCU_STATUS_HALT, 10,
-					100000) &&
+		ret = readl_poll_timeout(ptdev->iomem + MCU_STATUS, status,
+					 status == MCU_STATUS_HALT, 10,
+					 100000);
+		if (!ret)
+			panthor_fw_sync_shared_for_cpu(ptdev, "halt ack");
+		if (!ret &&
 		    glb_iface->output->halt_status == PANTHOR_FW_HALT_OK) {
 			ptdev->fw->fast_reset = true;
 		} else {
@@ -1106,6 +1287,7 @@ void panthor_fw_pre_reset(struct panthor_device *ptdev, bool on_hang)
 		 * the HALT bit before the FW is rebooted.
 		 */
 		panthor_fw_update_reqs(glb_iface, req, 0, GLB_HALT);
+		panthor_fw_sync_shared_for_device(ptdev, "halt clear");
 	}
 
 	panthor_job_irq_suspend(&ptdev->fw->irq);
@@ -1220,25 +1402,30 @@ void panthor_fw_unplug(struct panthor_device *ptdev)
  *
  * Return: 0 on success, -ETIMEDOUT otherwise.
  */
-static int panthor_fw_wait_acks(const u32 *req_ptr, const u32 *ack_ptr,
-				wait_queue_head_t *wq, u32 req_mask, u32 *acked,
-				u32 timeout_ms)
+static int panthor_fw_wait_acks(struct panthor_device *ptdev,
+				const u32 *req_ptr, const u32 *ack_ptr,
+				wait_queue_head_t *wq, u32 req_mask,
+				u32 *acked, u32 timeout_ms)
 {
 	u32 ack, req = READ_ONCE(*req_ptr) & req_mask;
-	int ret;
+	unsigned long timeout = jiffies + msecs_to_jiffies(timeout_ms);
 
 	/* Busy wait for a few µsecs before falling back to a sleeping wait. */
 	*acked = req_mask;
-	ret = read_poll_timeout_atomic(READ_ONCE, ack, (ack & req_mask) == req,
-				       0, 10, 0, *ack_ptr);
-	if (!ret)
-		return 0;
+	for (;;) {
+		panthor_fw_sync_shared_for_cpu(ptdev, "ack poll");
+		ack = READ_ONCE(*ack_ptr);
+		if ((ack & req_mask) == req)
+			return 0;
 
-	if (wait_event_timeout(*wq, (READ_ONCE(*ack_ptr) & req_mask) == req,
-			       msecs_to_jiffies(timeout_ms)))
-		return 0;
+		if (time_after(jiffies, timeout))
+			break;
+
+		wait_event_timeout(*wq, false, 1);
+	}
 
 	/* Check one last time, in case we were not woken up for some reason. */
+	panthor_fw_sync_shared_for_cpu(ptdev, "ack final");
 	ack = READ_ONCE(*ack_ptr);
 	if ((ack & req_mask) == req)
 		return 0;
@@ -1267,7 +1454,7 @@ int panthor_fw_glb_wait_acks(struct panthor_device *ptdev, u32 req_mask,
 	if (drm_WARN_ON(&ptdev->base, req_mask & (~GLB_REQ_MASK | GLB_HALT)))
 		return -EINVAL;
 
-	return panthor_fw_wait_acks(&glb_iface->input->req,
+	return panthor_fw_wait_acks(ptdev, &glb_iface->input->req,
 				    &glb_iface->output->ack,
 				    &ptdev->fw->req_waitqueue, req_mask, acked,
 				    timeout_ms);
@@ -1294,7 +1481,7 @@ int panthor_fw_csg_wait_acks(struct panthor_device *ptdev, u32 csg_slot,
 	if (drm_WARN_ON(&ptdev->base, req_mask & ~CSG_REQ_MASK))
 		return -EINVAL;
 
-	ret = panthor_fw_wait_acks(&csg_iface->input->req,
+	ret = panthor_fw_wait_acks(ptdev, &csg_iface->input->req,
 				   &csg_iface->output->ack,
 				   &ptdev->fw->req_waitqueue, req_mask, acked,
 				   timeout_ms);
@@ -1326,6 +1513,7 @@ void panthor_fw_ring_csg_doorbells(struct panthor_device *ptdev, u32 csg_mask)
 		panthor_fw_get_glb_iface(ptdev);
 
 	panthor_fw_toggle_reqs(glb_iface, doorbell_req, doorbell_ack, csg_mask);
+	panthor_fw_sync_shared_for_device(ptdev, "CSG doorbell");
 	gpu_write(ptdev, CSF_DOORBELL(CSF_GLB_DOORBELL_ID), 1);
 }
 
@@ -1343,6 +1531,7 @@ static void panthor_fw_ping_work(struct work_struct *work)
 		return;
 
 	panthor_fw_toggle_reqs(glb_iface, req, ack, GLB_PING);
+	panthor_fw_sync_shared_for_device(ptdev, "ping doorbell");
 	gpu_write(ptdev, CSF_DOORBELL(CSF_GLB_DOORBELL_ID), 1);
 
 	ret = panthor_fw_glb_wait_acks(ptdev, GLB_PING, &acked, 100);

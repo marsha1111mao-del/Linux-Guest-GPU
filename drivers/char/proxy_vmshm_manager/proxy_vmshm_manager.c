@@ -369,7 +369,10 @@ static int proxy_vmshm_buddy_init(struct proxy_vmshm_buddy *buddy,
 	if (!buddy->free_area)
 		return -ENOMEM;
 
-	buddy->pages = kcalloc(nr_pages, sizeof(*buddy->pages), GFP_KERNEL);
+	/* Per-page metadata is CPU-only and grows beyond MAX_ORDER for large
+	 * shared windows. It does not need physically contiguous backing.
+	 */
+	buddy->pages = kvcalloc(nr_pages, sizeof(*buddy->pages), GFP_KERNEL);
 	if (!buddy->pages) {
 		ret = -ENOMEM;
 		goto err_free_area;
@@ -411,7 +414,7 @@ static int proxy_vmshm_buddy_init(struct proxy_vmshm_buddy *buddy,
 	return 0;
 
 err_free_pages:
-	kfree(buddy->pages);
+	kvfree(buddy->pages);
 	buddy->pages = NULL;
 err_free_area:
 	kfree(buddy->free_area);
@@ -421,7 +424,7 @@ err_free_area:
 
 static void proxy_vmshm_buddy_destroy(struct proxy_vmshm_buddy *buddy)
 {
-	kfree(buddy->pages);
+	kvfree(buddy->pages);
 	kfree(buddy->free_area);
 	memset(buddy, 0, sizeof(*buddy));
 }
@@ -2252,11 +2255,15 @@ static int proxy_vmshm_manager_rx_handler(const struct vmshm_comm_rx *rx,
 	rsp.ret = ret;
 
 out_send:
+	if (rsp.ret)
+		pr_warn("proxy_manager_vmshm: GET_OBJECT failed reply_to=%llu lookup=%u handle=0x%llx requester_vmid=%u required_perms=0x%x ret=%d\n",
+			rx->seq, req.lookup, req.handle, req.requester_vmid,
+			req.required_perms, rsp.ret);
 	ret = proxy_vmshm_manager_send_object_rsp(rx->proxy_channel, rx->seq,
 						 &rsp);
 	if (ret)
-		pr_warn_ratelimited("proxy_manager_vmshm: response send failed (%d)\n",
-				    ret);
+		pr_warn("proxy_manager_vmshm: response send failed reply_to=%llu handle=0x%llx requester_vmid=%u ret=%d rsp_ret=%d\n",
+			rx->seq, req.handle, req.requester_vmid, ret, rsp.ret);
 
 	return ret;
 }

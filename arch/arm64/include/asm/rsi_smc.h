@@ -190,4 +190,23 @@ struct realm_config {
  */
 #define SMC_RSI_HOST_CALL			SMC_RSI_FID(0x199)
 
+/*
+ * OpenCCA experimental trusted-device helper.
+ *
+ * arg1 == IPA of one Realm granule containing an array of 64-bit GPAs.
+ * arg2 == Number of entries in the array.
+ * ret0 == Status / error
+ *
+ * On success, each input GPA entry is replaced with the RMM-validated PA/HPA
+ * backing the current Realm's assigned RAM mapping.
+ */
+#define SMC_RSI_OPENCCA_GPA_TO_HPA		SMC_RSI_FID(0x1af)
+
+/*
+ * Release OpenCCA GPU mapping leases for HPAs previously returned by
+ * SMC_RSI_OPENCCA_GPA_TO_HPA. This does not change GPT state or a hardware
+ * device permission.
+ */
+#define SMC_RSI_OPENCCA_GPU_REVOKE		SMC_RSI_FID(0x1ae)
+
 #endif /* __ASM_RSI_SMC_H_ */
