@@ -23,31 +23,6 @@
 #include "panthor_regs.h"
 #include "panthor_sched.h"
 
-static int panthor_clk_init(struct panthor_device *ptdev)
-{
-	ptdev->clks.core = devm_clk_get(ptdev->base.dev, NULL);
-	if (IS_ERR(ptdev->clks.core))
-		return dev_err_probe(ptdev->base.dev, PTR_ERR(ptdev->clks.core),
-				     "get 'core' clock failed");
-
-	ptdev->clks.stacks = devm_clk_get_optional(ptdev->base.dev, "stacks");
-	if (IS_ERR(ptdev->clks.stacks))
-		return dev_err_probe(ptdev->base.dev,
-				     PTR_ERR(ptdev->clks.stacks),
-				     "get 'stacks' clock failed");
-
-	ptdev->clks.coregroup =
-		devm_clk_get_optional(ptdev->base.dev, "coregroup");
-	if (IS_ERR(ptdev->clks.coregroup))
-		return dev_err_probe(ptdev->base.dev,
-				     PTR_ERR(ptdev->clks.coregroup),
-				     "get 'coregroup' clock failed");
-
-	drm_info(&ptdev->base, "clock rate = %lu\n",
-		 clk_get_rate(ptdev->clks.core));
-	return 0;
-}
-
 void panthor_device_unplug(struct panthor_device *ptdev)
 {
 	/* This function can be called from two different path: the reset work
@@ -218,14 +193,6 @@ int panthor_device_init(struct panthor_device *ptdev)
 				       panthor_device_reset_cleanup, NULL);
 	if (ret)
 		return ret;
-
-	// ret = panthor_clk_init(ptdev);
-	// if (ret)
-	// 	return ret;
-
-	// ret = panthor_devfreq_init(ptdev);
-	// if (ret)
-	// 	return ret;
 
 	ptdev->iomem = devm_platform_get_and_ioremap_resource(
 		to_platform_device(ptdev->base.dev), 0, &res);

@@ -1,11 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * client_comm_vmshm - client/frontend side of the vmshm control transport.
- *
- * The proxy VM owns the shared protocol layout. A client VM only maps its
- * single communication memslot, waits for the proxy side to publish a valid
- * header, validates the queue/object layout, and then exposes the region for
- * debugging and future in-kernel RPC users.
+ * client_comm_vmshm - RMM-authorized Realm queue transport.
+ * Pool binding supplies authenticated channel identity and mapped queue pages.
+ * Notifications use RMM IRQ subscription; queue data is validated privately.
+ * The character device only holds a lifetime reference for unbind checks.
  */
 
 #include <linux/cdev.h>
@@ -13,48 +11,27 @@
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/fs.h>
-#include <linux/interrupt.h>
 #include <linux/io.h>
-#include <linux/ioctl.h>
 #include <linux/ktime.h>
 #include <linux/list.h>
 #include <linux/log2.h>
 #include <linux/math64.h>
 #include <linux/mm.h>
-#include <linux/mod_devicetable.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
-#include <linux/of.h>
 #include <linux/panthor_vmshm.h>
 #include <linux/platform_device.h>
+#include <linux/refcount.h>
+#include <linux/realm_xshm.h>
+#include <asm/rsi.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
-#include <linux/uaccess.h>
 #include <linux/vmshm_comm.h>
+#include <linux/vmshm_comm_protocol.h>
 #include <linux/vmshm_manager.h>
 #include <linux/workqueue.h>
 
 #define CLIENT_COMM_VMSHM_NAME		"client_comm_vmshm"
-#define CLIENT_COMM_VMSHM_IOC_MAGIC	'C'
-
-#define CLIENT_COMM_VMSHM_IOC_GET_SIZE \
-	_IOR(CLIENT_COMM_VMSHM_IOC_MAGIC, 1, __u64)
-#define CLIENT_COMM_VMSHM_IOC_GET_BASE \
-	_IOR(CLIENT_COMM_VMSHM_IOC_MAGIC, 2, __u64)
-#define CLIENT_COMM_VMSHM_IOC_GET_INFO \
-	_IOR(CLIENT_COMM_VMSHM_IOC_MAGIC, 3, struct client_comm_vmshm_info)
-
-#define PROXY_COMM_VMSHM_MAGIC		0x56534350U /* "VSCP" */
-#define PROXY_COMM_VMSHM_INIT_MAGIC	0x494e4954U /* "INIT" */
-#define PROXY_COMM_VMSHM_VERSION	1
-#define PROXY_COMM_VMSHM_MAX_QUEUES	2
-#define PROXY_COMM_VMSHM_MAX_OBJECTS	64
-#define PROXY_COMM_VMSHM_QUEUE_SIZE	256
-#define PROXY_COMM_VMSHM_MSG_SIZE	512
-#define PROXY_COMM_VMSHM_INIT_WAIT_US	1000
-#define PROXY_COMM_VMSHM_INIT_RETRIES	1000
-#define PROXY_COMM_VMSHM_QUEUE_MAGIC	0x51564350U /* "PCVQ" */
-#define CLIENT_COMM_VMSHM_RPC_WAIT_US	1000
 #define CLIENT_COMM_VMSHM_RPC_MIN_TIMEOUT_MS	100
 #define CLIENT_COMM_VMSHM_RPC_DEFAULT_TIMEOUT_MS	10000
 #define CLIENT_COMM_VMSHM_RPC_MAX_TIMEOUT_MS	60000
@@ -63,142 +40,17 @@
 #define CLIENT_COMM_VMSHM_PERF_BURST_DEPTH	64
 #define CLIENT_COMM_VMSHM_RPC_STATS_MAX		64
 
-enum proxy_comm_vmshm_status {
-	PROXY_COMM_VMSHM_STATUS_RESET = 0,
-	PROXY_COMM_VMSHM_STATUS_INIT = 1,
-	PROXY_COMM_VMSHM_STATUS_READY = 2,
-	PROXY_COMM_VMSHM_STATUS_ERROR = 3,
-};
-
-enum proxy_comm_vmshm_role {
-	PROXY_COMM_VMSHM_ROLE_PROXY = 0,
-	PROXY_COMM_VMSHM_ROLE_CLIENT = 1,
-};
-
-enum proxy_comm_vmshm_direction {
-	PROXY_COMM_VMSHM_Q_CLIENT_TO_PROXY = 0,
-	PROXY_COMM_VMSHM_Q_PROXY_TO_CLIENT = 1,
-};
-
-struct proxy_comm_vmshm_queue {
-	u32 queue_obj_id;
-	u32 desc_obj_id;
-	u32 avail_obj_id;
-	u32 used_obj_id;
-	u32 msg_pool_obj_id;
-	u32 queue_off;
-	u32 size;
-	u32 msg_size;
-	u32 desc_off;
-	u32 avail_off;
-	u32 used_off;
-	u32 msg_pool_off;
-	u32 direction;
-	u32 flags;
-	u32 reserved;
-};
-
-struct proxy_comm_vmshm_header {
-	u32 magic;
-	u32 version;
-	u32 header_size;
-	u32 total_size;
-	u32 generation;
-	u32 status[2];
-	u32 heap_base_off;
-	u32 heap_size;
-	u32 next_free_off;
-	u32 object_table_off;
-	u32 object_count;
-	u32 object_capacity;
-	u32 queue_count;
-	u64 feature_bits;
-	struct proxy_comm_vmshm_queue queues[PROXY_COMM_VMSHM_MAX_QUEUES];
-};
-
-struct proxy_comm_vmshm_object {
-	u32 obj_id;
-	u32 type;
-	u32 offset;
-	u32 size;
-	u32 align;
-	u32 flags;
-	u32 generation;
-	u32 reserved;
-};
-
-struct proxy_comm_vmshm_queue_object {
-	u32 magic;
-	u32 queue_id;
-	u32 direction;
-	u32 queue_size;
-	u32 queue_mask;
-	u32 msg_size;
-	u32 desc_off;
-	u32 avail_off;
-	u32 used_off;
-	u32 msg_pool_off;
-	u32 desc_obj_id;
-	u32 avail_obj_id;
-	u32 used_obj_id;
-	u32 msg_pool_obj_id;
-	u32 flags;
-	u32 reserved;
-};
-
-struct proxy_comm_vmshm_desc {
-	u32 msg_off;
-	u32 msg_capacity;
-	u32 msg_len;
-	u32 flags;
-	u64 seq;
-};
-
-struct proxy_comm_vmshm_avail_ring {
-	u32 idx;
-	u32 flags;
-	u16 ring[];
-};
-
-struct proxy_comm_vmshm_used_elem {
-	u16 desc_id;
-	s16 status;
-	u32 len;
-};
-
-struct proxy_comm_vmshm_used_ring {
-	u32 idx;
-	u32 flags;
-	struct proxy_comm_vmshm_used_elem ring[];
-};
-
-struct proxy_comm_vmshm_msg {
-	u32 type;
-	u32 flags;
-	u32 len;
-	s32 status;
-	u64 seq;
-	u64 reply_to;
-	u32 reserved;
-	u8 payload[];
-};
-
-struct client_comm_vmshm_info {
-	__u64 gpa;
-	__u64 size;
-	__u32 header_size;
-	__u32 queue_count;
-};
 
 struct client_comm_vmshm_dev {
 	void *base;
 	struct proxy_comm_vmshm_header *hdr;
+	/* Validated, private geometry and locally owned ring progress. */
+	struct proxy_comm_vmshm_queue_object queues[PROXY_COMM_VMSHM_MAX_QUEUES];
+	u32 tx_avail[PROXY_COMM_VMSHM_MAX_QUEUES];
+	u32 rx_used[PROXY_COMM_VMSHM_MAX_QUEUES];
 	phys_addr_t gpa;
 	resource_size_t size;
 	u32 client_vmid;
-	void __iomem *doorbell;
-	resource_size_t doorbell_size;
-	int irq;
 	bool irq_notify;
 	struct work_struct rx_work;
 	atomic64_t irq_last_ns;
@@ -214,7 +66,14 @@ struct client_comm_vmshm_dev {
 	struct device *dev;
 	struct mutex lock;
 	struct mutex rpc_lock;
-	atomic_t open_cnt;
+	struct mutex poll_lock;
+	u64 realm_poll_attempts;
+	u64 realm_poll_completed;
+	atomic64_t realm_sleep_arms;
+	refcount_t users;
+	struct device *owner;
+	bool quiescing;
+	const struct realm_xshm_transport *realm;
 	atomic64_t next_seq;
 };
 
@@ -304,6 +163,10 @@ static const char *client_comm_vmshm_req_name(u32 type)
 		return "BO_CREATE";
 	case PANTHOR_VMSHM_MSG_BO_DESTROY_REQ:
 		return "BO_DESTROY";
+	case PANTHOR_VMSHM_MSG_SNAPSHOT_RETIRE_REQ:
+		return "SNAPSHOT_RETIRE";
+	case PANTHOR_VMSHM_MSG_SYNCOBJ_SNAPSHOT_REQ:
+		return "SYNCOBJ_SNAPSHOT";
 	case PANTHOR_VMSHM_MSG_SYNCOBJ_CREATE_REQ:
 		return "SYNCOBJ_CREATE";
 	case PANTHOR_VMSHM_MSG_SYNCOBJ_DESTROY_REQ:
@@ -332,8 +195,10 @@ static const char *client_comm_vmshm_req_name(u32 type)
 		return "TILER_HEAP_CREATE";
 	case PANTHOR_VMSHM_MSG_TILER_HEAP_DESTROY_REQ:
 		return "TILER_HEAP_DESTROY";
-	case PANTHOR_VMSHM_MSG_GROUP_SUBMIT_REQ:
-		return "GROUP_SUBMIT";
+	case PANTHOR_VMSHM_MSG_PLAN_REGISTER_REQ:
+		return "PLAN_REGISTER";
+	case PANTHOR_VMSHM_MSG_PLAN_EXEC_REQ:
+		return "PLAN_EXEC";
 	default:
 		return "UNKNOWN";
 	}
@@ -497,6 +362,21 @@ module_param_cb(rpc_stats, &client_comm_vmshm_rpc_stats_param_ops,
 MODULE_PARM_DESC(rpc_stats,
 		 "Collect aggregated client-side vmshm RPC latency stats");
 
+/* Experiment: IRQ replies are matched by seq/type under waiters_lock.
+ * Queue publication still holds d->lock. Keep polling RPCs serialized since
+ * their caller consumes replies directly and could discard another reply.
+ */
+static bool client_comm_vmshm_concurrent_rpc;
+static unsigned int client_comm_vmshm_realm_poll_us;
+module_param_named(realm_poll_us, client_comm_vmshm_realm_poll_us, uint, 0444);
+MODULE_PARM_DESC(realm_poll_us,
+		 "Bounded Realm RPC caller response polling, 0 disables, max 1000 us");
+static atomic_t client_comm_vmshm_rpc_active = ATOMIC_INIT(0);
+static atomic_t client_comm_vmshm_rpc_peak = ATOMIC_INIT(0);
+module_param_named(concurrent_rpc, client_comm_vmshm_concurrent_rpc, bool, 0400);
+MODULE_PARM_DESC(concurrent_rpc,
+		 "Allow concurrent in-flight IRQ RPCs (experimental, default off)");
+
 static int
 client_comm_vmshm_rpc_timeout_param_set(const char *val,
 					const struct kernel_param *kp)
@@ -563,14 +443,10 @@ static void *client_comm_vmshm_ptr(struct client_comm_vmshm_dev *d,
 static struct proxy_comm_vmshm_queue_object *
 client_comm_vmshm_queue_obj(struct client_comm_vmshm_dev *d, u32 queue_id)
 {
-	struct proxy_comm_vmshm_header *h = d->hdr;
-	struct proxy_comm_vmshm_queue *q;
-
-	if (!h || queue_id >= h->queue_count)
+	if (queue_id >= PROXY_COMM_VMSHM_MAX_QUEUES ||
+	    d->queues[queue_id].magic != PROXY_COMM_VMSHM_QUEUE_MAGIC)
 		return NULL;
-
-	q = &h->queues[queue_id];
-	return client_comm_vmshm_ptr(d, q->queue_off, sizeof(*q));
+	return &d->queues[queue_id];
 }
 
 static struct proxy_comm_vmshm_desc *
@@ -603,38 +479,53 @@ client_comm_vmshm_used(struct client_comm_vmshm_dev *d,
 
 static int client_comm_vmshm_validate_layout(struct client_comm_vmshm_dev *d)
 {
-	struct proxy_comm_vmshm_header *h = d->hdr;
-	u32 table_size;
-	u32 i;
+	struct proxy_comm_vmshm_header snapshot, *h = &snapshot;
+	u32 table_size, i;
 
-	if (READ_ONCE(h->magic) != PROXY_COMM_VMSHM_MAGIC)
+	if (d->size < sizeof(snapshot))
 		return -EINVAL;
-	if (h->version != PROXY_COMM_VMSHM_VERSION ||
+	memcpy(h, d->hdr, sizeof(*h));
+	barrier();
+	if (h->magic != PROXY_COMM_VMSHM_MAGIC ||
+	    h->version != PROXY_COMM_VMSHM_VERSION ||
 	    h->header_size != sizeof(*h) ||
-	    h->queue_count != PROXY_COMM_VMSHM_MAX_QUEUES)
-		return -EINVAL;
-	if (h->total_size > d->size ||
+	    h->queue_count != PROXY_COMM_VMSHM_MAX_QUEUES ||
+	    h->total_size > d->size ||
 	    h->object_count > h->object_capacity ||
 	    h->object_capacity > PROXY_COMM_VMSHM_MAX_OBJECTS)
 		return -EINVAL;
-
 	table_size = h->object_capacity * sizeof(struct proxy_comm_vmshm_object);
-	if (!client_comm_vmshm_range_valid(d, h->object_table_off, table_size))
+	if (!client_comm_vmshm_range_valid(d, h->object_table_off, table_size) ||
+	    !client_comm_vmshm_range_valid(d, h->heap_base_off, h->heap_size))
 		return -EINVAL;
-	if (!client_comm_vmshm_range_valid(d, h->heap_base_off, h->heap_size))
-		return -EINVAL;
+	for (i = 0; i < PROXY_COMM_VMSHM_MAX_QUEUES; i++) {
+		struct proxy_comm_vmshm_queue_object *q = &d->queues[i];
+		void *shared = client_comm_vmshm_ptr(d, h->queues[i].queue_off,
+						 sizeof(*q));
 
-	for (i = 0; i < h->queue_count; i++) {
-		struct proxy_comm_vmshm_queue_object *q;
-
-		q = client_comm_vmshm_queue_obj(d, i);
-		if (!q || q->magic != PROXY_COMM_VMSHM_QUEUE_MAGIC ||
-		    q->queue_size != PROXY_COMM_VMSHM_QUEUE_SIZE ||
-		    q->msg_size != PROXY_COMM_VMSHM_MSG_SIZE ||
-		    !is_power_of_2(q->queue_size))
+		if (!shared)
 			return -EINVAL;
+		memcpy(q, shared, sizeof(*q));
+		barrier();
+		if (q->magic != PROXY_COMM_VMSHM_QUEUE_MAGIC ||
+		    q->queue_id != i || q->direction != i ||
+		    q->queue_size != PROXY_COMM_VMSHM_QUEUE_SIZE ||
+		    q->queue_mask != PROXY_COMM_VMSHM_QUEUE_SIZE - 1 ||
+		    q->msg_size != PROXY_COMM_VMSHM_MSG_SIZE ||
+		    !IS_ALIGNED(q->desc_off, 8) ||
+		    !IS_ALIGNED(q->avail_off, 4) ||
+		    !IS_ALIGNED(q->used_off, 4) ||
+		    !IS_ALIGNED(q->msg_pool_off, 8) ||
+		    !client_comm_vmshm_descs(d, q) ||
+		    !client_comm_vmshm_avail(d, q) ||
+		    !client_comm_vmshm_used(d, q) ||
+		    !client_comm_vmshm_ptr(d, q->msg_pool_off,
+					 q->queue_size * q->msg_size))
+			return -EINVAL;
+		if (smp_load_acquire(&client_comm_vmshm_avail(d, q)->idx) != 0 ||
+		    smp_load_acquire(&client_comm_vmshm_used(d, q)->idx) != 0)
+			return -EBUSY;
 	}
-
 	return 0;
 }
 
@@ -648,8 +539,10 @@ static int client_comm_vmshm_attach_layout(struct client_comm_vmshm_dev *d)
 		return -EOVERFLOW;
 
 	d->hdr = h;
+	memset(d->tx_avail, 0, sizeof(d->tx_avail));
+	memset(d->rx_used, 0, sizeof(d->rx_used));
 	for (i = 0; i < PROXY_COMM_VMSHM_INIT_RETRIES; i++) {
-		magic = READ_ONCE(h->magic);
+		magic = smp_load_acquire(&h->magic);
 		if (magic == PROXY_COMM_VMSHM_MAGIC) {
 			ret = client_comm_vmshm_validate_layout(d);
 			if (ret)
@@ -701,7 +594,7 @@ static int client_comm_vmshm_queue_send(struct client_comm_vmshm_dev *d,
 	if (!descs || !avail || !used)
 		return -EINVAL;
 
-	avail_idx = READ_ONCE(avail->idx);
+	avail_idx = d->tx_avail[queue_id];
 	used_idx = smp_load_acquire(&used->idx);
 	if (avail_idx - used_idx >= q->queue_size)
 		return -EAGAIN;
@@ -733,6 +626,7 @@ static int client_comm_vmshm_queue_send(struct client_comm_vmshm_dev *d,
 
 	smp_wmb();
 	WRITE_ONCE(avail->ring[ring_idx], desc_id);
+	d->tx_avail[queue_id] = avail_idx + 1;
 	smp_store_release(&avail->idx, avail_idx + 1);
 	return 0;
 }
@@ -742,10 +636,12 @@ static int client_comm_vmshm_queue_recv(struct client_comm_vmshm_dev *d,
 					struct vmshm_comm_rx *rx)
 {
 	struct proxy_comm_vmshm_queue_object *q;
-	struct proxy_comm_vmshm_desc *descs, *desc = NULL;
+	struct proxy_comm_vmshm_desc *descs, descriptor, *desc = &descriptor;
 	struct proxy_comm_vmshm_avail_ring *avail;
 	struct proxy_comm_vmshm_used_ring *used;
-	struct proxy_comm_vmshm_msg *msg = NULL;
+	u8 snapshot[PROXY_COMM_VMSHM_MSG_SIZE] __aligned(8);
+	struct proxy_comm_vmshm_msg *msg = (void *)snapshot;
+	void *shared;
 	u32 avail_idx, used_idx, ring_idx, desc_id, expected_msg_off;
 	int ret = -EINVAL;
 
@@ -763,18 +659,20 @@ static int client_comm_vmshm_queue_recv(struct client_comm_vmshm_dev *d,
 	if (!descs || !avail || !used)
 		return -EINVAL;
 
-	used_idx = READ_ONCE(used->idx);
+	used_idx = d->rx_used[queue_id];
 	avail_idx = smp_load_acquire(&avail->idx);
 	if (used_idx == avail_idx)
 		return -ENOENT;
+	if (avail_idx - used_idx > q->queue_size)
+		return -EPROTO;
 
 	ring_idx = used_idx & q->queue_mask;
 	desc_id = READ_ONCE(avail->ring[ring_idx]);
 	if (desc_id >= q->queue_size)
 		goto out_used;
 
-	desc = &descs[desc_id];
-	smp_rmb();
+	memcpy(desc, &descs[desc_id], sizeof(*desc));
+	barrier();
 
 	expected_msg_off = q->msg_pool_off + desc_id * q->msg_size;
 	if (desc->msg_off != expected_msg_off ||
@@ -783,17 +681,22 @@ static int client_comm_vmshm_queue_recv(struct client_comm_vmshm_dev *d,
 	    desc->msg_len > q->msg_size)
 		goto out_used;
 
-	msg = client_comm_vmshm_ptr(d, desc->msg_off, desc->msg_len);
-	if (!msg)
+	shared = client_comm_vmshm_ptr(d, expected_msg_off, sizeof(snapshot));
+	if (!shared)
 		goto out_used;
+	/* Copy a fixed bounded slot before inspecting peer-controlled lengths. */
+	memcpy(snapshot, shared, sizeof(snapshot));
+	barrier();
 
 	if (msg->len > q->msg_size - sizeof(*msg) ||
 	    sizeof(*msg) + msg->len != desc->msg_len)
 		goto out_used;
 
 	if (msg->len) {
-		if (!rx->payload || msg->len > rx->payload_capacity)
-			return -EMSGSIZE;
+		if (!rx->payload || msg->len > rx->payload_capacity) {
+			ret = -EMSGSIZE;
+			goto out_used;
+		}
 		memcpy(rx->payload, msg->payload, msg->len);
 	}
 
@@ -809,6 +712,7 @@ out_used:
 	used->ring[ring_idx].desc_id = desc_id;
 	used->ring[ring_idx].status = ret;
 	used->ring[ring_idx].len = ret ? 0 : desc->msg_len;
+	d->rx_used[queue_id] = used_idx + 1;
 	smp_store_release(&used->idx, used_idx + 1);
 	return ret;
 }
@@ -817,11 +721,53 @@ static bool client_comm_vmshm_ready_locked(struct client_comm_vmshm_dev *d)
 {
 	struct proxy_comm_vmshm_header *h = d->hdr;
 
-	return d->base && h &&
+	return !READ_ONCE(d->quiescing) && d->base && h &&
 	       READ_ONCE(h->magic) == PROXY_COMM_VMSHM_MAGIC &&
 	       READ_ONCE(h->status[PROXY_COMM_VMSHM_ROLE_CLIENT]) ==
 		       PROXY_COMM_VMSHM_STATUS_READY;
 }
+
+/* A consumer holds this from before opening its remote session until its
+ * last local file/VMA and remote resources have been released. */
+bool client_comm_vmshm_get(void)
+{
+	struct client_comm_vmshm_dev *d = &client_comm_vmshm_dev;
+	bool ready;
+
+	mutex_lock(&d->lock);
+	ready = client_comm_vmshm_ready_locked(d);
+	if (ready)
+		refcount_inc(&d->users);
+	mutex_unlock(&d->lock);
+	return ready;
+}
+EXPORT_SYMBOL_GPL(client_comm_vmshm_get);
+
+void client_comm_vmshm_put(void)
+{
+	refcount_dec(&client_comm_vmshm_dev.users);
+}
+EXPORT_SYMBOL_GPL(client_comm_vmshm_put);
+
+int client_comm_vmshm_quiesce(struct device *dev)
+{
+	struct client_comm_vmshm_dev *d = &client_comm_vmshm_dev;
+	int ret = 0;
+
+	/* RPCs take rpc_lock before the ring lock. Keep the same ordering. */
+	mutex_lock(&d->rpc_lock);
+	mutex_lock(&d->lock);
+	if (d->owner != dev || !d->base)
+		ret = -ENODEV;
+	else if (refcount_read(&d->users) != 1)
+		ret = -EBUSY;
+	else
+		WRITE_ONCE(d->quiescing, true);
+	mutex_unlock(&d->lock);
+	mutex_unlock(&d->rpc_lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(client_comm_vmshm_quiesce);
 
 static void
 client_comm_vmshm_record_irq_work_latency(struct client_comm_vmshm_dev *d)
@@ -843,31 +789,13 @@ client_comm_vmshm_record_irq_work_latency(struct client_comm_vmshm_dev *d)
 
 static void client_comm_vmshm_kick_proxy(struct client_comm_vmshm_dev *d)
 {
-	if (d->irq_notify && d->doorbell)
-		writel(1, d->doorbell);
+	d->realm->notify(d->realm->channel);
 }
 
-bool client_comm_vmshm_ready(void)
+static bool client_comm_vmshm_ready(void)
 {
 	return client_comm_vmshm_ready_locked(&client_comm_vmshm_dev);
 }
-EXPORT_SYMBOL_GPL(client_comm_vmshm_ready);
-
-u32 client_comm_vmshm_max_payload(void)
-{
-	struct client_comm_vmshm_dev *d = &client_comm_vmshm_dev;
-	struct proxy_comm_vmshm_queue_object *q;
-
-	if (!client_comm_vmshm_ready_locked(d))
-		return 0;
-
-	q = client_comm_vmshm_queue_obj(d, PROXY_COMM_VMSHM_Q_CLIENT_TO_PROXY);
-	if (!q || q->msg_size <= sizeof(struct proxy_comm_vmshm_msg))
-		return 0;
-
-	return q->msg_size - sizeof(struct proxy_comm_vmshm_msg);
-}
-EXPORT_SYMBOL_GPL(client_comm_vmshm_max_payload);
 
 u32 client_comm_vmshm_client_vmid(void)
 {
@@ -875,7 +803,7 @@ u32 client_comm_vmshm_client_vmid(void)
 }
 EXPORT_SYMBOL_GPL(client_comm_vmshm_client_vmid);
 
-int client_comm_vmshm_send_to_proxy(const struct vmshm_comm_tx *tx)
+static int client_comm_vmshm_send_to_proxy(const struct vmshm_comm_tx *tx)
 {
 	struct client_comm_vmshm_dev *d = &client_comm_vmshm_dev;
 	int ret;
@@ -896,9 +824,8 @@ out_unlock:
 	mutex_unlock(&d->lock);
 	return ret;
 }
-EXPORT_SYMBOL_GPL(client_comm_vmshm_send_to_proxy);
 
-int client_comm_vmshm_recv_from_proxy(struct vmshm_comm_rx *rx)
+static int client_comm_vmshm_recv_from_proxy(struct vmshm_comm_rx *rx)
 {
 	struct client_comm_vmshm_dev *d = &client_comm_vmshm_dev;
 	int ret;
@@ -917,73 +844,169 @@ out_unlock:
 	mutex_unlock(&d->lock);
 	return ret;
 }
-EXPORT_SYMBOL_GPL(client_comm_vmshm_recv_from_proxy);
+
+/* Queue removal is serialized by d->lock; each dispatcher owns a private
+ * snapshot. Reply delivery/removal and stack waiter lifetime use waiters_lock.
+ */
+static int client_comm_vmshm_dispatch_response(struct client_comm_vmshm_dev *d)
+{
+	u8 payload[PROXY_COMM_VMSHM_MSG_SIZE - sizeof(struct proxy_comm_vmshm_msg)] = {};
+	struct vmshm_comm_rx rx = {
+		.payload = payload,
+		.payload_capacity = sizeof(payload),
+	};
+	struct client_comm_vmshm_waiter *waiter;
+	int ret = client_comm_vmshm_recv_from_proxy(&rx);
+
+	if (ret)
+		return ret;
+
+	spin_lock(&d->waiters_lock);
+	list_for_each_entry(waiter, &d->waiters, node) {
+		if (waiter->seq == rx.reply_to &&
+		    waiter->rsp_type == rx.type)
+			goto found_waiter;
+	}
+	waiter = NULL;
+
+found_waiter:
+	if (waiter) {
+		if (rx.len > waiter->rsp_payload_capacity) {
+			waiter->status = -EMSGSIZE;
+		} else {
+			if (rx.len)
+				memcpy(waiter->rsp_payload, payload, rx.len);
+			waiter->rsp_rx = rx;
+			waiter->rsp_rx.payload = waiter->rsp_payload;
+			waiter->rsp_rx.payload_capacity =
+				waiter->rsp_payload_capacity;
+			waiter->status = 0;
+		}
+		list_del_init(&waiter->node);
+		complete(&waiter->done);
+	}
+	spin_unlock(&d->waiters_lock);
+
+	if (!waiter)
+		pr_info_ratelimited("client_comm_vmshm: dropping unexpected rsp type=0x%x reply_to=%llu status=%d len=%u\n",
+				    rx.type, rx.reply_to, rx.status,
+				    rx.len);
+	return 0;
+}
 
 static void client_comm_vmshm_rx_work(struct work_struct *work)
 {
 	struct client_comm_vmshm_dev *d =
 		container_of(work, struct client_comm_vmshm_dev, rx_work);
-	u8 payload[PROXY_COMM_VMSHM_MSG_SIZE - sizeof(struct proxy_comm_vmshm_msg)];
-	struct vmshm_comm_rx rx = {
-		.payload = payload,
-		.payload_capacity = sizeof(payload),
-	};
-	struct client_comm_vmshm_waiter *waiter = NULL;
+	bool rechecked = false;
 	int ret;
 
 	client_comm_vmshm_record_irq_work_latency(d);
-
 	for (;;) {
-		memset(payload, 0, sizeof(payload));
-		ret = client_comm_vmshm_recv_from_proxy(&rx);
+		ret = client_comm_vmshm_dispatch_response(d);
+		if (ret == -ENOENT && d->realm && d->irq_notify && !rechecked) {
+			ret = d->realm->arm(d->realm->channel);
+			if (ret < 0)
+				break;
+			rechecked = ret == 1;
+			continue;
+		}
 		if (ret == -ENOENT || ret == -ENODEV)
 			break;
+		rechecked = false;
 		if (ret) {
-			pr_warn_ratelimited("client_comm_vmshm: IRQ recv failed (%d)\n",
-					    ret);
+			pr_warn_ratelimited("client_comm_vmshm: IRQ recv failed (%d)\n", ret);
 			break;
 		}
-
-		spin_lock(&d->waiters_lock);
-		list_for_each_entry(waiter, &d->waiters, node) {
-			if (waiter->seq == rx.reply_to &&
-			    waiter->rsp_type == rx.type)
-				goto found_waiter;
-		}
-		waiter = NULL;
-
-found_waiter:
-		if (waiter) {
-			if (rx.len > waiter->rsp_payload_capacity) {
-				waiter->status = -EMSGSIZE;
-			} else {
-				if (rx.len)
-					memcpy(waiter->rsp_payload, payload, rx.len);
-				waiter->rsp_rx = rx;
-				waiter->rsp_rx.payload = waiter->rsp_payload;
-				waiter->rsp_rx.payload_capacity =
-					waiter->rsp_payload_capacity;
-				waiter->status = 0;
-			}
-			list_del_init(&waiter->node);
-			complete(&waiter->done);
-		}
-		spin_unlock(&d->waiters_lock);
-
-		if (!waiter)
-			pr_info_ratelimited("client_comm_vmshm: dropping unexpected rsp type=0x%x reply_to=%llu status=%d len=%u\n",
-					    rx.type, rx.reply_to, rx.status,
-					    rx.len);
 	}
 }
 
-static irqreturn_t client_comm_vmshm_irq(int irq, void *data)
+/* RPC callers retain the channel reference across this window. Only one
+ * caller owns the hint. IRQ work can dispatch concurrently through the same
+ * queue and waiter locks; it never changes the polling owner's hint.
+ */
+static void client_comm_vmshm_poll_response(struct client_comm_vmshm_dev *d,
+					  struct client_comm_vmshm_waiter *waiter)
+{
+	unsigned int budget = min(READ_ONCE(client_comm_vmshm_realm_poll_us), 1000U);
+	struct proxy_comm_vmshm_used_ring *used = NULL;
+	u64 deadline;
+	int ret;
+
+	if (!budget || !d->realm || !d->irq_notify || completion_done(&waiter->done) ||
+	    !mutex_trylock(&d->poll_lock))
+		return;
+
+	mutex_lock(&d->lock);
+	if (client_comm_vmshm_ready_locked(d)) {
+		struct proxy_comm_vmshm_queue_object *q =
+			client_comm_vmshm_queue_obj(d, PROXY_COMM_VMSHM_Q_PROXY_TO_CLIENT);
+
+		if (q)
+			used = client_comm_vmshm_used(d, q);
+		if (used) {
+			WRITE_ONCE(used->flags, PROXY_COMM_VMSHM_USED_NO_NOTIFY);
+			smp_mb();
+		}
+	}
+	mutex_unlock(&d->lock);
+	if (!used)
+		goto out_unlock;
+
+	d->realm_poll_attempts++;
+	deadline = ktime_get_ns() + budget * NSEC_PER_USEC;
+	while (!completion_done(&waiter->done) && !need_resched() &&
+	       ktime_get_ns() < deadline) {
+		ret = client_comm_vmshm_dispatch_response(d);
+		if (ret && ret != -ENOENT)
+			break;
+		if (ret == -ENOENT)
+			cpu_relax();
+	}
+
+	/* Restore notifications and acquire-recheck even when our reply is done.
+	 * The caller arms the trusted event only if it still needs to sleep.
+	 * Other waiting callers independently arm before sleeping; their replies
+	 * can also be dispatched here through the shared waiter lock.
+	 */
+	WRITE_ONCE(used->flags, 0);
+	smp_mb();
+	do {
+		ret = client_comm_vmshm_dispatch_response(d);
+	} while (!ret);
+	if (completion_done(&waiter->done))
+		d->realm_poll_completed++;
+out_unlock:
+	mutex_unlock(&d->poll_lock);
+}
+
+/* A completed RPC needs no further wakeup. Every incomplete caller must
+ * ARM and then acquire-recheck before sleeping, including callers that could
+ * not take poll_lock. Never infer our completion from another waiter's reply.
+ */
+static void client_comm_vmshm_prepare_response_wait(struct client_comm_vmshm_dev *d,
+						 struct client_comm_vmshm_waiter *waiter)
+{
+	int ret;
+
+	if (!READ_ONCE(client_comm_vmshm_realm_poll_us) || !d->realm ||
+	    !d->irq_notify || completion_done(&waiter->done))
+		return;
+
+	atomic64_inc(&d->realm_sleep_arms);
+	if (d->realm->arm(d->realm->channel) >= 0) {
+		do {
+			ret = client_comm_vmshm_dispatch_response(d);
+		} while (!ret);
+	}
+}
+
+static void client_comm_vmshm_receive(void *data)
 {
 	struct client_comm_vmshm_dev *d = data;
 
 	atomic64_set(&d->irq_last_ns, ktime_get_ns());
 	schedule_work(&d->rx_work);
-	return IRQ_HANDLED;
 }
 
 int client_comm_vmshm_call(u32 req_type, u32 req_flags,
@@ -1002,13 +1025,14 @@ int client_comm_vmshm_call(u32 req_type, u32 req_flags,
 	u64 seq;
 	int ret;
 	unsigned int timeout_ms;
-	unsigned long rpc_poll_deadline;
 	bool stats_enabled = client_comm_vmshm_rpc_stats_is_enabled();
+	bool serialize = !client_comm_vmshm_concurrent_rpc;
 	u64 total_start_ns = 0, lock_start_ns = 0, send_start_ns;
-	u64 wait_start_ns, recv_start_ns;
+	u64 wait_start_ns;
 	struct client_comm_vmshm_rpc_sample sample = {
 		.req_type = req_type,
 	};
+	bool track_concurrency = stats_enabled && !serialize;
 
 	if (req_len && !req_payload)
 		return -EINVAL;
@@ -1019,9 +1043,24 @@ int client_comm_vmshm_call(u32 req_type, u32 req_flags,
 		total_start_ns = ktime_get_ns();
 		lock_start_ns = total_start_ns;
 	}
-	mutex_lock(&d->rpc_lock);
-	if (stats_enabled)
-		sample.lock_wait_ns = ktime_get_ns() - lock_start_ns;
+	if (serialize) {
+		mutex_lock(&d->rpc_lock);
+		if (stats_enabled)
+			sample.lock_wait_ns = ktime_get_ns() - lock_start_ns;
+	}
+	if (track_concurrency) {
+		int active = atomic_inc_return(&client_comm_vmshm_rpc_active);
+		int peak = atomic_read(&client_comm_vmshm_rpc_peak);
+
+		while (active > peak) {
+			int old = atomic_cmpxchg(&client_comm_vmshm_rpc_peak,
+						peak, active);
+
+			if (old == peak)
+				break;
+			peak = old;
+		}
+	}
 	if (!client_comm_vmshm_ready()) {
 		ret = -ENODEV;
 		goto out_unlock;
@@ -1031,7 +1070,7 @@ int client_comm_vmshm_call(u32 req_type, u32 req_flags,
 	tx.seq = seq;
 	timeout_ms = client_comm_vmshm_rpc_timeout();
 
-	if (d->irq_notify) {
+	{
 		struct client_comm_vmshm_waiter waiter = {
 			.seq = seq,
 			.rsp_type = rsp_type,
@@ -1039,7 +1078,7 @@ int client_comm_vmshm_call(u32 req_type, u32 req_flags,
 			.rsp_payload_capacity = rsp_payload_capacity,
 			.status = -ETIMEDOUT,
 		};
-		unsigned long timeout;
+		unsigned long timeout, expires;
 
 		INIT_LIST_HEAD(&waiter.node);
 		init_completion(&waiter.done);
@@ -1063,16 +1102,20 @@ int client_comm_vmshm_call(u32 req_type, u32 req_flags,
 		}
 
 		timeout = msecs_to_jiffies(timeout_ms);
+		expires = jiffies + timeout;
 		wait_start_ns = stats_enabled ? ktime_get_ns() : 0;
+		client_comm_vmshm_poll_response(d, &waiter);
+		client_comm_vmshm_prepare_response_wait(d, &waiter);
+		timeout = time_before(jiffies, expires) ? expires - jiffies : 0;
 		if (!wait_for_completion_timeout(&waiter.done, timeout)) {
 			bool completed;
 
 			if (stats_enabled)
 				sample.wait_ns += ktime_get_ns() - wait_start_ns;
 			spin_lock(&d->waiters_lock);
+			completed = list_empty(&waiter.node);
 			if (!list_empty(&waiter.node))
 				list_del_init(&waiter.node);
-			completed = list_empty(&waiter.node);
 			spin_unlock(&d->waiters_lock);
 
 			ret = completed ? waiter.status : -ETIMEDOUT;
@@ -1093,53 +1136,11 @@ int client_comm_vmshm_call(u32 req_type, u32 req_flags,
 		goto out_unlock;
 	}
 
-	send_start_ns = stats_enabled ? ktime_get_ns() : 0;
-	ret = client_comm_vmshm_send_to_proxy(&tx);
-	if (stats_enabled)
-		sample.send_ns += ktime_get_ns() - send_start_ns;
-	if (ret)
-		goto out_unlock;
-
-	rpc_poll_deadline = jiffies + msecs_to_jiffies(timeout_ms);
-	while (time_before(jiffies, rpc_poll_deadline)) {
-		struct vmshm_comm_rx rx = {
-			.payload = rsp_payload,
-			.payload_capacity = rsp_payload_capacity,
-		};
-
-		if (rsp_payload && rsp_payload_capacity)
-			memset(rsp_payload, 0, rsp_payload_capacity);
-
-		recv_start_ns = stats_enabled ? ktime_get_ns() : 0;
-		ret = client_comm_vmshm_recv_from_proxy(&rx);
-		if (stats_enabled)
-			sample.poll_recv_ns += ktime_get_ns() - recv_start_ns;
-		if (ret == -ENOENT) {
-			if (stats_enabled)
-				sample.poll_sleeps++;
-			usleep_range(CLIENT_COMM_VMSHM_RPC_WAIT_US,
-				     CLIENT_COMM_VMSHM_RPC_WAIT_US * 2);
-			continue;
-		}
-		if (ret)
-			goto out_unlock;
-
-		if (rx.type != rsp_type || rx.reply_to != seq)
-			continue;
-
-		if (rsp_rx)
-			*rsp_rx = rx;
-		ret = 0;
-		goto out_unlock;
-	}
-
-	ret = -ETIMEDOUT;
-	pr_warn_ratelimited("client_comm_vmshm: RPC poll timeout op=%s req_type=0x%x seq=%llu timeout_ms=%u\n",
-			    client_comm_vmshm_req_name(req_type), req_type,
-			    seq, timeout_ms);
-
 out_unlock:
-	mutex_unlock(&d->rpc_lock);
+	if (serialize)
+		mutex_unlock(&d->rpc_lock);
+	if (track_concurrency)
+		atomic_dec(&client_comm_vmshm_rpc_active);
 	if (stats_enabled) {
 		sample.ret = ret;
 		sample.total_ns = ktime_get_ns() - total_start_ns;
@@ -1147,6 +1148,10 @@ out_unlock:
 		if (req_type == PANTHOR_VMSHM_MSG_CLOSE_SESSION_REQ)
 			client_comm_vmshm_rpc_stats_dump_current_if_enabled(
 				"panthor-close-session");
+		if (track_concurrency &&
+		    req_type == PANTHOR_VMSHM_MSG_CLOSE_SESSION_REQ)
+			pr_info("client_comm_vmshm: RPC_CONCURRENCY peak=%d\n",
+				atomic_read(&client_comm_vmshm_rpc_peak));
 	}
 	return ret;
 }
@@ -1382,58 +1387,30 @@ static int client_comm_vmshm_perf_selftest_run(void)
 }
 #endif
 
-static void client_comm_vmshm_notify_init(struct platform_device *pdev,
-					  struct client_comm_vmshm_dev *d)
+static int client_comm_vmshm_notify_init(struct platform_device *pdev,
+                                          struct client_comm_vmshm_dev *d)
 {
-	struct device_node *np = pdev->dev.of_node;
-	u64 doorbell[2];
-	int irq, ret;
+	int ret = d->realm->subscribe(d->realm->channel, client_comm_vmshm_receive, d);
 
-	if (!np ||
-	    of_property_read_u64_array(np, "vmshm-doorbell-reg", doorbell, 2)) {
-		dev_info(&pdev->dev,
-			 "irq notify unavailable, falling back to polling\n");
-		return;
-	}
-
-	irq = platform_get_irq_optional(pdev, 0);
-	if (irq < 0) {
-		dev_info(&pdev->dev,
-			 "missing irq for notify, falling back to polling\n");
-		return;
-	}
-
-	d->doorbell = devm_ioremap(&pdev->dev, doorbell[0], doorbell[1]);
-	if (!d->doorbell) {
-		dev_info(&pdev->dev,
-			 "doorbell ioremap failed, falling back to polling\n");
-		return;
-	}
-
-	ret = devm_request_irq(&pdev->dev, irq, client_comm_vmshm_irq, 0,
-			       CLIENT_COMM_VMSHM_NAME, d);
-	if (ret) {
-		dev_info(&pdev->dev,
-			 "request_irq failed (%d), falling back to polling\n",
-			 ret);
-		d->doorbell = NULL;
-		return;
-	}
-
-	d->irq = irq;
-	d->doorbell_size = doorbell[1];
+	if (ret)
+		return ret;
 	d->irq_notify = true;
-	dev_info(&pdev->dev,
-		 "irq notify enabled irq=%d doorbell=0x%llx size=0x%llx\n",
-		 irq, doorbell[0], doorbell[1]);
+	dev_info(&pdev->dev, "RMM event IRQ enabled channel=%llu\n", d->realm->channel);
+	schedule_work(&d->rx_work);
+	return 0;
+}
+
+static void client_comm_vmshm_notify_stop(struct platform_device *pdev,
+                                         struct client_comm_vmshm_dev *d)
+{
+	if (d->irq_notify)
+		d->realm->unsubscribe(d->realm->channel);
 }
 
 static int client_comm_vmshm_open(struct inode *inode, struct file *filp)
 {
-	if (atomic_inc_return(&client_comm_vmshm_dev.open_cnt) < 0) {
-		atomic_dec(&client_comm_vmshm_dev.open_cnt);
-		return -EMFILE;
-	}
+	if (!client_comm_vmshm_get())
+		return -ENODEV;
 
 	filp->private_data = &client_comm_vmshm_dev;
 	return 0;
@@ -1441,153 +1418,52 @@ static int client_comm_vmshm_open(struct inode *inode, struct file *filp)
 
 static int client_comm_vmshm_release(struct inode *inode, struct file *filp)
 {
-	atomic_dec(&client_comm_vmshm_dev.open_cnt);
+	client_comm_vmshm_put();
 	return 0;
-}
-
-static loff_t client_comm_vmshm_llseek(struct file *filp, loff_t offset,
-				       int whence)
-{
-	loff_t newpos;
-
-	switch (whence) {
-	case SEEK_SET:
-		newpos = offset;
-		break;
-	case SEEK_CUR:
-		newpos = filp->f_pos + offset;
-		break;
-	case SEEK_END:
-		newpos = client_comm_vmshm_dev.size + offset;
-		break;
-	default:
-		return -EINVAL;
-	}
-
-	if (newpos < 0 || newpos > client_comm_vmshm_dev.size)
-		return -EINVAL;
-
-	filp->f_pos = newpos;
-	return newpos;
-}
-
-static ssize_t client_comm_vmshm_read(struct file *filp, char __user *buf,
-				      size_t count, loff_t *ppos)
-{
-	loff_t pos = *ppos;
-	size_t avail;
-
-	if (pos >= client_comm_vmshm_dev.size)
-		return 0;
-
-	avail = client_comm_vmshm_dev.size - pos;
-	if (count > avail)
-		count = avail;
-
-	mutex_lock(&client_comm_vmshm_dev.lock);
-	if (copy_to_user(buf, (u8 *)client_comm_vmshm_dev.base + pos, count))
-		count = -EFAULT;
-	else
-		*ppos = pos + count;
-	mutex_unlock(&client_comm_vmshm_dev.lock);
-
-	return count;
-}
-
-static ssize_t client_comm_vmshm_write(struct file *filp,
-				       const char __user *buf,
-				       size_t count, loff_t *ppos)
-{
-	loff_t pos = *ppos;
-	size_t avail;
-
-	if (pos >= client_comm_vmshm_dev.size)
-		return -ENOSPC;
-
-	avail = client_comm_vmshm_dev.size - pos;
-	if (count > avail)
-		count = avail;
-
-	mutex_lock(&client_comm_vmshm_dev.lock);
-	if (copy_from_user((u8 *)client_comm_vmshm_dev.base + pos, buf, count))
-		count = -EFAULT;
-	else
-		*ppos = pos + count;
-	mutex_unlock(&client_comm_vmshm_dev.lock);
-
-	return count;
-}
-
-static long client_comm_vmshm_ioctl(struct file *filp, unsigned int cmd,
-				    unsigned long arg)
-{
-	switch (cmd) {
-	case CLIENT_COMM_VMSHM_IOC_GET_SIZE: {
-		__u64 sz = client_comm_vmshm_dev.size;
-
-		if (copy_to_user((__u64 __user *)arg, &sz, sizeof(sz)))
-			return -EFAULT;
-		return 0;
-	}
-	case CLIENT_COMM_VMSHM_IOC_GET_BASE: {
-		__u64 base = client_comm_vmshm_dev.gpa;
-
-		if (copy_to_user((__u64 __user *)arg, &base, sizeof(base)))
-			return -EFAULT;
-		return 0;
-	}
-	case CLIENT_COMM_VMSHM_IOC_GET_INFO: {
-		struct client_comm_vmshm_info info = {
-			.gpa = client_comm_vmshm_dev.gpa,
-			.size = client_comm_vmshm_dev.size,
-			.header_size = sizeof(struct proxy_comm_vmshm_header),
-			.queue_count = PROXY_COMM_VMSHM_MAX_QUEUES,
-		};
-
-		if (copy_to_user((void __user *)arg, &info, sizeof(info)))
-			return -EFAULT;
-		return 0;
-	}
-	default:
-		return -ENOTTY;
-	}
 }
 
 static const struct file_operations client_comm_vmshm_fops = {
 	.owner		= THIS_MODULE,
 	.open		= client_comm_vmshm_open,
 	.release	= client_comm_vmshm_release,
-	.read		= client_comm_vmshm_read,
-	.write		= client_comm_vmshm_write,
-	.llseek		= client_comm_vmshm_llseek,
-	.unlocked_ioctl = client_comm_vmshm_ioctl,
 };
 
 static int client_comm_vmshm_probe(struct platform_device *pdev)
 {
+	const struct realm_xshm_transport *realm = dev_get_platdata(&pdev->dev);
 	struct resource *res;
 	int ret;
 
+	if (client_comm_vmshm_dev.base)
+		return -EBUSY;
+	/* Realm mappings must come from the kernel's authenticated RMM grant,
+	 * never from Host-supplied memslots/device-tree identifiers. */
+	if (!is_realm_world() || !realm || !realm->client_vmid ||
+				!realm->channel || !realm->notify || !realm->subscribe ||
+				!realm->unsubscribe || !realm->arm)
+		return -EPERM;
+
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	if (!res) {
-		dev_err(&pdev->dev, "missing 'reg' resource in DT node\n");
+		dev_err(&pdev->dev, "missing authenticated pool resource\n");
 		return -ENODEV;
 	}
 
 	client_comm_vmshm_dev.gpa = res->start;
 	client_comm_vmshm_dev.size = resource_size(res);
-	if (pdev->dev.of_node)
-		of_property_read_u32(pdev->dev.of_node, "vmshm-client-vmid",
-				     &client_comm_vmshm_dev.client_vmid);
-	if (!client_comm_vmshm_dev.client_vmid)
-		client_comm_vmshm_dev.client_vmid = 1;
+	client_comm_vmshm_dev.client_vmid = realm->client_vmid;
+	client_comm_vmshm_dev.realm = realm;
 	mutex_init(&client_comm_vmshm_dev.lock);
 	mutex_init(&client_comm_vmshm_dev.rpc_lock);
-	atomic_set(&client_comm_vmshm_dev.open_cnt, 0);
+	mutex_init(&client_comm_vmshm_dev.poll_lock);
+	client_comm_vmshm_dev.realm_poll_attempts = 0;
+	client_comm_vmshm_dev.realm_poll_completed = 0;
+	atomic64_set(&client_comm_vmshm_dev.realm_sleep_arms, 0);
+	refcount_set(&client_comm_vmshm_dev.users, 1);
+	client_comm_vmshm_dev.owner = &pdev->dev;
+	client_comm_vmshm_dev.quiescing = false;
 	atomic64_set(&client_comm_vmshm_dev.next_seq, 0);
 	client_comm_vmshm_dev.irq_notify = false;
-	client_comm_vmshm_dev.doorbell = NULL;
-	client_comm_vmshm_dev.irq = -1;
 	INIT_WORK(&client_comm_vmshm_dev.rx_work, client_comm_vmshm_rx_work);
 	INIT_LIST_HEAD(&client_comm_vmshm_dev.waiters);
 	spin_lock_init(&client_comm_vmshm_dev.waiters_lock);
@@ -1617,7 +1493,9 @@ static int client_comm_vmshm_probe(struct platform_device *pdev)
 		goto err_unmap;
 	}
 
-	client_comm_vmshm_notify_init(pdev, &client_comm_vmshm_dev);
+	ret = client_comm_vmshm_notify_init(pdev, &client_comm_vmshm_dev);
+	if (ret)
+		goto err_unmap;
 
 	dev_info(&pdev->dev,
 		 "attached protocol generation=%u objects=%u heap=[0x%x,0x%x]\n",
@@ -1679,22 +1557,43 @@ err_cdev_del:
 err_unregister_chrdev:
 	unregister_chrdev_region(client_comm_vmshm_dev.devt, 1);
 err_unmap:
+	client_comm_vmshm_notify_stop(pdev, &client_comm_vmshm_dev);
 	cancel_work_sync(&client_comm_vmshm_dev.rx_work);
 	memunmap(client_comm_vmshm_dev.base);
 	client_comm_vmshm_dev.base = NULL;
 	return ret;
 }
 
-static const struct of_device_id client_comm_vmshm_of_match[] = {
-	{ .compatible = "client_comm_vmshm" },
-	{ }
-};
+static void client_comm_vmshm_remove(struct platform_device *pdev)
+{
+	struct client_comm_vmshm_dev *d = &client_comm_vmshm_dev;
+
+	/* The trusted owner must have successfully quiesced before unregister. */
+	WARN_ON(refcount_read(&d->users) != 1 || !d->quiescing);
+	client_comm_vmshm_notify_stop(pdev, d);
+	cancel_work_sync(&d->rx_work);
+	if (d->realm)
+		dev_info(&pdev->dev, "[REALM_RESPONSE_POLL_STATS] attempts=%llu completed_before_sleep=%llu arms_before_sleep=%lld\n",
+			 d->realm_poll_attempts, d->realm_poll_completed,
+			 atomic64_read(&d->realm_sleep_arms));
+	device_destroy(d->class, d->devt);
+	class_destroy(d->class);
+	cdev_del(&d->cdev);
+	unregister_chrdev_region(d->devt, 1);
+	mutex_lock(&d->lock);
+	memunmap(d->base);
+	d->base = NULL;
+	d->hdr = NULL;
+	d->owner = NULL;
+	mutex_unlock(&d->lock);
+}
 
 static struct platform_driver client_comm_vmshm_driver = {
 	.probe = client_comm_vmshm_probe,
+	.remove_new = client_comm_vmshm_remove,
 	.driver = {
 		.name = CLIENT_COMM_VMSHM_NAME,
-		.of_match_table = client_comm_vmshm_of_match,
+		.suppress_bind_attrs = true,
 	},
 };
 

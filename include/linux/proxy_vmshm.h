@@ -64,15 +64,14 @@ struct proxy_vmshm_span {
 };
 
 #if IS_ENABLED(CONFIG_PROXY_VMSHM_MANAGER) || defined(PROXY_VMSHM_MANAGER_BUILD)
+int proxy_vmshm_manager_register_domain(u32 owner_vmid, void *base,
+				      phys_addr_t gpa, size_t size);
+int proxy_vmshm_manager_unregister_domain(u32 owner_vmid, void *base);
 struct proxy_vmshm_object *
 proxy_vmshm_alloc_ext(const struct proxy_vmshm_alloc_params *params,
 		      gfp_t gfp);
-struct proxy_vmshm_object *proxy_vmshm_alloc(size_t size, gfp_t gfp);
 void proxy_vmshm_free(struct proxy_vmshm_object *obj);
-int proxy_vmshm_free_handle(u64 handle, u32 requester_vmid);
 
-bool proxy_vmshm_get(struct proxy_vmshm_object *obj);
-void proxy_vmshm_put(struct proxy_vmshm_object *obj);
 int proxy_vmshm_pin(struct proxy_vmshm_object *obj);
 void proxy_vmshm_unpin(struct proxy_vmshm_object *obj);
 
@@ -83,18 +82,12 @@ void proxy_vmshm_unpin(struct proxy_vmshm_object *obj);
 int proxy_vmshm_lookup_pin(u64 handle, u32 requester_vmid,
 			   u32 required_perms,
 			   struct proxy_vmshm_object **out);
-int proxy_vmshm_lookup(u64 handle, u32 requester_vmid, u32 required_perms,
-		       struct proxy_vmshm_object **out);
 
 u64 proxy_vmshm_obj_handle(struct proxy_vmshm_object *obj);
 u32 proxy_vmshm_obj_id(struct proxy_vmshm_object *obj);
 u32 proxy_vmshm_obj_generation(struct proxy_vmshm_object *obj);
-u32 proxy_vmshm_obj_type(struct proxy_vmshm_object *obj);
 u32 proxy_vmshm_obj_owner_vmid(struct proxy_vmshm_object *obj);
-u32 proxy_vmshm_obj_perms(struct proxy_vmshm_object *obj);
-unsigned int proxy_vmshm_obj_order(struct proxy_vmshm_object *obj);
 void *proxy_vmshm_obj_kva(struct proxy_vmshm_object *obj);
-phys_addr_t proxy_vmshm_obj_gpa(struct proxy_vmshm_object *obj);
 u64 proxy_vmshm_obj_offset(struct proxy_vmshm_object *obj);
 size_t proxy_vmshm_obj_size(struct proxy_vmshm_object *obj);
 size_t proxy_vmshm_obj_alloc_size(struct proxy_vmshm_object *obj);
@@ -126,11 +119,18 @@ int proxy_vmshm_grant_create(struct proxy_vmshm_object *obj, u32 target_vmid,
 int proxy_vmshm_grant_lookup_pin(u64 grant_id, u32 requester_vmid,
 				 u32 required_perms,
 				 struct proxy_vmshm_object **out);
-int proxy_vmshm_grant_lookup(u64 grant_id, u32 requester_vmid,
-			     u32 required_perms,
-			     struct proxy_vmshm_object **out);
 int proxy_vmshm_grant_revoke(u64 grant_id);
 #else
+static inline int proxy_vmshm_manager_register_domain(u32 owner_vmid, void *base,
+						     phys_addr_t gpa, size_t size)
+{
+	return -ENODEV;
+}
+
+static inline int proxy_vmshm_manager_unregister_domain(u32 owner_vmid, void *base)
+{
+	return -ENODEV;
+}
 static inline struct proxy_vmshm_object *
 proxy_vmshm_alloc_ext(const struct proxy_vmshm_alloc_params *params,
 		      gfp_t gfp)
@@ -138,25 +138,7 @@ proxy_vmshm_alloc_ext(const struct proxy_vmshm_alloc_params *params,
 	return ERR_PTR(-ENODEV);
 }
 
-static inline struct proxy_vmshm_object *
-proxy_vmshm_alloc(size_t size, gfp_t gfp)
-{
-	return ERR_PTR(-ENODEV);
-}
-
 static inline void proxy_vmshm_free(struct proxy_vmshm_object *obj) {}
-
-static inline int proxy_vmshm_free_handle(u64 handle, u32 requester_vmid)
-{
-	return -ENODEV;
-}
-
-static inline bool proxy_vmshm_get(struct proxy_vmshm_object *obj)
-{
-	return false;
-}
-
-static inline void proxy_vmshm_put(struct proxy_vmshm_object *obj) {}
 
 static inline int proxy_vmshm_pin(struct proxy_vmshm_object *obj)
 {
@@ -168,13 +150,6 @@ static inline void proxy_vmshm_unpin(struct proxy_vmshm_object *obj) {}
 static inline int proxy_vmshm_lookup_pin(u64 handle, u32 requester_vmid,
 					 u32 required_perms,
 					 struct proxy_vmshm_object **out)
-{
-	return -ENODEV;
-}
-
-static inline int proxy_vmshm_lookup(u64 handle, u32 requester_vmid,
-				     u32 required_perms,
-				     struct proxy_vmshm_object **out)
 {
 	return -ENODEV;
 }
@@ -194,22 +169,7 @@ static inline u32 proxy_vmshm_obj_generation(struct proxy_vmshm_object *obj)
 	return 0;
 }
 
-static inline u32 proxy_vmshm_obj_type(struct proxy_vmshm_object *obj)
-{
-	return 0;
-}
-
 static inline u32 proxy_vmshm_obj_owner_vmid(struct proxy_vmshm_object *obj)
-{
-	return 0;
-}
-
-static inline u32 proxy_vmshm_obj_perms(struct proxy_vmshm_object *obj)
-{
-	return 0;
-}
-
-static inline unsigned int proxy_vmshm_obj_order(struct proxy_vmshm_object *obj)
 {
 	return 0;
 }
@@ -217,11 +177,6 @@ static inline unsigned int proxy_vmshm_obj_order(struct proxy_vmshm_object *obj)
 static inline void *proxy_vmshm_obj_kva(struct proxy_vmshm_object *obj)
 {
 	return NULL;
-}
-
-static inline phys_addr_t proxy_vmshm_obj_gpa(struct proxy_vmshm_object *obj)
-{
-	return 0;
 }
 
 static inline u64 proxy_vmshm_obj_offset(struct proxy_vmshm_object *obj)
@@ -281,13 +236,6 @@ static inline int proxy_vmshm_grant_create(struct proxy_vmshm_object *obj,
 static inline int proxy_vmshm_grant_lookup_pin(u64 grant_id, u32 requester_vmid,
 					       u32 required_perms,
 					       struct proxy_vmshm_object **out)
-{
-	return -ENODEV;
-}
-
-static inline int proxy_vmshm_grant_lookup(u64 grant_id, u32 requester_vmid,
-					   u32 required_perms,
-					   struct proxy_vmshm_object **out)
 {
 	return -ENODEV;
 }

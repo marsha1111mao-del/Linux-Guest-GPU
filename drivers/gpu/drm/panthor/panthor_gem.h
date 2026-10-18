@@ -14,6 +14,11 @@
 struct panthor_vm;
 struct proxy_vmshm_object;
 
+/* Kernel-only initialization followed by exclusive GPU ownership. Never a
+ * userspace BO flag. The creator must hand off caches before publishing it.
+ */
+#define PANTHOR_BO_GPU_ONLY BIT(31)
+
 /**
  * struct panthor_gem_object - Driver specific GEM object.
  */
@@ -45,7 +50,7 @@ struct panthor_gem_object {
 	 */
 	struct mutex gpuva_list_lock;
 
-	/** @flags: Combination of drm_panthor_bo_flags flags. */
+	/** @flags: DRM BO flags and the private PANTHOR_BO_GPU_ONLY role. */
 	u32 flags;
 
 	/**
@@ -103,6 +108,9 @@ struct panthor_kernel_bo {
 	 * @kmap: Kernel CPU mapping of @gem.
 	 */
 	void *kmap;
+
+	/** @gpu_owned: CPU initialization has ended; further vmap is forbidden. */
+	bool gpu_owned;
 };
 
 static inline
@@ -162,6 +170,8 @@ panthor_kernel_bo_vmap(struct panthor_kernel_bo *bo)
 
 	if (bo->kmap)
 		return 0;
+	if (bo->gpu_owned)
+		return -EACCES;
 
 	ret = drm_gem_vmap_unlocked(bo->obj, &map);
 	if (ret)
@@ -187,6 +197,7 @@ panthor_kernel_bo_create(struct panthor_device *ptdev, struct panthor_vm *vm,
 			 size_t size, u32 bo_flags, u32 vm_map_flags,
 			 u64 gpu_va);
 
+int panthor_kernel_bo_handoff_to_gpu(struct panthor_kernel_bo *bo);
 int panthor_kernel_bo_sync_for_device(struct panthor_device *ptdev,
 				      struct panthor_kernel_bo *bo,
 				      size_t offset, size_t len);

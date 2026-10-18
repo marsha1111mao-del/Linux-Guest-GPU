@@ -427,4 +427,14 @@ source "drivers/char/client_vmshm_manager/Kconfig"
 source "drivers/char/proxy_vmshm_comm/Kconfig"
 source "drivers/char/client_vmshm_comm/Kconfig"
 
+config REALM_XSHM
+	bool "OpenCCA Realm communication service"
+	depends on ARM64 && DMA_CMA
+	help
+	  Provide /dev/realm-xshm for privileged Realm software to establish
+	  RMM-authenticated channels and manage persistent event sequences.
+	  Requires the matching experimental OpenCCA RMM interface. This
+	  includes a bounded protected data pool and RMM-controlled notifications.
+	  The device is not registered in ordinary VMs.
+
 endmenu

@@ -13,6 +13,7 @@
  * are owned by the upper driver using the channel.
  */
 struct proxy_comm_vmshm_channel;
+struct device;
 
 struct vmshm_comm_tx {
 	u32 type;
@@ -58,8 +59,9 @@ typedef int (*proxy_comm_vmshm_rx_handler_t)(const struct vmshm_comm_rx *rx,
 					     void *priv);
 
 #if IS_ENABLED(CONFIG_PROXY_VMSHM_COMM)
-bool proxy_comm_vmshm_channel_ready(struct proxy_comm_vmshm_channel *channel);
-u32 proxy_comm_vmshm_channel_max_payload(struct proxy_comm_vmshm_channel *channel);
+bool proxy_comm_vmshm_channel_get(struct proxy_comm_vmshm_channel *channel);
+void proxy_comm_vmshm_channel_put(struct proxy_comm_vmshm_channel *channel);
+int proxy_comm_vmshm_quiesce(struct device *dev);
 u32 proxy_comm_vmshm_channel_client_vmid(struct proxy_comm_vmshm_channel *channel);
 int proxy_comm_vmshm_send_to_channel(struct proxy_comm_vmshm_channel *channel,
 				     const struct vmshm_comm_tx *tx);
@@ -70,17 +72,12 @@ void proxy_comm_vmshm_unregister_handler(u32 type,
 					 proxy_comm_vmshm_rx_handler_t handler,
 					 void *priv);
 #else
-static inline bool
-proxy_comm_vmshm_channel_ready(struct proxy_comm_vmshm_channel *channel)
+static inline bool proxy_comm_vmshm_channel_get(struct proxy_comm_vmshm_channel *channel)
 {
 	return false;
 }
-
-static inline u32
-proxy_comm_vmshm_channel_max_payload(struct proxy_comm_vmshm_channel *channel)
-{
-	return 0;
-}
+static inline void proxy_comm_vmshm_channel_put(struct proxy_comm_vmshm_channel *channel) {}
+static inline int proxy_comm_vmshm_quiesce(struct device *dev) { return -ENODEV; }
 
 static inline u32
 proxy_comm_vmshm_channel_client_vmid(struct proxy_comm_vmshm_channel *channel)
@@ -112,40 +109,23 @@ proxy_comm_vmshm_unregister_handler(u32 type,
 #endif
 
 #if IS_ENABLED(CONFIG_CLIENT_VMSHM_COMM)
-bool client_comm_vmshm_ready(void);
-u32 client_comm_vmshm_max_payload(void);
+bool client_comm_vmshm_get(void);
+void client_comm_vmshm_put(void);
+int client_comm_vmshm_quiesce(struct device *dev);
 u32 client_comm_vmshm_client_vmid(void);
-int client_comm_vmshm_send_to_proxy(const struct vmshm_comm_tx *tx);
-int client_comm_vmshm_recv_from_proxy(struct vmshm_comm_rx *rx);
 int client_comm_vmshm_call(u32 req_type, u32 req_flags,
 			   const void *req_payload, u32 req_len,
 			   u32 rsp_type, void *rsp_payload,
 			   u32 rsp_payload_capacity,
 			   struct vmshm_comm_rx *rsp_rx);
 #else
-static inline bool client_comm_vmshm_ready(void)
-{
-	return false;
-}
-
-static inline u32 client_comm_vmshm_max_payload(void)
-{
-	return 0;
-}
+static inline bool client_comm_vmshm_get(void) { return false; }
+static inline void client_comm_vmshm_put(void) {}
+static inline int client_comm_vmshm_quiesce(struct device *dev) { return -ENODEV; }
 
 static inline u32 client_comm_vmshm_client_vmid(void)
 {
 	return 0;
-}
-
-static inline int client_comm_vmshm_send_to_proxy(const struct vmshm_comm_tx *tx)
-{
-	return -ENODEV;
-}
-
-static inline int client_comm_vmshm_recv_from_proxy(struct vmshm_comm_rx *rx)
-{
-	return -ENODEV;
 }
 
 static inline int client_comm_vmshm_call(u32 req_type, u32 req_flags,

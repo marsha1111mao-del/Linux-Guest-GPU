@@ -216,7 +216,8 @@ struct panthor_scheduler {
 	 * outside the interrupt path so we don't block the tick logic when
 	 * it calls panthor_fw_{csg,wait}_wait_acks(). Since most of the
 	 * event processing requires taking this lock, we just delegate all
-	 * FW event processing to the scheduler workqueue.
+	 * FW event processing to the scheduler workqueue, except for the
+	 * non-blocking global idle acknowledgement.
 	 */
 	struct work_struct fw_events_work;
 
@@ -224,6 +225,9 @@ struct panthor_scheduler {
 	 * @fw_events: Bitmask encoding pending FW events.
 	 */
 	atomic_t fw_events;
+
+	/** @idle_event: Idle event acknowledged in IRQ context, awaiting a tick. */
+	atomic_t idle_event;
 
 	/**
 	 * @resched_target: When the next tick should occur.
@@ -655,6 +659,9 @@ struct panthor_group {
 	 */
 	struct panthor_kernel_bo *protm_suspend_buf;
 
+	/** @completion_lock: Serializes deferred/inline completion and termination. */
+	struct mutex completion_lock;
+
 	/** @sync_upd_work: Work used to check/signal job fences. */
 	struct work_struct sync_upd_work;
 
@@ -764,14 +771,16 @@ static void panthor_queue_iface_sync_for_device(struct panthor_device *ptdev,
 {
 	int ret;
 
-	ret = panthor_kernel_bo_sync_for_device(ptdev, queue->iface.mem, 0,
-						panthor_kernel_bo_size(queue->iface.mem));
+	/* Runtime publication owns only the input page. The second page is
+	 * GPU output and must never be cleaned from a stale CPU cache copy.
+	 */
+	ret = panthor_kernel_bo_sync_for_device(ptdev, queue->iface.mem, 0, SZ_4K);
 	if (ret)
 		drm_warn(&ptdev->base,
 			 "Failed to sync Realm queue iface ret=%d", ret);
 }
 
-static void panthor_queue_sync_for_device(struct panthor_device *ptdev,
+static void panthor_queue_sync_ringbuf_for_device(struct panthor_device *ptdev,
 					  struct panthor_queue *queue,
 					  u32 ringbuf_insert, size_t ringbuf_len)
 {
@@ -782,8 +791,6 @@ static void panthor_queue_sync_for_device(struct panthor_device *ptdev,
 	if (ret)
 		drm_warn(&ptdev->base,
 			 "Failed to sync Realm queue ringbuf ret=%d", ret);
-
-	panthor_queue_iface_sync_for_device(ptdev, queue);
 }
 
 static void panthor_queue_iface_sync_for_cpu(struct panthor_device *ptdev,
@@ -791,8 +798,12 @@ static void panthor_queue_iface_sync_for_cpu(struct panthor_device *ptdev,
 {
 	int ret;
 
-	ret = panthor_kernel_bo_sync_for_cpu(ptdev, queue->iface.mem, 0,
-					     panthor_kernel_bo_size(queue->iface.mem));
+	/* Invalidate whole lines; a partial final line may otherwise be
+	 * cleaned over output the GPU has written since our last read.
+	 */
+	ret = panthor_kernel_bo_sync_for_cpu(ptdev, queue->iface.mem, SZ_4K,
+					     ALIGN(sizeof(*queue->iface.output),
+						   dma_get_cache_alignment()));
 	if (ret)
 		drm_warn(&ptdev->base,
 			 "Failed to sync Realm queue iface for CPU ret=%d", ret);
@@ -1135,7 +1146,7 @@ panthor_dump_csg_diag_locked(struct panthor_device *ptdev, u32 csg_id,
 		return;
 	}
 
-	panthor_fw_sync_shared_for_cpu(ptdev, reason);
+	panthor_fw_sync_outputs_for_cpu(ptdev, reason);
 
 	glb_iface = panthor_fw_get_glb_iface(ptdev);
 	csg_iface = panthor_fw_get_csg_iface(ptdev, csg_id);
@@ -1489,7 +1500,9 @@ csg_slot_sync_priority_locked(struct panthor_device *ptdev, u32 csg_id)
 	lockdep_assert_held(&ptdev->scheduler->lock);
 
 	csg_iface = panthor_fw_get_csg_iface(ptdev, csg_id);
-	panthor_fw_sync_shared_for_cpu(ptdev, "CS slot state");
+	/* Priority is CPU-owned input. The update boundary refreshes the CSG
+	 * output before any state/idle readers; no unrelated outputs are read.
+	 */
 	csg_slot->priority = (csg_iface->input->endpoint_req & CSG_EP_REQ_PRIORITY_MASK) >> 28;
 }
 
@@ -1511,7 +1524,9 @@ cs_slot_sync_queue_state_locked(struct panthor_device *ptdev, u32 csg_id, u32 cs
 
 	u32 status_wait_cond;
 
-	panthor_fw_sync_shared_for_cpu(ptdev, "CS queue state");
+	panthor_fw_sync_output_for_cpu(ptdev, cs_iface->output,
+				      sizeof(*cs_iface->output), "CS queue state");
+	panthor_queue_iface_sync_for_cpu(ptdev, queue);
 	switch (cs_iface->output->status_blocked_reason) {
 	case CS_STATUS_BLOCKED_REASON_UNBLOCKED:
 		if (queue->iface.input->insert == queue->iface.output->extract &&
@@ -1696,7 +1711,7 @@ csg_slot_prog_locked(struct panthor_device *ptdev, u32 csg_id, u32 priority)
 	}
 
 	csg_iface->input->ack_irq_mask = ~0;
-	panthor_fw_toggle_reqs(csg_iface, doorbell_req, doorbell_ack, queue_mask);
+	panthor_fw_toggle_cs_doorbells(ptdev, csg_id, queue_mask);
 	return 0;
 }
 
@@ -1852,16 +1867,16 @@ static int group_process_tiler_oom(struct panthor_group *group, u32 cs_id)
 	mutex_lock(&sched->lock);
 	csg_id = group->csg_id;
 	if (csg_id >= 0) {
-		struct panthor_fw_csg_iface *csg_iface;
 		struct panthor_fw_cs_iface *cs_iface;
 
-		csg_iface = panthor_fw_get_csg_iface(ptdev, csg_id);
 		cs_iface = panthor_fw_get_cs_iface(ptdev, csg_id, cs_id);
 
 		cs_iface->input->heap_start = new_chunk_va;
 		cs_iface->input->heap_end = new_chunk_va;
-		panthor_fw_update_reqs(cs_iface, req, cs_iface->output->ack, CS_TILER_OOM);
-		panthor_fw_toggle_reqs(csg_iface, doorbell_req, doorbell_ack, BIT(cs_id));
+		panthor_fw_update_reqs(cs_iface, req,
+				       panthor_fw_read_ack(ptdev, &cs_iface->output->ack),
+				       CS_TILER_OOM);
+		panthor_fw_toggle_cs_doorbells(ptdev, csg_id, BIT(cs_id));
 		panthor_fw_ring_csg_doorbells(ptdev, BIT(csg_id));
 	}
 	mutex_unlock(&sched->lock);
@@ -1928,6 +1943,8 @@ static bool cs_slot_process_irq_locked(struct panthor_device *ptdev,
 	lockdep_assert_held(&ptdev->scheduler->lock);
 
 	cs_iface = panthor_fw_get_cs_iface(ptdev, csg_id, cs_id);
+	panthor_fw_sync_output_for_cpu(ptdev, cs_iface->output,
+				      sizeof(*cs_iface->output), "CS IRQ");
 	req = cs_iface->input->req;
 	ack = cs_iface->output->ack;
 	events = (req ^ ack) & CS_EVT_MASK;
@@ -1975,16 +1992,26 @@ static void csg_slot_process_idle_event_locked(struct panthor_device *ptdev, u32
 	sched_queue_delayed_work(sched, tick, 0);
 }
 
+static void group_complete_jobs(struct panthor_group *group);
+
 static void csg_slot_sync_update_locked(struct panthor_device *ptdev,
-					u32 csg_id)
+					u32 csg_id,
+					struct panthor_group **completion)
 {
 	struct panthor_csg_slot *csg_slot = &ptdev->scheduler->csg_slots[csg_id];
 	struct panthor_group *group = csg_slot->group;
 
 	lockdep_assert_held(&ptdev->scheduler->lock);
 
-	if (group)
-		group_queue_work(group, sync_upd);
+	if (group) {
+		/* Only the FW worker supplies an output. Hold the group until it
+		 * completes outside sched->lock; tick/reset callers remain deferred.
+		 */
+		if (completion)
+			*completion = group_get(group);
+		else
+			group_queue_work(group, sync_upd);
+	}
 
 	sched_queue_work(ptdev->scheduler, sync_upd);
 }
@@ -2007,7 +2034,8 @@ csg_slot_process_progress_timer_event_locked(struct panthor_device *ptdev, u32 c
 	sched_queue_delayed_work(sched, tick, 0);
 }
 
-static void sched_process_csg_irq_locked(struct panthor_device *ptdev, u32 csg_id)
+static void sched_process_csg_irq_locked(struct panthor_device *ptdev, u32 csg_id,
+					 struct panthor_group **completion)
 {
 	u32 req, ack, cs_irq_req, cs_irq_ack, cs_irqs, csg_events;
 	struct panthor_fw_csg_iface *csg_iface;
@@ -2018,8 +2046,9 @@ static void sched_process_csg_irq_locked(struct panthor_device *ptdev, u32 csg_i
 	if (drm_WARN_ON(&ptdev->base, csg_id >= ptdev->scheduler->csg_slot_count))
 		return;
 
-	panthor_fw_sync_shared_for_cpu(ptdev, "CSG IRQ");
 	csg_iface = panthor_fw_get_csg_iface(ptdev, csg_id);
+	panthor_fw_sync_output_for_cpu(ptdev, csg_iface->output,
+				      sizeof(*csg_iface->output), "CSG IRQ");
 	req = READ_ONCE(csg_iface->input->req);
 	ack = READ_ONCE(csg_iface->output->ack);
 	cs_irq_req = READ_ONCE(csg_iface->output->cs_irq_req);
@@ -2060,67 +2089,52 @@ static void sched_process_csg_irq_locked(struct panthor_device *ptdev, u32 csg_i
 	}
 
 	if (csg_events & CSG_SYNC_UPDATE)
-		csg_slot_sync_update_locked(ptdev, csg_id);
+		csg_slot_sync_update_locked(ptdev, csg_id, completion);
 
 	if (ring_cs_db_mask)
-		panthor_fw_toggle_reqs(csg_iface, doorbell_req, doorbell_ack, ring_cs_db_mask);
+		panthor_fw_toggle_cs_doorbells(ptdev, csg_id, ring_cs_db_mask);
 
 	panthor_fw_ring_csg_doorbells(ptdev, BIT(csg_id));
-}
-
-static void sched_process_idle_event_locked(struct panthor_device *ptdev)
-{
-	struct panthor_fw_global_iface *glb_iface = panthor_fw_get_glb_iface(ptdev);
-
-	lockdep_assert_held(&ptdev->scheduler->lock);
-
-	/* Acknowledge the idle event and schedule a tick. */
-	panthor_fw_update_reqs(glb_iface, req, glb_iface->output->ack, GLB_IDLE);
-	sched_queue_delayed_work(ptdev->scheduler, tick, 0);
-}
-
-/**
- * sched_process_global_irq_locked() - Process the scheduling part of a global IRQ
- * @ptdev: Device.
- */
-static void sched_process_global_irq_locked(struct panthor_device *ptdev)
-{
-	struct panthor_fw_global_iface *glb_iface = panthor_fw_get_glb_iface(ptdev);
-	u32 req, ack, evts;
-
-	lockdep_assert_held(&ptdev->scheduler->lock);
-
-	panthor_fw_sync_shared_for_cpu(ptdev, "global IRQ");
-	req = READ_ONCE(glb_iface->input->req);
-	ack = READ_ONCE(glb_iface->output->ack);
-	evts = (req ^ ack) & GLB_EVT_MASK;
-
-	if (evts & GLB_IDLE)
-		sched_process_idle_event_locked(ptdev);
 }
 
 static void process_fw_events_work(struct work_struct *work)
 {
 	struct panthor_scheduler *sched = container_of(work, struct panthor_scheduler,
 						      fw_events_work);
+	struct panthor_group *completed[MAX_CSGS] = { 0 };
+	u32 i;
 	u32 events = atomic_xchg(&sched->fw_events, 0);
 	struct panthor_device *ptdev = sched->ptdev;
 
 	mutex_lock(&sched->lock);
 
 	if (events & JOB_INT_GLOBAL_IF) {
-		sched_process_global_irq_locked(ptdev);
+		if (atomic_xchg(&sched->idle_event, 0))
+			sched_queue_delayed_work(sched, tick, 0);
 		events &= ~JOB_INT_GLOBAL_IF;
 	}
 
 	while (events) {
 		u32 csg_id = ffs(events) - 1;
 
-		sched_process_csg_irq_locked(ptdev, csg_id);
+		sched_process_csg_irq_locked(ptdev, csg_id,
+			cc_platform_has(CC_ATTR_MEM_ENCRYPT) ? &completed[csg_id] : NULL);
 		events &= ~BIT(csg_id);
 	}
 
 	mutex_unlock(&sched->lock);
+
+	/* Cache maintenance may sleep and fence callbacks may schedule more
+	 * work. Neither may run under sched->lock or in the hard IRQ handler.
+	 */
+	for (i = 0; i < MAX_CSGS; i++) {
+		if (!completed[i])
+			continue;
+		drm_info_once(&ptdev->base,
+			      "Realm GPU completion: inline FW worker path\n");
+		group_complete_jobs(completed[i]);
+		group_put(completed[i]);
+	}
 }
 
 /**
@@ -2130,6 +2144,17 @@ void panthor_sched_report_fw_events(struct panthor_device *ptdev, u32 events)
 {
 	if (!ptdev->scheduler)
 		return;
+
+	/* A tick waits for CSG ACKs while holding sched->lock. Acknowledge
+	 * firmware idle here, without that lock, so the IRQ thread can make
+	 * progress during the wait. Retain the acknowledged event for the
+	 * deferred scheduling work.
+	 */
+	if ((events & JOB_INT_GLOBAL_IF) && panthor_fw_ack_idle_event(ptdev))
+		/* Order the latch before fw_events can become visible to a
+		 * worker already running on another CPU.
+		 */
+		atomic_xchg(&ptdev->scheduler->idle_event, 1);
 
 	atomic_or(events, &ptdev->scheduler->fw_events);
 	sched_queue_work(ptdev->scheduler, fw_events);
@@ -2212,6 +2237,11 @@ static int csgs_upd_ctx_apply_locked(struct panthor_device *ptdev,
 		csg_iface = panthor_fw_get_csg_iface(ptdev, csg_id);
 
 		ret = panthor_fw_csg_wait_acks(ptdev, csg_id, req_mask, &acked, 100);
+		/* ACK polling refreshes its own cacheline only. State/idle readers
+		 * below also need this CSG's remaining output fields, not all slots.
+		 */
+		panthor_fw_sync_output_for_cpu(ptdev, csg_iface->output,
+					      sizeof(*csg_iface->output), "CSG update");
 
 		if (acked & CSG_ENDPOINT_CONFIG)
 			csg_slot_sync_priority_locked(ptdev, csg_id);
@@ -2397,7 +2427,7 @@ tick_ctx_init(struct panthor_scheduler *sched,
 		 * CSG IRQs, so we can flag the faulty queue.
 		 */
 		if (panthor_vm_has_unhandled_faults(group->vm)) {
-			sched_process_csg_irq_locked(ptdev, i);
+			sched_process_csg_irq_locked(ptdev, i, NULL);
 
 			/* No fatal fault reported, flag all queues as faulty. */
 			if (!group->fatal_queues)
@@ -2406,7 +2436,7 @@ tick_ctx_init(struct panthor_scheduler *sched,
 
 		tick_ctx_insert_old_group(sched, ctx, group, full_tick);
 		csgs_upd_ctx_queue_reqs(ptdev, &upd_ctx, i,
-					csg_iface->output->ack ^ CSG_STATUS_UPDATE,
+					panthor_fw_read_ack(ptdev, &csg_iface->output->ack) ^ CSG_STATUS_UPDATE,
 					CSG_STATUS_UPDATE);
 	}
 
@@ -2432,23 +2462,11 @@ panthor_build_job_instrs(struct panthor_job *job,
 	u64 sync_addr = panthor_kernel_bo_gpuva(group->syncobjs) +
 			job->queue_idx * sizeof(struct panthor_syncobj_64b);
 	u64 ringbuf_probe_addr = panthor_sync_only_probe_gpuva(queue);
-	phys_addr_t sync_hpa = 0, ringbuf_probe_hpa = 0;
 	u32 waitall_mask = GENMASK(sched->sb_slot_count - 1, 0);
 	bool realm_sync_only = panthor_realm_sync_only_active();
 
 	memset(call_instrs, 0, sizeof(u64) * NUM_INSTRS_PER_SLOT);
 
-	if (cc_platform_has(CC_ATTR_MEM_ENCRYPT)) {
-		sync_hpa = panthor_vm_iova_to_phys(group->vm, sync_addr);
-		ringbuf_probe_hpa =
-			panthor_vm_iova_to_phys(group->vm, ringbuf_probe_addr);
-		drm_err(&ptdev->base,
-			"[MZH][PANTHOR_SYNC_ADDR] queue=%u sync_addr=%#llx sync_hpa=%pa ringbuf_probe_addr=%#llx ringbuf_probe_hpa=%pa syncobjs_gpuva=%#llx syncobjs_size=%zu realm_sync_only=%u\n",
-			job->queue_idx, (unsigned long long)sync_addr, &sync_hpa,
-			(unsigned long long)ringbuf_probe_addr, &ringbuf_probe_hpa,
-			(unsigned long long)panthor_kernel_bo_gpuva(group->syncobjs),
-			panthor_kernel_bo_size(group->syncobjs), realm_sync_only);
-	}
 
 	if (realm_sync_only) {
 		drm_err_once(&ptdev->base,
@@ -2546,6 +2564,7 @@ group_term_post_processing(struct panthor_group *group)
 	if (drm_WARN_ON(&group->ptdev->base, group_can_run(group)))
 		return;
 
+	mutex_lock(&group->completion_lock);
 	cookie = dma_fence_begin_signalling();
 	for (i = 0; i < group->queue_count; i++) {
 		struct panthor_queue *queue = group->queues[i];
@@ -2578,6 +2597,7 @@ group_term_post_processing(struct panthor_group *group)
 		sched_queue_work(group->ptdev->scheduler, sync_upd);
 	}
 	dma_fence_end_signalling(cookie);
+	mutex_unlock(&group->completion_lock);
 
 	list_for_each_entry_safe(job, tmp, &faulty_jobs, node) {
 		list_del_init(&job->node);
@@ -2696,7 +2716,7 @@ tick_ctx_apply(struct panthor_scheduler *sched, struct panthor_sched_tick_ctx *c
 					       CSG_EP_REQ_PRIORITY(new_csg_prio),
 					       CSG_EP_REQ_PRIORITY_MASK);
 			csgs_upd_ctx_queue_reqs(ptdev, &upd_ctx, csg_id,
-						csg_iface->output->ack ^ CSG_ENDPOINT_CONFIG,
+						panthor_fw_read_ack(ptdev, &csg_iface->output->ack) ^ CSG_ENDPOINT_CONFIG,
 						CSG_ENDPOINT_CONFIG);
 			new_csg_prio--;
 		}
@@ -2717,7 +2737,7 @@ tick_ctx_apply(struct panthor_scheduler *sched, struct panthor_sched_tick_ctx *c
 			 * group.
 			 */
 			if (group->csg_id >= 0)
-				sched_process_csg_irq_locked(ptdev, group->csg_id);
+				sched_process_csg_irq_locked(ptdev, group->csg_id, NULL);
 
 			group_unbind_locked(group);
 		}
@@ -2755,7 +2775,7 @@ tick_ctx_apply(struct panthor_scheduler *sched, struct panthor_sched_tick_ctx *c
 						CSG_STATE_RESUME : CSG_STATE_START,
 						CSG_STATE_MASK);
 			csgs_upd_ctx_queue_reqs(ptdev, &upd_ctx, csg_id,
-						csg_iface->output->ack ^ CSG_ENDPOINT_CONFIG,
+						panthor_fw_read_ack(ptdev, &csg_iface->output->ack) ^ CSG_ENDPOINT_CONFIG,
 						CSG_ENDPOINT_CONFIG);
 			free_csg_slots &= ~BIT(csg_id);
 		}
@@ -3233,7 +3253,7 @@ void panthor_sched_suspend(struct panthor_device *ptdev)
 			if (flush_caches_failed)
 				csg_slot->group->state = PANTHOR_CS_GROUP_TERMINATED;
 			else
-				csg_slot_sync_update_locked(ptdev, csg_id);
+				csg_slot_sync_update_locked(ptdev, csg_id, NULL);
 
 			slot_mask &= ~BIT(csg_id);
 		}
@@ -3249,7 +3269,7 @@ void panthor_sched_suspend(struct panthor_device *ptdev)
 		group_get(group);
 
 		if (group->csg_id >= 0)
-			sched_process_csg_irq_locked(ptdev, group->csg_id);
+			sched_process_csg_irq_locked(ptdev, group->csg_id, NULL);
 
 		group_unbind_locked(group);
 
@@ -3335,15 +3355,17 @@ void panthor_sched_post_reset(struct panthor_device *ptdev, bool reset_failed)
 	}
 }
 
-static void group_sync_upd_work(struct work_struct *work)
+static void group_complete_jobs(struct panthor_group *group)
 {
-	struct panthor_group *group =
-		container_of(work, struct panthor_group, sync_upd_work);
 	struct panthor_job *job, *job_tmp;
 	LIST_HEAD(done_jobs);
 	u32 queue_idx;
 	bool cookie;
 
+	lockdep_assert_not_held(&group->ptdev->scheduler->lock);
+
+	/* A previously queued completion can overlap the FW worker. */
+	mutex_lock(&group->completion_lock);
 	cookie = dma_fence_begin_signalling();
 	panthor_vm_sync_mapped_bos(group->vm, DMA_FROM_DEVICE);
 	panthor_group_syncobjs_sync_for_cpu(group);
@@ -3367,12 +3389,20 @@ static void group_sync_upd_work(struct work_struct *work)
 		spin_unlock(&queue->fence_ctx.lock);
 	}
 	dma_fence_end_signalling(cookie);
+	mutex_unlock(&group->completion_lock);
 
 	list_for_each_entry_safe(job, job_tmp, &done_jobs, node) {
 		list_del_init(&job->node);
 		panthor_job_put(&job->base);
 	}
+}
 
+static void group_sync_upd_work(struct work_struct *work)
+{
+	struct panthor_group *group =
+		container_of(work, struct panthor_group, sync_upd_work);
+
+	group_complete_jobs(group);
 	group_put(group);
 }
 
@@ -3463,10 +3493,16 @@ queue_run_job_stats(struct drm_sched_job *sched_job)
 	job->ringbuf.start = queue->iface.input->insert;
 	job->ringbuf.end = job->ringbuf.start + sizeof(call_instrs);
 
-	/* Make sure the ring buffer is updated before the INSERT
-	 * register.
+	/* Publish command bytes before touching INSERT. With cached Realm
+	 * mappings, a barrier alone does not make those bytes visible to the
+	 * GPU, and INSERT may be evicted before the explicit input sync.
 	 */
+	stats_phase_start = stats_enabled ? ktime_get_ns() : 0;
+	panthor_queue_sync_ringbuf_for_device(ptdev, queue, ringbuf_insert,
+					      sizeof(call_instrs));
 	wmb();
+	if (stats_phase_start)
+		stats.ringbuf_write_ns += ktime_get_ns() - stats_phase_start;
 
 	stats_phase_start = stats_enabled ? ktime_get_ns() : 0;
 	panthor_queue_iface_sync_for_cpu(ptdev, queue);
@@ -3477,8 +3513,7 @@ queue_run_job_stats(struct drm_sched_job *sched_job)
 
 	stats_phase_start = stats_enabled ? ktime_get_ns() : 0;
 	/* The first job reaches the GPU through the scheduler, without a doorbell. */
-	panthor_queue_sync_for_device(ptdev, queue, ringbuf_insert,
-				      sizeof(call_instrs));
+	panthor_queue_iface_sync_for_device(ptdev, queue);
 	if (group->csg_id < 0) {
 		/* If the queue is blocked, we want to keep the timeout running, so we
 		 * can detect unbounded waits and kill the group when that happens.
@@ -3604,9 +3639,12 @@ queue_run_job(struct drm_sched_job *sched_job)
 	job->ringbuf.start = queue->iface.input->insert;
 	job->ringbuf.end = job->ringbuf.start + sizeof(call_instrs);
 
-	/* Make sure the ring buffer is updated before the INSERT
-	 * register.
+	/* Publish command bytes before touching INSERT. With cached Realm
+	 * mappings, a barrier alone does not make those bytes visible to the
+	 * GPU, and INSERT may be evicted before the explicit input sync.
 	 */
+	panthor_queue_sync_ringbuf_for_device(ptdev, queue, ringbuf_insert,
+					      sizeof(call_instrs));
 	wmb();
 
 	panthor_queue_iface_sync_for_cpu(ptdev, queue);
@@ -3614,8 +3652,7 @@ queue_run_job(struct drm_sched_job *sched_job)
 	queue->iface.input->insert = job->ringbuf.end;
 
 	/* The first job reaches the GPU through the scheduler, without a doorbell. */
-	panthor_queue_sync_for_device(ptdev, queue, ringbuf_insert,
-				      sizeof(call_instrs));
+	panthor_queue_iface_sync_for_device(ptdev, queue);
 	if (group->csg_id < 0) {
 		/* If the queue is blocked, we want to keep the timeout running, so we
 		 * can detect unbounded waits and kill the group when that happens.
@@ -3816,6 +3853,7 @@ int panthor_group_create(struct panthor_file *pfile,
 	if (!group)
 		return -ENOMEM;
 
+	mutex_init(&group->completion_lock);
 	spin_lock_init(&group->fatal_lock);
 	kref_init(&group->refcount);
 	group->state = PANTHOR_CS_GROUP_CREATED;
@@ -4247,6 +4285,8 @@ int panthor_sched_init(struct panthor_device *ptdev)
 	INIT_DELAYED_WORK(&sched->tick_work, tick_work);
 	INIT_WORK(&sched->sync_upd_work, sync_upd_work);
 	INIT_WORK(&sched->fw_events_work, process_fw_events_work);
+	atomic_set(&sched->fw_events, 0);
+	atomic_set(&sched->idle_event, 0);
 
 	ret = drmm_mutex_init(&ptdev->base, &sched->lock);
 	if (ret)

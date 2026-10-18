@@ -9,7 +9,7 @@
 
 #include <drm/panthor_drm.h>
 
-#define PANTHOR_VMSHM_ABI_VERSION	1
+#define PANTHOR_VMSHM_ABI_VERSION	2
 #define PANTHOR_VMSHM_POC_CLIENT_VMID	1
 
 #define PANTHOR_VMSHM_MSG_OPEN_SESSION_REQ	0x50544f52U /* "PTOR" */
@@ -58,8 +58,60 @@
 #define PANTHOR_VMSHM_MSG_TILER_HEAP_CREATE_RSP	0x50546a53U /* "PTjS" */
 #define PANTHOR_VMSHM_MSG_TILER_HEAP_DESTROY_REQ	0x50546b52U /* "PTkR" */
 #define PANTHOR_VMSHM_MSG_TILER_HEAP_DESTROY_RSP	0x50546b53U /* "PTkS" */
-#define PANTHOR_VMSHM_MSG_GROUP_SUBMIT_REQ	0x50546c52U /* "PTlR" */
-#define PANTHOR_VMSHM_MSG_GROUP_SUBMIT_RSP	0x50546c53U /* "PTlS" */
+
+/* Register a bounded execution shape once; subsequent runs patch only data. */
+#define PANTHOR_VMSHM_FEATURE_TASK_PLAN (1ULL << 2)
+#define PANTHOR_VMSHM_MSG_PLAN_REGISTER_REQ 0x50546e52U
+#define PANTHOR_VMSHM_MSG_PLAN_REGISTER_RSP 0x50546e53U
+#define PANTHOR_VMSHM_MSG_PLAN_EXEC_REQ 0x50546f52U
+#define PANTHOR_VMSHM_MSG_PLAN_EXEC_RSP 0x50546f53U
+#define PANTHOR_VMSHM_PLAN_SLOTS 8
+/* Optional PLAN_EXEC response extension; legacy pad=0 keeps the old ABI. */
+#define PANTHOR_VMSHM_FEATURE_PLAN_COMPLETION (1ULL << 6)
+#define PANTHOR_VMSHM_PLAN_EXEC_WATCH 1U
+
+/* Optional, advertised per OPEN_SESSION; old peers keep the two-RPC path. */
+#define PANTHOR_VMSHM_FEATURE_SNAPSHOT_COMPLETION (1ULL << 3)
+#define PANTHOR_VMSHM_MSG_COMPLETION_PAGE_REQ 0x50547052U
+#define PANTHOR_VMSHM_MSG_COMPLETION_PAGE_RSP 0x50547053U
+#define PANTHOR_VMSHM_MSG_SNAPSHOT_WATCH_REQ 0x50547152U
+#define PANTHOR_VMSHM_MSG_SNAPSHOT_WATCH_RSP 0x50547153U
+#define PANTHOR_VMSHM_COMPLETION_SLOTS 64
+
+/* Reap only retired private snapshots while capturing a fresh snapshot. */
+#define PANTHOR_VMSHM_FEATURE_SNAPSHOT_RETIRE (1ULL << 7)
+#define PANTHOR_VMSHM_MSG_SNAPSHOT_RETIRE_REQ 0x50547852U
+#define PANTHOR_VMSHM_MSG_SNAPSHOT_RETIRE_RSP 0x50547853U
+#define PANTHOR_VMSHM_RETIRE_MAX 8
+
+/* Each slot publishes one non-reused cookie, never a completion watermark.
+ * Zero means no proof. Slot reuse first drains the previous native callback.
+ */
+struct panthor_vmshm_completion_slot {
+	__u64 cookie;
+	__u8 reserved[56];
+};
+struct panthor_vmshm_completion_page {
+	struct panthor_vmshm_completion_slot slots[PANTHOR_VMSHM_COMPLETION_SLOTS];
+};
+struct panthor_vmshm_completion_page_req {
+	__u64 session_id;
+};
+struct panthor_vmshm_completion_page_rsp {
+	__s32 ret;
+	__u32 pad;
+	__u64 payload_handle;
+	__u64 payload_offset;
+	__u64 payload_size;
+};
+
+#define PANTHOR_VMSHM_FEATURE_SYNCOBJ_SNAPSHOT (1ULL << 0)
+#define PANTHOR_VMSHM_FEATURE_COMPLETED_SNAPSHOT (1ULL << 1)
+/* Opt-in use of snapshot req/rsp pad; absent the new feature it stays zero. */
+#define PANTHOR_VMSHM_SNAPSHOT_ALLOW_COMPLETED (1U << 0)
+#define PANTHOR_VMSHM_SNAPSHOT_COMPLETED (1U << 0)
+#define PANTHOR_VMSHM_MSG_SYNCOBJ_SNAPSHOT_REQ 0x50546d52U /* "PTmR" */
+#define PANTHOR_VMSHM_MSG_SYNCOBJ_SNAPSHOT_RSP 0x50546d53U /* "PTmS" */
 
 #define PANTHOR_VMSHM_DEV_QUERY_F_DATA	(1U << 0)
 #define PANTHOR_VMSHM_MAX_QUERY_DATA	sizeof(struct drm_panthor_gpu_info)
@@ -234,6 +286,20 @@ struct panthor_vmshm_syncobj_create_rsp {
 	__u32 pad;
 };
 
+/* Response uses panthor_vmshm_syncobj_create_rsp. No userspace ABI change. */
+struct panthor_vmshm_syncobj_snapshot_req {
+	__u64 session_id;
+	__u32 source_handle;
+	__u32 pad;
+};
+
+struct panthor_vmshm_snapshot_retire_req {
+	struct panthor_vmshm_syncobj_snapshot_req snapshot;
+	__u32 count;
+	__u32 pad;
+	__u32 handles[PANTHOR_VMSHM_RETIRE_MAX];
+};
+
 struct panthor_vmshm_syncobj_destroy_req {
 	__u64 session_id;
 	__u32 client_syncobj_handle;
@@ -391,49 +457,90 @@ struct panthor_vmshm_tiler_heap_destroy_rsp {
 	__u32 proxy_heap_handle;
 };
 
-struct panthor_vmshm_group_submit_job {
+/* Immutable queue layout and resource bindings, registered once. */
+struct panthor_vmshm_plan_job {
 	__u32 queue_index;
-	__u32 stream_size;
-	__u64 stream_addr;
-	__u32 latest_flush;
 	__u32 sync_start;
 	__u32 sync_count;
 	__u32 pad;
 };
 
-struct panthor_vmshm_group_submit_sync {
+struct panthor_vmshm_plan_sync {
 	__u32 flags;
 	__u32 client_syncobj_handle;
-	__u64 timeline_value;
 };
 
-struct panthor_vmshm_group_submit_req {
+struct panthor_vmshm_plan_register_req {
 	__u64 session_id;
 	__u32 client_group_handle;
 	__u32 job_count;
 	__u32 sync_count;
-	__u32 pad;
-	struct panthor_vmshm_group_submit_job jobs[PANTHOR_VMSHM_MAX_GROUP_SUBMITS];
-	struct panthor_vmshm_group_submit_sync syncs[PANTHOR_VMSHM_MAX_GROUP_SUBMIT_SYNCS];
+	__u32 slot;
+	struct panthor_vmshm_plan_job jobs[PANTHOR_VMSHM_MAX_GROUP_SUBMITS];
+	struct panthor_vmshm_plan_sync syncs[PANTHOR_VMSHM_MAX_GROUP_SUBMIT_SYNCS];
 };
 
-struct panthor_vmshm_group_submit_rsp {
+struct panthor_vmshm_plan_exec_rsp {
 	__s32 ret;
 	__u32 proxy_group_handle;
 	__u32 job_count;
 	__u32 sync_count;
 };
 
+struct panthor_vmshm_plan_exec_watch_rsp {
+	struct panthor_vmshm_plan_exec_rsp result;
+	__u64 cookie;
+	__u32 slot;
+	__u32 sync_index;
+};
+static_assert(sizeof(struct panthor_vmshm_plan_exec_watch_rsp) == 32);
+
+/* Registration selects a cache slot and never submits work.
+ * A plan ID is issued by the service and never reused within a session.
+ */
+struct panthor_vmshm_plan_register_rsp {
+	__s32 ret;
+	__u32 slot;
+	__u64 plan_id;
+};
+
+struct panthor_vmshm_plan_job_patch {
+	__u64 stream_addr;
+	__u32 stream_size;
+	__u32 latest_flush;
+};
+
+struct panthor_vmshm_plan_exec_req {
+	__u64 session_id;
+	__u64 plan_id;
+	__u32 slot;
+	__u32 pad;
+	struct panthor_vmshm_plan_job_patch jobs[PANTHOR_VMSHM_MAX_GROUP_SUBMITS];
+	__u64 timeline_values[PANTHOR_VMSHM_MAX_GROUP_SUBMIT_SYNCS];
+};
+
 static_assert(sizeof(struct panthor_vmshm_group_create_req) <=
 	      PANTHOR_VMSHM_COMM_PAYLOAD_LIMIT);
 static_assert(sizeof(struct panthor_vmshm_vm_bind_req) <=
 	      PANTHOR_VMSHM_COMM_PAYLOAD_LIMIT);
-static_assert(sizeof(struct panthor_vmshm_group_submit_req) <=
+static_assert(sizeof(struct panthor_vmshm_plan_register_req) <=
+	      PANTHOR_VMSHM_COMM_PAYLOAD_LIMIT);
+static_assert(sizeof(struct panthor_vmshm_plan_exec_req) <=
 	      PANTHOR_VMSHM_COMM_PAYLOAD_LIMIT);
 
+struct panthor_vmshm_snapshot_watch_rsp {
+	struct panthor_vmshm_syncobj_create_rsp snapshot;
+	__u64 cookie;
+	__u32 slot;
+	__u32 pad;
+};
+static_assert(sizeof(struct panthor_vmshm_completion_page) == 4096);
+struct dma_fence;
 struct panthor_vmshm_session;
 
 #if IS_ENABLED(CONFIG_DRM_PANTHOR)
+int panthor_vmshm_syncobj_fence_get_at(struct panthor_vmshm_session *session,
+				    __u32 handle, __u64 point, struct dma_fence **fence);
 int panthor_vmshm_session_open(struct panthor_vmshm_session **session);
 void panthor_vmshm_session_close(struct panthor_vmshm_session *session);
 int panthor_vmshm_dev_query(const struct panthor_vmshm_dev_query_req *req,
@@ -451,8 +558,6 @@ int panthor_vmshm_vm_bind(struct panthor_vmshm_session *session, __u32 vm_id,
 			  __u32 *failed_op);
 int panthor_vmshm_vm_get_state(struct panthor_vmshm_session *session,
 			       __u32 vm_id, __u32 *state);
-int panthor_vmshm_bo_create(struct panthor_vmshm_session *session,
-			    struct drm_panthor_bo_create *args);
 int panthor_vmshm_bo_create_from_payload(struct panthor_vmshm_session *session,
 					 struct drm_panthor_bo_create *args,
 					 struct proxy_vmshm_object *payload);
@@ -468,6 +573,8 @@ int panthor_vmshm_syncobj_wait(struct panthor_vmshm_session *session,
 			       __u64 deadline_nsec, __u32 *first_signaled);
 int panthor_vmshm_syncobj_transfer(struct panthor_vmshm_session *session,
 				   struct drm_syncobj_transfer *args);
+int panthor_vmshm_syncobj_status(struct panthor_vmshm_session *session,
+				 __u32 handle, int *status);
 int panthor_vmshm_syncobj_timeline_wait(
 	struct panthor_vmshm_session *session, const __u32 *handles,
 	const __u64 *points, __u32 count_handles, __s64 timeout_nsec,
@@ -495,7 +602,7 @@ int panthor_vmshm_group_submit(struct panthor_vmshm_session *session,
 			       const struct drm_panthor_sync_op *syncs,
 			       const __u32 *sync_starts,
 			       const __u32 *sync_counts,
-			       __u32 job_count, unsigned int trace_seq);
+			       __u32 job_count);
 int panthor_vmshm_tiler_heap_create(struct panthor_vmshm_session *session,
 				    struct drm_panthor_tiler_heap_create *args);
 int panthor_vmshm_tiler_heap_destroy(struct panthor_vmshm_session *session,
@@ -560,13 +667,6 @@ panthor_vmshm_vm_get_state(struct panthor_vmshm_session *session, __u32 vm_id,
 }
 
 static inline int
-panthor_vmshm_bo_create(struct panthor_vmshm_session *session,
-			struct drm_panthor_bo_create *args)
-{
-	return -ENODEV;
-}
-
-static inline int
 panthor_vmshm_bo_create_from_payload(struct panthor_vmshm_session *session,
 				     struct drm_panthor_bo_create *args,
 				     struct proxy_vmshm_object *payload)
@@ -606,6 +706,13 @@ panthor_vmshm_syncobj_wait(struct panthor_vmshm_session *session,
 static inline int
 panthor_vmshm_syncobj_transfer(struct panthor_vmshm_session *session,
 			       struct drm_syncobj_transfer *args)
+{
+	return -ENODEV;
+}
+
+static inline int
+panthor_vmshm_syncobj_status(struct panthor_vmshm_session *session,
+			    __u32 handle, int *status)
 {
 	return -ENODEV;
 }
@@ -677,7 +784,7 @@ panthor_vmshm_group_submit(struct panthor_vmshm_session *session,
 			   const struct drm_panthor_sync_op *syncs,
 			   const __u32 *sync_starts,
 			   const __u32 *sync_counts,
-				   __u32 job_count, unsigned int trace_seq)
+			   __u32 job_count)
 {
 	return -ENODEV;
 }

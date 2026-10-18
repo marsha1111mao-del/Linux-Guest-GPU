@@ -47,3 +47,4 @@ obj-$(CONFIG_PROXY_VMSHM_MANAGER)	+= proxy_vmshm_manager/
 obj-$(CONFIG_CLIENT_VMSHM_MANAGER)	+= client_vmshm_manager/
 obj-$(CONFIG_PROXY_VMSHM_COMM)	+= proxy_vmshm_comm/
 obj-$(CONFIG_CLIENT_VMSHM_COMM)	+= client_vmshm_comm/
+obj-$(CONFIG_REALM_XSHM)		+= realm_xshm.o

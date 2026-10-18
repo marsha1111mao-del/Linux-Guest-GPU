@@ -8,10 +8,9 @@
  * manager 主要负责三件事：
  * - 用私有 buddy allocator 从 vmshm window 中切分 payload 内存；
  * - 把 object/grant 等元数据保存在 proxy 私有内核内存中；
- * - 在其他路径使用共享对象前，统一做 handle、owner 和生命周期检查。
+ * - 在其他路径使用共享对象前，统一做 handle、owner、权限和生命周期检查。
  *
- * 当前阶段暂不在 manager 内解释 read/write/mmap 权限；perms 字段只作为
- * 未来协议的保留元数据保存。
+ * 权限限制对象 API 的请求；不替代共享池的 CPU 页表或 GPU 访存隔离。
  */
 
 #define PROXY_VMSHM_MANAGER_BUILD
@@ -21,6 +20,7 @@
 #include <linux/delay.h>
 #include <linux/idr.h>
 #include <linux/kernel.h>
+#include <linux/ktime.h>
 #include <linux/limits.h>
 #include <linux/list.h>
 #include <linux/log2.h>
@@ -48,6 +48,31 @@
 #define PROXY_VMSHM_MANAGER_SEND_RETRIES	1000
 #define PROXY_VMSHM_MANAGER_SEND_WAIT_US	1000
 #define PROXY_VMSHM_DEFAULT_OWNER_VMID		1
+
+/* Diagnostic only: initialize shared backing before publishing an object.
+ * In particular, this touches GPU-only pages through the Proxy CPU mapping.
+ * It is not a replacement for a host DMA ownership protocol.
+ */
+static bool diagnostic_zero_on_alloc;
+module_param(diagnostic_zero_on_alloc, bool, 0444);
+static atomic64_t diagnostic_zero_objects = ATOMIC64_INIT(0);
+static atomic64_t diagnostic_zero_bytes = ATOMIC64_INIT(0);
+static atomic64_t diagnostic_zero_ns = ATOMIC64_INIT(0);
+
+static int diagnostic_zero_stats_get(char *buf, const struct kernel_param *kp)
+{
+	return scnprintf(buf, PAGE_SIZE,
+			 "enabled=%u objects=%lld bytes=%lld zero_ns=%lld\n",
+			 diagnostic_zero_on_alloc,
+			 atomic64_read(&diagnostic_zero_objects),
+			 atomic64_read(&diagnostic_zero_bytes),
+			 atomic64_read(&diagnostic_zero_ns));
+}
+
+static const struct kernel_param_ops diagnostic_zero_stats_ops = {
+	.get = diagnostic_zero_stats_get,
+};
+module_param_cb(diagnostic_zero_stats, &diagnostic_zero_stats_ops, NULL, 0444);
 
 static const size_t proxy_vmshm_slab_sizes[] = {
 	8, 16, 32, 64, 128, 256, 512, 1024, 2048,
@@ -94,6 +119,7 @@ enum proxy_vmshm_backing_kind {
 	PROXY_VMSHM_BACKING_BUDDY = 0,
 	PROXY_VMSHM_BACKING_SLAB,
 	PROXY_VMSHM_BACKING_SG,
+	PROXY_VMSHM_BACKING_EXTENT,
 };
 
 enum proxy_vmshm_slab_state {
@@ -154,6 +180,8 @@ struct proxy_vmshm_backing {
 
 struct proxy_vmshm_domain {
 	u32 owner_vmid;
+	/* Includes unpublished zombies still held by GPU/CPU users. */
+	unsigned long live_objects;
 	void *base;
 	phys_addr_t gpa;
 	size_t size;
@@ -230,7 +258,6 @@ struct proxy_vmshm_manager {
 	u32 next_object_generation;
 	u32 next_grant_generation;
 	bool ready;
-	bool handler_registered;
 };
 
 static struct proxy_vmshm_manager proxy_vmshm_mgr;
@@ -902,6 +929,121 @@ static int proxy_vmshm_buddy_alloc_backing_locked(struct proxy_vmshm_domain *dom
 	return 0;
 }
 
+/* Exact contiguous extents share the buddy's page map and lock. Splitting
+ * free blocks rather than rounding BOs to powers of two preserves both mmap
+ * contiguity and the owner domain boundary without a second allocator bitmap.
+ */
+static unsigned int proxy_vmshm_extent_order(struct proxy_vmshm_buddy *buddy,
+                                            unsigned long start,
+                                            unsigned long count)
+{
+	return min3(start ? (unsigned int)__ffs(start) : buddy->max_order,
+		    (unsigned int)ilog2(count), buddy->max_order);
+}
+
+static void proxy_vmshm_extent_mark(struct proxy_vmshm_buddy *buddy,
+                                   unsigned long start, unsigned long count,
+                                   bool free)
+{
+	while (count) {
+		unsigned int order = proxy_vmshm_extent_order(buddy, start, count);
+
+		if (free)
+			proxy_vmshm_buddy_insert(buddy, start, order);
+		else
+			proxy_vmshm_buddy_mark_block(buddy, start, order,
+						     PROXY_VMSHM_BLOCK_USED);
+		start += 1UL << order;
+		count -= 1UL << order;
+	}
+}
+
+static int proxy_vmshm_extent_alloc_locked(struct proxy_vmshm_domain *domain,
+                                          size_t size, size_t align,
+                                          struct proxy_vmshm_backing *backing)
+{
+	struct proxy_vmshm_buddy *buddy = &domain->buddy;
+	unsigned long i = 0, run = 0, largest = 0, first = 0, end, needed;
+	size_t rounded;
+	unsigned int unused;
+	int ret;
+
+	ret = proxy_vmshm_size_align_to_order(size, align, &unused, &rounded);
+	if (ret)
+		return ret;
+	needed = DIV_ROUND_UP(size, PAGE_SIZE);
+	if (needed > buddy->free_pages) {
+		pr_warn_ratelimited("proxy_manager_vmshm: BO capacity owner=%u request=%zu free=%lu total=%lu pages\n",
+				    domain->owner_vmid, size, buddy->free_pages,
+				    buddy->nr_pages);
+		return -ENOMEM;
+	}
+	align = max_t(size_t, align, PAGE_SIZE);
+
+	/* Read-only first pass: failure must leave the allocator untouched. */
+	while (i < buddy->nr_pages) {
+		struct proxy_vmshm_buddy_page *page = &buddy->pages[i];
+		unsigned long next = i + (1UL << page->order);
+
+		if (page->state == PROXY_VMSHM_BLOCK_FREE) {
+			if (!run)
+				first = (ALIGN(buddy->base_offset + (i << PAGE_SHIFT),
+					       align) - buddy->base_offset) >> PAGE_SHIFT;
+			run = next > first ? next - first : 0;
+			largest = max(largest, run);
+			if (run >= needed)
+				break;
+		} else {
+			run = 0;
+		}
+		i = next;
+	}
+	if (run < needed) {
+		pr_warn_ratelimited("proxy_manager_vmshm: BO fragmentation owner=%u request=%zu free=%lu largest=%lu total=%lu pages\n",
+				    domain->owner_vmid, size, buddy->free_pages,
+				    largest, buddy->nr_pages);
+		return -ENOMEM;
+	}
+
+	end = first + needed;
+	/* No allocations or fallible operations after the search succeeds. */
+	for (i = 0; i < end;) {
+		struct proxy_vmshm_buddy_page *page = &buddy->pages[i];
+		unsigned long next = i + (1UL << page->order);
+		unsigned long lo = max(i, first), hi = min(next, end);
+
+		if (lo < hi) {
+			proxy_vmshm_buddy_remove(buddy, i);
+			proxy_vmshm_extent_mark(buddy, i, lo - i, true);
+			proxy_vmshm_extent_mark(buddy, hi, next - hi, true);
+		}
+		i = next;
+	}
+	proxy_vmshm_extent_mark(buddy, first, needed, false);
+	backing->kind = PROXY_VMSHM_BACKING_EXTENT;
+	backing->offset = buddy->base_offset + (first << PAGE_SHIFT);
+	backing->kva = (u8 *)domain->base + backing->offset;
+	backing->gpa = domain->gpa + backing->offset;
+	backing->alloc_size = needed << PAGE_SHIFT;
+	return 0;
+}
+
+static void proxy_vmshm_extent_free_locked(struct proxy_vmshm_object *obj)
+{
+	struct proxy_vmshm_buddy *buddy = &obj->domain->buddy;
+	unsigned long start = (obj->offset - buddy->base_offset) >> PAGE_SHIFT;
+	unsigned long remaining = obj->alloc_size >> PAGE_SHIFT;
+
+	while (remaining) {
+		unsigned int order = proxy_vmshm_extent_order(buddy, start, remaining);
+
+		proxy_vmshm_buddy_free(buddy, buddy->base_offset +
+					    (start << PAGE_SHIFT), order);
+		start += 1UL << order;
+		remaining -= 1UL << order;
+	}
+}
+
 static bool proxy_vmshm_params_allow_sg(const struct proxy_vmshm_alloc_params *params)
 {
 	if (!(params->flags & PROXY_VMSHM_F_ALLOW_SG))
@@ -936,6 +1078,10 @@ static int proxy_vmshm_alloc_backing_locked(struct proxy_vmshm_manager *mgr,
 					    backing, gfp);
 	if (ret != -ENOENT)
 		return ret;
+
+	if (params->type == PROXY_VMSHM_OBJ_GPU_BO)
+		return proxy_vmshm_extent_alloc_locked(domain, params->size,
+						      params->align, backing);
 
 	buddy_ret = proxy_vmshm_buddy_alloc_backing_locked(domain, params->size,
 							   params->align,
@@ -995,6 +1141,7 @@ static bool proxy_vmshm_object_zero_lockless(struct proxy_vmshm_object *obj)
 static void proxy_vmshm_object_zero_backing(struct proxy_vmshm_object *obj)
 {
 	switch (obj->backing_kind) {
+	case PROXY_VMSHM_BACKING_EXTENT:
 	case PROXY_VMSHM_BACKING_BUDDY:
 	case PROXY_VMSHM_BACKING_SLAB:
 		if (obj->kva && obj->alloc_size)
@@ -1032,6 +1179,9 @@ static void proxy_vmshm_object_release_backing_locked(struct proxy_vmshm_object 
 	case PROXY_VMSHM_BACKING_BUDDY:
 		proxy_vmshm_buddy_free(&domain->buddy, obj->offset, obj->order);
 		break;
+	case PROXY_VMSHM_BACKING_EXTENT:
+		proxy_vmshm_extent_free_locked(obj);
+		break;
 	case PROXY_VMSHM_BACKING_SG:
 		proxy_vmshm_sg_free_locked(domain, &obj->sg);
 		break;
@@ -1048,6 +1198,8 @@ static void proxy_vmshm_object_put_locked(struct proxy_vmshm_object *obj)
 		return;
 
 	WARN_ON(!obj->backing_released);
+	WARN_ON(!obj->domain->live_objects);
+	obj->domain->live_objects--;
 	kmem_cache_free(proxy_vmshm_obj_cache, obj);
 }
 
@@ -1234,7 +1386,6 @@ static int proxy_vmshm_manager_ensure_ready_locked(struct proxy_vmshm_manager *m
 	mgr->next_object_generation = 1;
 	mgr->next_grant_generation = 1;
 	mgr->ready = true;
-	mgr->handler_registered = false;
 
 	if (IS_ENABLED(CONFIG_PROXY_VMSHM_COMM)) {
 		ret = proxy_comm_vmshm_register_handler(
@@ -1242,7 +1393,6 @@ static int proxy_vmshm_manager_ensure_ready_locked(struct proxy_vmshm_manager *m
 			proxy_vmshm_manager_rx_handler, NULL);
 		if (ret)
 			goto err_destroy_tables;
-		mgr->handler_registered = true;
 	}
 
 	return 0;
@@ -1343,7 +1493,10 @@ int proxy_vmshm_manager_register_domain(u32 owner_vmid, void *base,
 
 	mutex_unlock(&mgr->lock);
 	mutex_unlock(&proxy_vmshm_init_lock);
-	return 0;
+	ret = proxy_vmshm_manager_selftest_permissions(owner_vmid);
+	if (ret)
+		WARN_ON(proxy_vmshm_manager_unregister_domain(owner_vmid, base));
+	return ret;
 
 err_destroy_buddy:
 	proxy_vmshm_buddy_destroy(&domain->buddy);
@@ -1357,73 +1510,33 @@ out_unlock:
 }
 EXPORT_SYMBOL_GPL(proxy_vmshm_manager_register_domain);
 
-int proxy_vmshm_manager_init(void *base, phys_addr_t gpa, size_t size)
-{
-	return proxy_vmshm_manager_register_domain(
-		PROXY_VMSHM_DEFAULT_OWNER_VMID, base, gpa, size);
-}
-
-void proxy_vmshm_manager_destroy(void)
+int proxy_vmshm_manager_unregister_domain(u32 owner_vmid, void *base)
 {
 	struct proxy_vmshm_manager *mgr = &proxy_vmshm_mgr;
 	struct proxy_vmshm_domain *domain;
-	struct proxy_vmshm_object *obj;
-	struct proxy_vmshm_grant *grant;
-	unsigned long index;
+	int ret = 0;
 
-	/*
-	 * destroy 只能在上层停止发起新请求，并释放所有 object pin 后调用。
-	 * force 路径会对未释放的 pin 打 WARN，但仍会继续拆掉设备私有状态。
-	 */
 	mutex_lock(&proxy_vmshm_init_lock);
 	if (!mgr->ready) {
-		mutex_unlock(&proxy_vmshm_init_lock);
-		return;
+		ret = -ENODEV;
+		goto out;
 	}
-
-	if (mgr->handler_registered)
-		proxy_comm_vmshm_unregister_handler(
-			VMSHM_MANAGER_MSG_GET_OBJECT_REQ,
-			proxy_vmshm_manager_rx_handler, NULL);
-	mgr->handler_registered = false;
-
 	mutex_lock(&mgr->lock);
-	mgr->ready = false;
-	while (true) {
-		index = 0;
-		grant = xa_find(&mgr->grants, &index, ULONG_MAX, XA_PRESENT);
-		if (!grant)
-			break;
-		proxy_vmshm_grant_destroy_locked(grant);
-	}
-
-	while (true) {
-		index = 0;
-		obj = xa_find(&mgr->objects, &index, ULONG_MAX, XA_PRESENT);
-		if (!obj)
-			break;
-		if (proxy_vmshm_object_begin_free_locked(obj, true))
-			proxy_vmshm_object_release_and_put_maybe_unlock(obj, true);
-	}
-
-	while (true) {
-		index = 0;
-		domain = xa_find(&mgr->domains, &index, ULONG_MAX, XA_PRESENT);
-		if (!domain)
-			break;
-		xa_erase(&mgr->domains, index);
+	domain = proxy_vmshm_domain_lookup_locked(mgr, owner_vmid);
+	if (!domain || domain->base != base)
+		ret = -ENOENT;
+	else if (domain->live_objects)
+		ret = -EBUSY;
+	else {
+		xa_erase(&mgr->domains, domain->owner_vmid);
 		proxy_vmshm_domain_destroy_locked(domain);
 	}
 	mutex_unlock(&mgr->lock);
-
-	ida_destroy(&mgr->grant_ids);
-	ida_destroy(&mgr->object_ids);
-	xa_destroy(&mgr->grants);
-	xa_destroy(&mgr->objects);
-	xa_destroy(&mgr->domains);
-	proxy_vmshm_cache_destroy();
+out:
 	mutex_unlock(&proxy_vmshm_init_lock);
+	return ret;
 }
+EXPORT_SYMBOL_GPL(proxy_vmshm_manager_unregister_domain);
 
 struct proxy_vmshm_object *
 proxy_vmshm_alloc_ext(const struct proxy_vmshm_alloc_params *params,
@@ -1505,10 +1618,21 @@ proxy_vmshm_alloc_ext(const struct proxy_vmshm_alloc_params *params,
 	obj->slab_index = backing.slab_index;
 	obj->sg = backing.sg;
 	INIT_LIST_HEAD(&obj->grants);
+	if (diagnostic_zero_on_alloc) {
+		u64 start = ktime_get_ns();
+
+		proxy_vmshm_object_zero_backing(obj);
+		/* Complete WC initialization before any handle is published. */
+		wmb();
+		atomic64_inc(&diagnostic_zero_objects);
+		atomic64_add(obj->alloc_size, &diagnostic_zero_bytes);
+		atomic64_add(ktime_get_ns() - start, &diagnostic_zero_ns);
+	}
 
 	ret = xa_err(xa_store(&mgr->objects, obj->id, obj, gfp));
 	if (ret)
 		goto err_release_backing;
+	domain->live_objects++;
 
 	mutex_unlock(&mgr->lock);
 	mutex_unlock(&proxy_vmshm_init_lock);
@@ -1526,20 +1650,6 @@ err_init_unlock:
 	return ERR_PTR(ret);
 }
 EXPORT_SYMBOL_GPL(proxy_vmshm_alloc_ext);
-
-struct proxy_vmshm_object *proxy_vmshm_alloc(size_t size, gfp_t gfp)
-{
-	struct proxy_vmshm_alloc_params params = {
-		.owner_vmid = 0,
-		.type = PROXY_VMSHM_OBJ_GENERIC,
-		.perms = 0,
-		.size = size,
-		.align = 0,
-	};
-
-	return proxy_vmshm_alloc_ext(&params, gfp);
-}
-EXPORT_SYMBOL_GPL(proxy_vmshm_alloc);
 
 void proxy_vmshm_free(struct proxy_vmshm_object *obj)
 {
@@ -1562,81 +1672,6 @@ void proxy_vmshm_free(struct proxy_vmshm_object *obj)
 	mutex_unlock(&proxy_vmshm_init_lock);
 }
 EXPORT_SYMBOL_GPL(proxy_vmshm_free);
-
-int proxy_vmshm_free_handle(u64 handle, u32 requester_vmid)
-{
-	struct proxy_vmshm_manager *mgr = &proxy_vmshm_mgr;
-	struct proxy_vmshm_object *obj;
-	u32 id = proxy_vmshm_obj_index(handle);
-	u32 generation = proxy_vmshm_obj_handle_generation(handle);
-	int ret = 0;
-
-	if (!id || !generation)
-		return -EINVAL;
-
-	mutex_lock(&proxy_vmshm_init_lock);
-	mutex_lock(&mgr->lock);
-	if (!mgr->ready) {
-		ret = -ENODEV;
-		goto out_unlock;
-	}
-
-	obj = xa_load(&mgr->objects, id);
-	if (!obj) {
-		ret = -ENOENT;
-		goto out_unlock;
-	}
-
-	if (obj->generation != generation) {
-		ret = -ESTALE;
-		goto out_unlock;
-	}
-
-	if (obj->owner_vmid != requester_vmid) {
-		ret = -EACCES;
-		goto out_unlock;
-	}
-
-	if (proxy_vmshm_object_begin_free_locked(obj, false))
-		proxy_vmshm_object_release_and_put_maybe_unlock(obj, false);
-
-out_unlock:
-	mutex_unlock(&mgr->lock);
-	mutex_unlock(&proxy_vmshm_init_lock);
-	return ret;
-}
-EXPORT_SYMBOL_GPL(proxy_vmshm_free_handle);
-
-bool proxy_vmshm_get(struct proxy_vmshm_object *obj)
-{
-	struct proxy_vmshm_manager *mgr = &proxy_vmshm_mgr;
-	bool ret = false;
-
-	if (!obj)
-		return false;
-
-	mutex_lock(&mgr->lock);
-	if (mgr->ready && xa_load(&mgr->objects, obj->id) == obj &&
-	    proxy_vmshm_object_state_usable(obj))
-		ret = proxy_vmshm_object_get_locked(obj);
-	mutex_unlock(&mgr->lock);
-
-	return ret;
-}
-EXPORT_SYMBOL_GPL(proxy_vmshm_get);
-
-void proxy_vmshm_put(struct proxy_vmshm_object *obj)
-{
-	struct proxy_vmshm_manager *mgr = &proxy_vmshm_mgr;
-
-	if (!obj)
-		return;
-
-	mutex_lock(&mgr->lock);
-	proxy_vmshm_object_put_locked(obj);
-	mutex_unlock(&mgr->lock);
-}
-EXPORT_SYMBOL_GPL(proxy_vmshm_put);
 
 int proxy_vmshm_pin(struct proxy_vmshm_object *obj)
 {
@@ -1698,7 +1733,6 @@ int proxy_vmshm_lookup_pin(u64 handle, u32 requester_vmid, u32 required_perms,
 	if (!out || !id || !generation)
 		return -EINVAL;
 
-	(void)required_perms;
 	*out = NULL;
 
 	mutex_lock(&mgr->lock);
@@ -1718,7 +1752,8 @@ int proxy_vmshm_lookup_pin(u64 handle, u32 requester_vmid, u32 required_perms,
 		goto out_unlock;
 	}
 
-	if (obj->owner_vmid != requester_vmid) {
+	if (obj->owner_vmid != requester_vmid ||
+	    (required_perms & ~obj->perms)) {
 		ret = -EACCES;
 		goto out_unlock;
 	}
@@ -1733,14 +1768,6 @@ out_unlock:
 	return ret;
 }
 EXPORT_SYMBOL_GPL(proxy_vmshm_lookup_pin);
-
-int proxy_vmshm_lookup(u64 handle, u32 requester_vmid, u32 required_perms,
-		       struct proxy_vmshm_object **out)
-{
-	return proxy_vmshm_lookup_pin(handle, requester_vmid, required_perms,
-				      out);
-}
-EXPORT_SYMBOL_GPL(proxy_vmshm_lookup);
 
 u64 proxy_vmshm_obj_handle(struct proxy_vmshm_object *obj)
 {
@@ -1760,11 +1787,10 @@ u32 proxy_vmshm_obj_generation(struct proxy_vmshm_object *obj)
 }
 EXPORT_SYMBOL_GPL(proxy_vmshm_obj_generation);
 
-u32 proxy_vmshm_obj_type(struct proxy_vmshm_object *obj)
+static u32 proxy_vmshm_obj_type(struct proxy_vmshm_object *obj)
 {
 	return obj ? obj->type : PROXY_VMSHM_OBJ_GENERIC;
 }
-EXPORT_SYMBOL_GPL(proxy_vmshm_obj_type);
 
 u32 proxy_vmshm_obj_owner_vmid(struct proxy_vmshm_object *obj)
 {
@@ -1772,17 +1798,10 @@ u32 proxy_vmshm_obj_owner_vmid(struct proxy_vmshm_object *obj)
 }
 EXPORT_SYMBOL_GPL(proxy_vmshm_obj_owner_vmid);
 
-u32 proxy_vmshm_obj_perms(struct proxy_vmshm_object *obj)
+static u32 proxy_vmshm_obj_perms(struct proxy_vmshm_object *obj)
 {
 	return obj ? obj->perms : 0;
 }
-EXPORT_SYMBOL_GPL(proxy_vmshm_obj_perms);
-
-unsigned int proxy_vmshm_obj_order(struct proxy_vmshm_object *obj)
-{
-	return obj ? obj->order : 0;
-}
-EXPORT_SYMBOL_GPL(proxy_vmshm_obj_order);
 
 void *proxy_vmshm_obj_kva(struct proxy_vmshm_object *obj)
 {
@@ -1795,7 +1814,7 @@ void *proxy_vmshm_obj_kva(struct proxy_vmshm_object *obj)
 }
 EXPORT_SYMBOL_GPL(proxy_vmshm_obj_kva);
 
-phys_addr_t proxy_vmshm_obj_gpa(struct proxy_vmshm_object *obj)
+static phys_addr_t proxy_vmshm_obj_gpa(struct proxy_vmshm_object *obj)
 {
 	if (obj && obj->backing_kind == PROXY_VMSHM_BACKING_SG) {
 		WARN_ON_ONCE(1);
@@ -1804,7 +1823,6 @@ phys_addr_t proxy_vmshm_obj_gpa(struct proxy_vmshm_object *obj)
 
 	return obj ? obj->gpa : 0;
 }
-EXPORT_SYMBOL_GPL(proxy_vmshm_obj_gpa);
 
 u64 proxy_vmshm_obj_offset(struct proxy_vmshm_object *obj)
 {
@@ -2008,7 +2026,7 @@ int proxy_vmshm_grant_create(struct proxy_vmshm_object *obj, u32 target_vmid,
 		goto err_unlock;
 	}
 
-	if (!proxy_vmshm_object_state_usable(obj)) {
+	if (!proxy_vmshm_object_state_usable(obj) || (perms & ~obj->perms)) {
 		ret = -EACCES;
 		goto err_unlock;
 	}
@@ -2068,7 +2086,6 @@ int proxy_vmshm_grant_lookup_pin(u64 grant_id, u32 requester_vmid,
 	if (!out || !id || !generation)
 		return -EINVAL;
 
-	(void)required_perms;
 	*out = NULL;
 
 	mutex_lock(&mgr->lock);
@@ -2099,6 +2116,11 @@ int proxy_vmshm_grant_lookup_pin(u64 grant_id, u32 requester_vmid,
 		goto out_unlock;
 	}
 
+	if (required_perms & ~(grant->perms & obj->perms)) {
+		ret = -EACCES;
+		goto out_unlock;
+	}
+
 	/* grant lookup 也代表正在使用底层 object backing，因此需要 pin。 */
 	ret = proxy_vmshm_object_pin_locked(obj);
 	if (!ret)
@@ -2109,15 +2131,6 @@ out_unlock:
 	return ret;
 }
 EXPORT_SYMBOL_GPL(proxy_vmshm_grant_lookup_pin);
-
-int proxy_vmshm_grant_lookup(u64 grant_id, u32 requester_vmid,
-			     u32 required_perms,
-			     struct proxy_vmshm_object **out)
-{
-	return proxy_vmshm_grant_lookup_pin(grant_id, requester_vmid,
-					    required_perms, out);
-}
-EXPORT_SYMBOL_GPL(proxy_vmshm_grant_lookup);
 
 int proxy_vmshm_grant_revoke(u64 grant_id)
 {
@@ -2267,169 +2280,3 @@ out_send:
 
 	return ret;
 }
-
-#ifdef CONFIG_PROXY_VMSHM_MANAGER_SELFTEST
-static int proxy_vmshm_debug_check_free_area_locked(struct proxy_vmshm_buddy *buddy,
-						    unsigned long *listed_pages)
-{
-	struct proxy_vmshm_buddy_page *page;
-	unsigned long page_idx;
-	unsigned int order;
-
-	*listed_pages = 0;
-
-	for (order = 0; order <= buddy->max_order; order++) {
-		list_for_each_entry(page, &buddy->free_area[order], node) {
-			page_idx = page - buddy->pages;
-
-			if (page_idx >= buddy->nr_pages) {
-				pr_err("proxy_manager_vmshm: debug free_area[%u] has out-of-range page\n",
-				       order);
-				return -EINVAL;
-			}
-
-			if (page->state != PROXY_VMSHM_BLOCK_FREE ||
-			    page->order != order) {
-				pr_err("proxy_manager_vmshm: debug free_area[%u] bad head idx=%lu state=%d order=%u\n",
-				       order, page_idx, page->state, page->order);
-				return -EINVAL;
-			}
-
-			if (page_idx + proxy_vmshm_buddy_order_pages(order) >
-			    buddy->nr_pages) {
-				pr_err("proxy_manager_vmshm: debug free_area[%u] block idx=%lu exceeds pool\n",
-				       order, page_idx);
-				return -EINVAL;
-			}
-
-			*listed_pages += proxy_vmshm_buddy_order_pages(order);
-		}
-	}
-
-	return 0;
-}
-
-static int proxy_vmshm_debug_check_page_map_locked(struct proxy_vmshm_buddy *buddy,
-						   unsigned long *mapped_pages,
-						   unsigned long *free_blocks)
-{
-	unsigned long block_pages, i, page_idx = 0;
-	struct proxy_vmshm_buddy_page *head;
-	struct proxy_vmshm_buddy_page *tail;
-
-	*mapped_pages = 0;
-	*free_blocks = 0;
-
-	while (page_idx < buddy->nr_pages) {
-		head = &buddy->pages[page_idx];
-		if (head->state != PROXY_VMSHM_BLOCK_FREE) {
-			pr_err("proxy_manager_vmshm: debug expected free head at idx=%lu state=%d order=%u\n",
-			       page_idx, head->state, head->order);
-			return -EINVAL;
-		}
-
-		if (head->order > buddy->max_order) {
-			pr_err("proxy_manager_vmshm: debug head idx=%lu has bad order=%u\n",
-			       page_idx, head->order);
-			return -EINVAL;
-		}
-
-		block_pages = proxy_vmshm_buddy_order_pages(head->order);
-		if (page_idx + block_pages > buddy->nr_pages) {
-			pr_err("proxy_manager_vmshm: debug head idx=%lu order=%u exceeds pool\n",
-			       page_idx, head->order);
-			return -EINVAL;
-		}
-
-		for (i = 1; i < block_pages; i++) {
-			tail = &buddy->pages[page_idx + i];
-			if (tail->state != PROXY_VMSHM_BLOCK_TAIL ||
-			    tail->order != head->order) {
-				pr_err("proxy_manager_vmshm: debug bad tail idx=%lu state=%d order=%u expected_order=%u\n",
-				       page_idx + i, tail->state, tail->order,
-				       head->order);
-				return -EINVAL;
-			}
-		}
-
-		*mapped_pages += block_pages;
-		(*free_blocks)++;
-		page_idx += block_pages;
-	}
-
-	return 0;
-}
-
-int proxy_vmshm_manager_debug_check_empty(void)
-{
-	struct proxy_vmshm_manager *mgr = &proxy_vmshm_mgr;
-	struct proxy_vmshm_domain *domain;
-	unsigned long listed_pages, mapped_pages, free_blocks;
-	struct proxy_vmshm_buddy *buddy;
-	unsigned long index;
-	int ret = 0;
-
-	mutex_lock(&mgr->lock);
-	if (!mgr->ready) {
-		ret = -ENODEV;
-		goto out_unlock;
-	}
-
-	index = 0;
-	if (xa_find(&mgr->objects, &index, ULONG_MAX, XA_PRESENT)) {
-		pr_err("proxy_manager_vmshm: debug object xarray is not empty\n");
-		ret = -EBUSY;
-		goto out_unlock;
-	}
-
-	index = 0;
-	if (xa_find(&mgr->grants, &index, ULONG_MAX, XA_PRESENT)) {
-		pr_err("proxy_manager_vmshm: debug grant xarray is not empty\n");
-		ret = -EBUSY;
-		goto out_unlock;
-	}
-
-	index = 0;
-	xa_for_each(&mgr->domains, index, domain) {
-		buddy = &domain->buddy;
-		if (buddy->free_pages != buddy->nr_pages) {
-			pr_err("proxy_manager_vmshm: debug owner_vmid=%u free_pages mismatch free=%lu total=%lu\n",
-			       domain->owner_vmid, buddy->free_pages, buddy->nr_pages);
-			ret = -EBUSY;
-			goto out_unlock;
-		}
-
-		ret = proxy_vmshm_debug_check_free_area_locked(buddy, &listed_pages);
-		if (ret)
-			goto out_unlock;
-
-		if (listed_pages != buddy->nr_pages) {
-			pr_err("proxy_manager_vmshm: debug owner_vmid=%u listed free pages mismatch listed=%lu total=%lu\n",
-			       domain->owner_vmid, listed_pages, buddy->nr_pages);
-			ret = -EINVAL;
-			goto out_unlock;
-		}
-
-		ret = proxy_vmshm_debug_check_page_map_locked(buddy, &mapped_pages,
-							      &free_blocks);
-		if (ret)
-			goto out_unlock;
-
-		if (mapped_pages != buddy->nr_pages) {
-			pr_err("proxy_manager_vmshm: debug owner_vmid=%u page map mismatch mapped=%lu total=%lu\n",
-			       domain->owner_vmid, mapped_pages, buddy->nr_pages);
-			ret = -EINVAL;
-			goto out_unlock;
-		}
-
-		pr_info("proxy_manager_vmshm: debug domain empty owner_vmid=%u free_pages=%lu free_blocks=%lu\n",
-			domain->owner_vmid, buddy->free_pages, free_blocks);
-	}
-
-	pr_info("proxy_manager_vmshm: debug empty check passed objects=0 grants=0\n");
-
-out_unlock:
-	mutex_unlock(&mgr->lock);
-	return ret;
-}
-#endif

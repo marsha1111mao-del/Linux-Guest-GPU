@@ -202,6 +202,9 @@ struct realm_config {
  */
 #define SMC_RSI_OPENCCA_GPA_TO_HPA		SMC_RSI_FID(0x1af)
 
+/* Realm-authenticated endpoints and persistent event state (experimental). */
+#define SMC_RSI_OPENCCA_XSHM		SMC_RSI_FID(0x1ad)
+
 /*
  * Release OpenCCA GPU mapping leases for HPAs previously returned by
  * SMC_RSI_OPENCCA_GPA_TO_HPA. This does not change GPT state or a hardware

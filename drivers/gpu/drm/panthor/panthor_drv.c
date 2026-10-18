@@ -67,6 +67,7 @@ struct panthor_submit_stats {
 	u64 group_create_jobs_ns;
 	u64 group_collect_signals_ns;
 	u64 group_prepare_resvs_ns;
+	u64 group_sync_mapped_bos_ns;
 	u64 group_arm_jobs_ns;
 	u64 group_push_jobs_ns;
 	u64 group_push_update_resvs_ns;
@@ -127,6 +128,7 @@ struct panthor_submit_stats_sample {
 	u64 create_jobs_ns;
 	u64 collect_signals_ns;
 	u64 prepare_resvs_ns;
+	u64 sync_mapped_bos_ns;
 	u64 arm_jobs_ns;
 	u64 push_jobs_ns;
 	u64 push_update_resvs_ns;
@@ -198,12 +200,13 @@ panthor_submit_stats_dump_snapshot(const struct panthor_submit_stats *stats)
 		vm_bind_avg_ns = div64_u64(stats->vm_bind_total_ns,
 					   vm_bind_calls);
 
-	pr_info("panthor: [MZH][PANTHOR_SUBMIT_STATS_GROUP] group_calls=%llu group_jobs=%llu group_avg_ns=%llu group_max_ns=%llu group_copy_jobs_ns=%llu group_init_ctx_ns=%llu group_create_jobs_ns=%llu group_collect_signals_ns=%llu group_prepare_resvs_ns=%llu group_arm_jobs_ns=%llu group_push_jobs_ns=%llu group_push_update_resvs_ns=%llu group_push_entity_ns=%llu group_push_fences_ns=%llu group_cleanup_ns=%llu\n",
+	pr_info("panthor: [MZH][PANTHOR_SUBMIT_STATS_GROUP] group_calls=%llu group_jobs=%llu group_avg_ns=%llu group_max_ns=%llu group_copy_jobs_ns=%llu group_init_ctx_ns=%llu group_create_jobs_ns=%llu group_collect_signals_ns=%llu group_prepare_resvs_ns=%llu group_sync_mapped_bos_ns=%llu group_arm_jobs_ns=%llu group_push_jobs_ns=%llu group_push_update_resvs_ns=%llu group_push_entity_ns=%llu group_push_fences_ns=%llu group_cleanup_ns=%llu\n",
 		stats->group_submit_calls, stats->group_submit_jobs,
 		group_avg_ns, stats->group_submit_max_ns,
 		stats->group_copy_jobs_ns, stats->group_init_ctx_ns,
 		stats->group_create_jobs_ns, stats->group_collect_signals_ns,
-		stats->group_prepare_resvs_ns, stats->group_arm_jobs_ns,
+		stats->group_prepare_resvs_ns, stats->group_sync_mapped_bos_ns,
+		stats->group_arm_jobs_ns,
 		stats->group_push_jobs_ns,
 		stats->group_push_update_resvs_ns,
 		stats->group_push_entity_ns, stats->group_push_fences_ns,
@@ -313,6 +316,7 @@ static void panthor_submit_stats_commit(struct panthor_submit_stats_sample *samp
 		stats->group_create_jobs_ns += sample->create_jobs_ns;
 		stats->group_collect_signals_ns += sample->collect_signals_ns;
 		stats->group_prepare_resvs_ns += sample->prepare_resvs_ns;
+		stats->group_sync_mapped_bos_ns += sample->sync_mapped_bos_ns;
 		stats->group_arm_jobs_ns += sample->arm_jobs_ns;
 		stats->group_push_jobs_ns += sample->push_jobs_ns;
 		stats->group_push_update_resvs_ns +=
@@ -540,8 +544,6 @@ struct panthor_vmshm_session {
 };
 
 #define PANTHOR_BO_FLAGS DRM_PANTHOR_BO_NO_MMAP
-#define PANTHOR_VMSHM_STREAM_TRACE_LIMIT	512
-#define PANTHOR_VMSHM_STREAM_TRACE_MAX_BYTES	SZ_64K
 
 static void panthor_vmshm_release_gem_handles(struct panthor_vmshm_session *session)
 {
@@ -1646,50 +1648,6 @@ int panthor_vmshm_vm_destroy(struct panthor_vmshm_session *session,
 }
 EXPORT_SYMBOL_GPL(panthor_vmshm_vm_destroy);
 
-int panthor_vmshm_bo_create(struct panthor_vmshm_session *session,
-			    struct drm_panthor_bo_create *args)
-{
-	struct panthor_file *pfile;
-	struct panthor_vm *vm = NULL;
-	u64 size;
-	int cookie, ret;
-
-	if (!session || !session->pfile || !args)
-		return -EINVAL;
-
-	pfile = session->pfile;
-	if (!drm_dev_enter(&pfile->ptdev->base, &cookie))
-		return -ENODEV;
-
-	if (!args->size || args->pad || (args->flags & ~PANTHOR_BO_FLAGS)) {
-		ret = -EINVAL;
-		goto out_dev_exit;
-	}
-
-	size = args->size;
-
-	if (args->exclusive_vm_id) {
-		vm = panthor_vm_pool_get_vm(pfile->vms, args->exclusive_vm_id);
-		if (!vm) {
-			ret = -EINVAL;
-			goto out_dev_exit;
-		}
-	}
-
-	ret = panthor_gem_create_with_handle(&session->file, &pfile->ptdev->base,
-					     vm, &size, args->flags,
-					     &args->handle);
-	if (!ret)
-		args->size = size;
-
-	panthor_vm_put(vm);
-
-out_dev_exit:
-	drm_dev_exit(cookie);
-	return ret;
-}
-EXPORT_SYMBOL_GPL(panthor_vmshm_bo_create);
-
 int panthor_vmshm_bo_create_from_payload(struct panthor_vmshm_session *session,
 					 struct drm_panthor_bo_create *args,
 					 struct proxy_vmshm_object *payload)
@@ -1862,6 +1820,33 @@ int panthor_vmshm_syncobj_transfer(struct panthor_vmshm_session *session,
 	return drm_syncobj_transfer(&session->file, args);
 }
 EXPORT_SYMBOL_GPL(panthor_vmshm_syncobj_transfer);
+
+int panthor_vmshm_syncobj_fence_get_at(struct panthor_vmshm_session *session,
+				    __u32 handle, __u64 point, struct dma_fence **fence)
+{
+	if (!session || !session->pfile || !fence)
+		return -EINVAL;
+	/* Keep the complete native chain, not just the most recent job fence. */
+	return drm_syncobj_find_fence(&session->file, handle, point, 0, fence);
+}
+EXPORT_SYMBOL_GPL(panthor_vmshm_syncobj_fence_get_at);
+
+int panthor_vmshm_syncobj_status(struct panthor_vmshm_session *session,
+				 __u32 handle, int *status)
+{
+	struct dma_fence *fence;
+	int ret;
+
+	if (!session || !session->pfile || !status)
+		return -EINVAL;
+	ret = drm_syncobj_find_fence(&session->file, handle, 0, 0, &fence);
+	if (ret)
+		return ret;
+	*status = dma_fence_get_status(fence);
+	dma_fence_put(fence);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(panthor_vmshm_syncobj_status);
 
 int panthor_vmshm_syncobj_timeline_wait(
 	struct panthor_vmshm_session *session, const __u32 *handles,
@@ -2211,22 +2196,22 @@ int panthor_vmshm_group_get_state(struct panthor_vmshm_session *session,
 }
 EXPORT_SYMBOL_GPL(panthor_vmshm_group_get_state);
 
-static u32 panthor_vmshm_stream_hash(const void *data, size_t len);
-static void
-panthor_vmshm_trace_submit_stream(struct panthor_vm *vm,
-				  const struct drm_panthor_queue_submit *job,
-				  unsigned int trace_seq, u32 job_index);
-
 int panthor_vmshm_group_submit(struct panthor_vmshm_session *session,
 			       __u32 group_handle,
 			       const struct drm_panthor_queue_submit *jobs,
 			       const struct drm_panthor_sync_op *syncs,
 			       const __u32 *sync_starts,
 			       const __u32 *sync_counts,
-			       __u32 job_count, unsigned int trace_seq)
+			       __u32 job_count)
 {
 	struct panthor_file *pfile;
 	struct panthor_submit_ctx ctx;
+	struct panthor_submit_stats_sample stats = {
+		.kind = PANTHOR_SUBMIT_STATS_GROUP_SUBMIT,
+		.job_or_op_count = job_count,
+	};
+	bool stats_enabled = panthor_submit_stats_is_enabled();
+	u64 stats_phase_start;
 	int ret = 0, cookie;
 	u32 i;
 
@@ -2258,10 +2243,14 @@ int panthor_vmshm_group_submit(struct panthor_vmshm_session *session,
 	if (!drm_dev_enter(&pfile->ptdev->base, &cookie))
 		return -ENODEV;
 
+	stats.start_ns = panthor_submit_stats_now(stats_enabled);
+	stats_phase_start = panthor_submit_stats_now(stats_enabled);
 	ret = panthor_submit_ctx_init(&ctx, &session->file, job_count);
+	panthor_submit_stats_accum(&stats.init_ctx_ns, stats_phase_start);
 	if (ret)
 		goto out_dev_exit;
 
+	stats_phase_start = panthor_submit_stats_now(stats_enabled);
 	for (i = 0; i < job_count; i++) {
 		struct drm_sched_job *job;
 		const struct drm_panthor_sync_op *job_syncs = NULL;
@@ -2281,136 +2270,59 @@ int panthor_vmshm_group_submit(struct panthor_vmshm_session *session,
 			goto out_cleanup_submit_ctx;
 	}
 
+	panthor_submit_stats_accum(&stats.create_jobs_ns, stats_phase_start);
+	stats_phase_start = panthor_submit_stats_now(stats_enabled);
 	ret = panthor_submit_ctx_collect_jobs_signal_ops(&ctx);
+	panthor_submit_stats_accum(&stats.collect_signals_ns, stats_phase_start);
 	if (ret)
 		goto out_cleanup_submit_ctx;
 
 	if (job_count > 0) {
 		struct panthor_vm *vm = panthor_job_vm(ctx.jobs[0].job);
 
-		for (i = 0; i < job_count; i++)
-			panthor_vmshm_trace_submit_stream(vm, &jobs[i],
-							  trace_seq, i);
 
+		stats_phase_start = panthor_submit_stats_now(stats_enabled);
 		drm_exec_until_all_locked(&ctx.exec)
 		{
 			ret = panthor_vm_prepare_mapped_bos_resvs(&ctx.exec, vm,
 								  job_count);
 		}
+		panthor_submit_stats_accum(&stats.prepare_resvs_ns, stats_phase_start);
 		if (ret)
 			goto out_cleanup_submit_ctx;
 
+		stats_phase_start = panthor_submit_stats_now(stats_enabled);
 		ret = panthor_vm_sync_mapped_bos(vm, DMA_TO_DEVICE);
+		panthor_submit_stats_accum(&stats.sync_mapped_bos_ns, stats_phase_start);
 		if (ret)
 			goto out_cleanup_submit_ctx;
 	}
 
+	stats_phase_start = panthor_submit_stats_now(stats_enabled);
 	ret = panthor_submit_ctx_add_deps_and_arm_jobs(&ctx);
+	panthor_submit_stats_accum(&stats.arm_jobs_ns, stats_phase_start);
 	if (ret)
 		goto out_cleanup_submit_ctx;
 
-	panthor_submit_ctx_push_jobs(&ctx, panthor_job_update_resvs);
+	if (stats_enabled) {
+		stats_phase_start = panthor_submit_stats_now(stats_enabled);
+		panthor_submit_ctx_push_jobs_stats(&ctx, panthor_job_update_resvs, &stats);
+		panthor_submit_stats_accum(&stats.push_jobs_ns, stats_phase_start);
+	} else {
+		panthor_submit_ctx_push_jobs(&ctx, panthor_job_update_resvs);
+	}
 
 out_cleanup_submit_ctx:
+	stats_phase_start = panthor_submit_stats_now(stats_enabled);
 	panthor_submit_ctx_cleanup(&ctx, panthor_job_put);
+	panthor_submit_stats_accum(&stats.cleanup_ns, stats_phase_start);
 
 out_dev_exit:
+	panthor_submit_stats_commit(&stats);
 	drm_dev_exit(cookie);
 	return ret;
 }
 EXPORT_SYMBOL_GPL(panthor_vmshm_group_submit);
-
-static u32 panthor_vmshm_stream_hash(const void *data, size_t len)
-{
-	const u8 *p = data;
-	u32 hash = 0x811c9dc5;
-
-	while (len--) {
-		hash ^= *p++;
-		hash *= 0x01000193;
-	}
-
-	return hash;
-}
-
-static void
-panthor_vmshm_trace_submit_stream(struct panthor_vm *vm,
-				  const struct drm_panthor_queue_submit *job,
-				  unsigned int trace_seq, u32 job_index)
-{
-	struct panthor_gem_object *bo;
-	char first32[3 * 32 + 1] = { 0 };
-	size_t payload_size, scanned_len, prefix_len;
-	u64 bo_offset = 0;
-	void *kva;
-	u32 hash;
-
-	if (!trace_seq || trace_seq > PANTHOR_VMSHM_STREAM_TRACE_LIMIT)
-		return;
-
-	bo = panthor_vm_get_bo_for_va(vm, job->stream_addr, &bo_offset);
-	if (IS_ERR(bo)) {
-		pr_info("panthor-vmshm: STREAM_TRACE seq=%u job=%u queue=%u stream=0x%llx size=%u stage=lookup result=error ret=%ld\n",
-			trace_seq, job_index, job->queue_index,
-			(unsigned long long)job->stream_addr,
-			job->stream_size, PTR_ERR(bo));
-		return;
-	}
-
-	if (!bo->vmshm_payload) {
-		pr_info("panthor-vmshm: STREAM_TRACE seq=%u job=%u queue=%u stream=0x%llx size=%llu stage=backing result=non-vmshm bo_offset=0x%llx payload_size=%llu\n",
-			trace_seq, job_index, job->queue_index,
-			(unsigned long long)job->stream_addr,
-			(unsigned long long)job->stream_size,
-			(unsigned long long)bo_offset,
-			(unsigned long long)bo->base.base.size);
-		goto out_put_bo;
-	}
-
-	payload_size = proxy_vmshm_obj_size(bo->vmshm_payload);
-	if (bo_offset >= payload_size ||
-	    job->stream_size > payload_size - bo_offset) {
-		pr_info("panthor-vmshm: STREAM_TRACE seq=%u job=%u queue=%u stream=0x%llx size=%u stage=range result=error payload=0x%llx bo_offset=0x%llx payload_size=%llu\n",
-			trace_seq, job_index, job->queue_index,
-			(unsigned long long)job->stream_addr,
-			job->stream_size,
-			(unsigned long long)proxy_vmshm_obj_handle(bo->vmshm_payload),
-			(unsigned long long)bo_offset,
-			(unsigned long long)payload_size);
-		goto out_put_bo;
-	}
-
-	kva = proxy_vmshm_obj_kva(bo->vmshm_payload);
-	if (!kva) {
-		pr_info("panthor-vmshm: STREAM_TRACE seq=%u job=%u queue=%u stream=0x%llx size=%u stage=kva result=null payload=0x%llx bo_offset=0x%llx payload_size=%llu\n",
-			trace_seq, job_index, job->queue_index,
-			(unsigned long long)job->stream_addr,
-			job->stream_size,
-			(unsigned long long)proxy_vmshm_obj_handle(bo->vmshm_payload),
-			(unsigned long long)bo_offset,
-			(unsigned long long)payload_size);
-		goto out_put_bo;
-	}
-
-	scanned_len = min_t(size_t, job->stream_size,
-			    PANTHOR_VMSHM_STREAM_TRACE_MAX_BYTES);
-	hash = panthor_vmshm_stream_hash(kva + bo_offset, scanned_len);
-	prefix_len = min_t(size_t, scanned_len, 32);
-	hex_dump_to_buffer(kva + bo_offset, prefix_len, 32, 1,
-			   first32, sizeof(first32), false);
-
-	pr_info("panthor-vmshm: STREAM_TRACE seq=%u job=%u queue=%u stream=0x%llx size=%u scanned=%llu payload=0x%llx generation=%u bo_offset=0x%llx payload_size=%llu hash=0x%08x first32=%s\n",
-		trace_seq, job_index, job->queue_index,
-		(unsigned long long)job->stream_addr, job->stream_size,
-		(unsigned long long)scanned_len,
-		(unsigned long long)proxy_vmshm_obj_handle(bo->vmshm_payload),
-		proxy_vmshm_obj_generation(bo->vmshm_payload),
-		(unsigned long long)bo_offset,
-		(unsigned long long)payload_size, hash, first32);
-
-out_put_bo:
-	drm_gem_object_put(&bo->base.base);
-}
 
 int panthor_vmshm_tiler_heap_create(struct panthor_vmshm_session *session,
 				    struct drm_panthor_tiler_heap_create *args)

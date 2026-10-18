@@ -456,36 +456,127 @@ static int panthor_fw_sync_section_for_cpu(struct panthor_device *ptdev,
 	return panthor_kernel_bo_sync_for_cpu(ptdev, section->mem, 0, size);
 }
 
-static void panthor_fw_sync_shared_for_device(struct panthor_device *ptdev,
-					      const char *where)
+static void panthor_fw_sync_input_for_device(struct panthor_device *ptdev,
+					    const void *input, size_t size,
+					    const char *where)
 {
 	struct panthor_fw_section *section = ptdev->fw->shared_section;
+	size_t offset, end;
 	int ret;
 
-	if (!panthor_gem_realm_gpu_enabled() || !section || !section->mem)
+	if (!panthor_gem_realm_gpu_enabled() || !input || !section || !section->mem)
 		return;
 
-	ret = panthor_fw_sync_section_for_device(ptdev, section);
+	offset = (unsigned long)input - (unsigned long)section->mem->kmap;
+	if (check_add_overflow(offset, size, &end) ||
+	    end > panthor_kernel_bo_size(section->mem)) {
+		drm_WARN_ON_ONCE(&ptdev->base, 1);
+		return;
+	}
+	ret = panthor_kernel_bo_sync_for_device(ptdev, section->mem, offset, size);
 	if (ret)
 		drm_warn(&ptdev->base,
-			 "Failed to sync Realm MCU shared iface before %s ret=%d",
+			 "Failed to sync Realm MCU input before %s ret=%d",
 			 where, ret);
 }
 
-void panthor_fw_sync_shared_for_cpu(struct panthor_device *ptdev,
+static void panthor_fw_sync_cs_inputs_for_device(struct panthor_device *ptdev,
+						u32 csg_id, u32 cs_mask)
+{
+	struct panthor_fw_iface *iface = &ptdev->fw->iface;
+
+	if (!panthor_gem_realm_gpu_enabled())
+		return;
+	while (cs_mask) {
+		u32 cs_id = __ffs(cs_mask);
+		struct panthor_fw_cs_iface *cs = &iface->streams[csg_id][cs_id];
+
+		cs_mask &= ~BIT(cs_id);
+		panthor_fw_sync_input_for_device(ptdev, cs->input,
+						 sizeof(*cs->input), "CS input");
+	}
+}
+
+static void panthor_fw_sync_global_input_for_device(struct panthor_device *ptdev)
+{
+	struct panthor_fw_global_iface *glb = panthor_fw_get_glb_iface(ptdev);
+
+	panthor_fw_sync_input_for_device(ptdev, glb->input, sizeof(*glb->input),
+					 "global input");
+}
+
+bool panthor_fw_ack_idle_event(struct panthor_device *ptdev)
+{
+	struct panthor_fw_global_iface *glb = panthor_fw_get_glb_iface(ptdev);
+	u32 ack;
+
+	if (!glb->input || !glb->output)
+		return false;
+	ack = panthor_fw_read_ack(ptdev, &glb->output->ack);
+	if (!((READ_ONCE(glb->input->req) ^ ack) & GLB_IDLE))
+		return false;
+	panthor_fw_update_reqs(glb, req, ack, GLB_IDLE);
+	/* An empty scheduling tick need not ring another doorbell. Publish
+	 * the CPU-owned ACK without depending on a later request.
+	 */
+	panthor_fw_sync_input_for_device(ptdev, glb->input, sizeof(*glb->input),
+					 "global idle ack");
+	return true;
+}
+
+/* Runtime inputs belong to the CPU and may still be dirty. Invalidating
+ * the whole section while reading GPU output can discard those writes.
+ * Keep boot-time section synchronization separate from runtime output reads.
+ */
+void panthor_fw_sync_output_for_cpu(struct panthor_device *ptdev,
+				    const void *output, size_t size,
 				    const char *where)
 {
 	struct panthor_fw_section *section = ptdev->fw->shared_section;
+	size_t offset, end, alignment;
 	int ret;
 
-	if (!panthor_gem_realm_gpu_enabled() || !section || !section->mem)
+	if (!panthor_gem_realm_gpu_enabled() || !output || !section || !section->mem)
 		return;
-
-	ret = panthor_fw_sync_section_for_cpu(ptdev, section);
+	alignment = dma_get_cache_alignment();
+	offset = (unsigned long)output - (unsigned long)section->mem->kmap;
+	if (check_add_overflow(offset, size, &end) ||
+	    end > panthor_kernel_bo_size(section->mem)) {
+		drm_WARN_ON_ONCE(&ptdev->base, 1);
+		return;
+	}
+	/* Cache maintenance operates on whole lines, including a single ACK. */
+	offset = round_down(offset, alignment);
+	end = round_up(end, alignment);
+	ret = panthor_kernel_bo_sync_for_cpu(ptdev, section->mem, offset, end - offset);
 	if (ret)
-		drm_warn(&ptdev->base,
-			 "Failed to sync Realm MCU shared iface before %s ret=%d",
+		drm_warn(&ptdev->base, "Failed to sync Realm MCU output before %s ret=%d",
 			 where, ret);
+}
+
+void panthor_fw_sync_outputs_for_cpu(struct panthor_device *ptdev,
+				     const char *where)
+{
+	struct panthor_fw_iface *iface = &ptdev->fw->iface;
+	unsigned int group, stream;
+
+	if (!panthor_gem_realm_gpu_enabled())
+		return;
+	panthor_fw_sync_output_for_cpu(ptdev, iface->global.output,
+				      sizeof(*iface->global.output), where);
+	for (group = 0; group < MAX_CSGS && iface->groups[group].output; group++) {
+		struct panthor_fw_csg_iface *csg = &iface->groups[group];
+
+		panthor_fw_sync_output_for_cpu(ptdev, csg->output,
+					      sizeof(*csg->output), where);
+		for (stream = 0; stream < MAX_CS_PER_CSG &&
+		     iface->streams[group][stream].output; stream++) {
+			struct panthor_fw_cs_iface *cs = &iface->streams[group][stream];
+
+			panthor_fw_sync_output_for_cpu(ptdev, cs->output,
+						      sizeof(*cs->output), where);
+		}
+	}
 }
 
 /**
@@ -697,15 +788,6 @@ static int panthor_fw_load_section_entry(struct panthor_device *ptdev,
 			DRM_PANTHOR_BO_NO_MMAP, vm_map_flags, va);
 		if (IS_ERR(section->mem))
 			return PTR_ERR(section->mem);
-
-		if (cc_platform_has(CC_ATTR_MEM_ENCRYPT)) {
-			struct panthor_gem_object *fw_bo =
-				to_panthor_bo(section->mem->obj);
-
-			fw_bo->base.map_wc = false;
-			drm_info_once(&ptdev->base,
-				      "Realm trusted-GPU: firmware MCU sections use cached CPU mappings with explicit sync");
-		}
 
 		if (drm_WARN_ON(&ptdev->base,
 				section->mem->va_node.start != hdr.va.start))
@@ -1093,11 +1175,11 @@ static void panthor_fw_init_global_iface(struct panthor_device *ptdev)
 		GLB_CFG_POWEROFF_TIMER | GLB_IDLE_EN | GLB_IDLE;
 
 	panthor_fw_update_reqs(glb_iface, req, GLB_IDLE_EN, GLB_IDLE_EN);
-	panthor_fw_toggle_reqs(glb_iface, req, ack,
+	panthor_fw_toggle_reqs(ptdev, glb_iface, req, ack,
 			       GLB_CFG_ALLOC_EN | GLB_CFG_POWEROFF_TIMER |
 				       GLB_CFG_PROGRESS_TIMER);
 
-	panthor_fw_sync_shared_for_device(ptdev, "global init doorbell");
+	panthor_fw_sync_global_input_for_device(ptdev);
 	gpu_write(ptdev, CSF_DOORBELL(CSF_GLB_DOORBELL_ID), 1);
 
 	/* Kick the watchdog. */
@@ -1269,13 +1351,13 @@ void panthor_fw_pre_reset(struct panthor_device *ptdev, bool on_hang)
 		int ret;
 
 		panthor_fw_update_reqs(glb_iface, req, GLB_HALT, GLB_HALT);
-		panthor_fw_sync_shared_for_device(ptdev, "halt doorbell");
+		panthor_fw_sync_global_input_for_device(ptdev);
 		gpu_write(ptdev, CSF_DOORBELL(CSF_GLB_DOORBELL_ID), 1);
 		ret = readl_poll_timeout(ptdev->iomem + MCU_STATUS, status,
 					 status == MCU_STATUS_HALT, 10,
 					 100000);
 		if (!ret)
-			panthor_fw_sync_shared_for_cpu(ptdev, "halt ack");
+			panthor_fw_sync_outputs_for_cpu(ptdev, "halt ack");
 		if (!ret &&
 		    glb_iface->output->halt_status == PANTHOR_FW_HALT_OK) {
 			ptdev->fw->fast_reset = true;
@@ -1287,7 +1369,7 @@ void panthor_fw_pre_reset(struct panthor_device *ptdev, bool on_hang)
 		 * the HALT bit before the FW is rebooted.
 		 */
 		panthor_fw_update_reqs(glb_iface, req, 0, GLB_HALT);
-		panthor_fw_sync_shared_for_device(ptdev, "halt clear");
+		panthor_fw_sync_global_input_for_device(ptdev);
 	}
 
 	panthor_job_irq_suspend(&ptdev->fw->irq);
@@ -1390,6 +1472,14 @@ void panthor_fw_unplug(struct panthor_device *ptdev)
 	panthor_gpu_power_off(ptdev, L2, ptdev->gpu_info.l2_present, 20000);
 }
 
+u32 panthor_fw_read_ack(struct panthor_device *ptdev,
+			      const u32 *ack_ptr)
+{
+	/* Realm firmware interfaces need an explicit sync before CPU reads. */
+	panthor_fw_sync_output_for_cpu(ptdev, ack_ptr, sizeof(*ack_ptr), "ack read");
+	return READ_ONCE(*ack_ptr);
+}
+
 /**
  * panthor_fw_wait_acks() - Wait for requests to be acknowledged by the FW.
  * @req_ptr: Pointer to the req register.
@@ -1408,25 +1498,27 @@ static int panthor_fw_wait_acks(struct panthor_device *ptdev,
 				u32 *acked, u32 timeout_ms)
 {
 	u32 ack, req = READ_ONCE(*req_ptr) & req_mask;
-	unsigned long timeout = jiffies + msecs_to_jiffies(timeout_ms);
+	int ret;
 
 	/* Busy wait for a few µsecs before falling back to a sleeping wait. */
 	*acked = req_mask;
-	for (;;) {
-		panthor_fw_sync_shared_for_cpu(ptdev, "ack poll");
-		ack = READ_ONCE(*ack_ptr);
-		if ((ack & req_mask) == req)
-			return 0;
+	ret = read_poll_timeout(panthor_fw_read_ack, ack,
+				(ack & req_mask) == req, 0, 10, false,
+				ptdev, ack_ptr);
+	if (!ret)
+		return 0;
 
-		if (time_after(jiffies, timeout))
-			break;
-
-		wait_event_timeout(*wq, false, 1);
-	}
+	/* Recheck the actual ACK on wakeup instead of sleeping a full jiffy
+	 * unconditionally. Callers can hold the scheduler lock here, so a
+	 * tick-sized delay also stalls unrelated job submission.
+	 */
+	if (wait_event_timeout(*wq,
+			       (panthor_fw_read_ack(ptdev, ack_ptr) & req_mask) == req,
+			       msecs_to_jiffies(timeout_ms)))
+		return 0;
 
 	/* Check one last time, in case we were not woken up for some reason. */
-	panthor_fw_sync_shared_for_cpu(ptdev, "ack final");
-	ack = READ_ONCE(*ack_ptr);
+	ack = panthor_fw_read_ack(ptdev, ack_ptr);
 	if ((ack & req_mask) == req)
 		return 0;
 
@@ -1511,10 +1603,43 @@ void panthor_fw_ring_csg_doorbells(struct panthor_device *ptdev, u32 csg_mask)
 {
 	struct panthor_fw_global_iface *glb_iface =
 		panthor_fw_get_glb_iface(ptdev);
+	u32 pending = panthor_gem_realm_gpu_enabled() ? csg_mask : 0;
 
-	panthor_fw_toggle_reqs(glb_iface, doorbell_req, doorbell_ack, csg_mask);
-	panthor_fw_sync_shared_for_device(ptdev, "CSG doorbell");
+	/* Publish children before making the parent doorbell observable.
+	 * The MCU may see doorbell_req before the MMIO doorbell is written.
+	 * Cleaning global input first lets it consume a stale CSG request.
+	 */
+	while (pending) {
+		u32 csg_id = __ffs(pending);
+		struct panthor_fw_csg_iface *csg = panthor_fw_get_csg_iface(ptdev, csg_id);
+
+		pending &= ~BIT(csg_id);
+		panthor_fw_sync_cs_inputs_for_device(ptdev, csg_id,
+					 GENMASK(csg->control->stream_num - 1, 0));
+		panthor_fw_sync_input_for_device(ptdev, csg->input,
+						 sizeof(*csg->input), "CSG input");
+	}
+	panthor_fw_toggle_reqs(ptdev, glb_iface, doorbell_req, doorbell_ack, csg_mask);
+	panthor_fw_sync_global_input_for_device(ptdev);
 	gpu_write(ptdev, CSF_DOORBELL(CSF_GLB_DOORBELL_ID), 1);
+}
+
+/**
+ * panthor_fw_toggle_cs_doorbells() - Publish CS inputs before their CSG doorbell.
+ * @ptdev: Device.
+ * @csg_id: Command stream group slot.
+ * @cs_mask: Command stream slots whose doorbell bits should be updated.
+ *
+ * The caller subsequently rings the CSG doorbell. This only prepares the
+ * nested doorbell, which must not become visible before its CS inputs.
+ */
+void panthor_fw_toggle_cs_doorbells(struct panthor_device *ptdev, u32 csg_id,
+				  u32 cs_mask)
+{
+	struct panthor_fw_csg_iface *csg = panthor_fw_get_csg_iface(ptdev, csg_id);
+
+	panthor_fw_sync_cs_inputs_for_device(ptdev, csg_id, cs_mask);
+	panthor_fw_toggle_reqs(ptdev, csg, doorbell_req, doorbell_ack, cs_mask);
 }
 
 static void panthor_fw_ping_work(struct work_struct *work)
@@ -1530,8 +1655,8 @@ static void panthor_fw_ping_work(struct work_struct *work)
 	if (panthor_device_reset_is_pending(ptdev))
 		return;
 
-	panthor_fw_toggle_reqs(glb_iface, req, ack, GLB_PING);
-	panthor_fw_sync_shared_for_device(ptdev, "ping doorbell");
+	panthor_fw_toggle_reqs(ptdev, glb_iface, req, ack, GLB_PING);
+	panthor_fw_sync_global_input_for_device(ptdev);
 	gpu_write(ptdev, CSF_DOORBELL(CSF_GLB_DOORBELL_ID), 1);
 
 	ret = panthor_fw_glb_wait_acks(ptdev, GLB_PING, &acked, 100);

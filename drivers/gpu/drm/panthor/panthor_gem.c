@@ -120,7 +120,7 @@ panthor_gem_sync_realm_private_bo(struct panthor_gem_object *bo,
 int panthor_gem_sync_realm_bo_for_device(struct panthor_gem_object *bo,
 					 size_t offset, size_t len)
 {
-	if (!panthor_gem_realm_private_bo(bo))
+	if (!panthor_gem_realm_private_bo(bo) || (bo->flags & PANTHOR_BO_GPU_ONLY))
 		return 0;
 
 	dma_wmb();
@@ -133,7 +133,7 @@ int panthor_gem_sync_realm_bo_for_cpu(struct panthor_gem_object *bo,
 {
 	int ret;
 
-	if (!panthor_gem_realm_private_bo(bo))
+	if (!panthor_gem_realm_private_bo(bo) || (bo->flags & PANTHOR_BO_GPU_ONLY))
 		return 0;
 
 	ret = panthor_gem_sync_realm_private_bo(bo, offset, len,
@@ -142,6 +142,31 @@ int panthor_gem_sync_realm_bo_for_cpu(struct panthor_gem_object *bo,
 		return ret;
 
 	dma_rmb();
+	return 0;
+}
+
+int panthor_kernel_bo_handoff_to_gpu(struct panthor_kernel_bo *kbo)
+{
+	struct panthor_gem_object *bo = to_panthor_bo(kbo->obj);
+	int ret;
+
+	if (!(bo->flags & PANTHOR_BO_GPU_ONLY) ||
+	    !(bo->flags & DRM_PANTHOR_BO_NO_MMAP) || !kbo->kmap || kbo->gpu_owned)
+		return -EINVAL;
+
+	if (panthor_gem_realm_private_bo(bo)) {
+		flush_kernel_vmap_range(kbo->kmap, panthor_kernel_bo_size(kbo));
+		dma_wmb();
+		/* Initial CPU writes must reach PoC, and no dirty CPU line may
+		 * later overwrite GPU writes. No CPU access follows this handoff.
+		 */
+		ret = panthor_gem_sync_realm_private_bo(bo, 0,
+			panthor_kernel_bo_size(kbo), DMA_BIDIRECTIONAL);
+		if (ret)
+			return ret;
+	}
+	panthor_kernel_bo_vunmap(kbo);
+	kbo->gpu_owned = true;
 	return 0;
 }
 
@@ -282,6 +307,8 @@ struct panthor_kernel_bo *panthor_kernel_bo_create(struct panthor_device *ptdev,
 
 	if (drm_WARN_ON(&ptdev->base, !vm))
 		return ERR_PTR(-EINVAL);
+	if ((bo_flags & PANTHOR_BO_GPU_ONLY) && !(bo_flags & DRM_PANTHOR_BO_NO_MMAP))
+		return ERR_PTR(-EINVAL);
 
 	kbo = kzalloc(sizeof(*kbo), GFP_KERNEL);
 	if (!kbo)
@@ -317,19 +344,6 @@ struct panthor_kernel_bo *panthor_kernel_bo_create(struct panthor_device *ptdev,
 	if (ret)
 		goto err_free_va;
 
-	if (panthor_gem_realm_private_bo(bo)) {
-		phys_addr_t first_gpa = 0;
-		phys_addr_t first_hpa = panthor_vm_iova_to_phys(vm,
-								kbo->va_node.start);
-
-		if (obj->pages && obj->pages[0])
-			first_gpa = page_to_phys(obj->pages[0]);
-
-		drm_err(&ptdev->base,
-			"[MZH][PANTHOR_KBO_MAP] gpuva=%#llx size=%zu bo_flags=%#x map_flags=%#x first_gpa=%pa first_iova_hpa=%pa\n",
-			(unsigned long long)kbo->va_node.start, size,
-			bo_flags, vm_map_flags, &first_gpa, &first_hpa);
-	}
 
 	kbo->vm = panthor_vm_get(vm);
 	bo->exclusive_vm_root_gem = panthor_vm_root_gem(vm);

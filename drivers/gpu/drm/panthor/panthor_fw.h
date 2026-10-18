@@ -402,6 +402,7 @@ struct panthor_fw_global_iface {
 
 /**
  * panthor_fw_toggle_reqs() - Toggle acknowledge bits to send an event to the FW
+ * @__ptdev: Device owning the firmware interface.
  * @__iface: The interface to operate on.
  * @__in_reg: Name of the register to update in the input section of the interface.
  * @__out_reg: Name of the register to take as a reference in the output section of the
@@ -421,12 +422,12 @@ struct panthor_fw_global_iface {
  *
  * Anything requiring atomic updates to multiple registers requires a dedicated lock.
  */
-#define panthor_fw_toggle_reqs(__iface, __in_reg, __out_reg, __mask) \
+#define panthor_fw_toggle_reqs(__ptdev, __iface, __in_reg, __out_reg, __mask) \
 	do { \
 		u32 __cur_val, __new_val, __out_val; \
 		spin_lock(&(__iface)->lock); \
 		__cur_val = READ_ONCE((__iface)->input->__in_reg); \
-		__out_val = READ_ONCE((__iface)->output->__out_reg); \
+		__out_val = panthor_fw_read_ack(__ptdev, &(__iface)->output->__out_reg); \
 		__new_val = ((__out_val ^ (__mask)) & (__mask)) | (__cur_val & ~(__mask)); \
 		WRITE_ONCE((__iface)->input->__in_reg, __new_val); \
 		spin_unlock(&(__iface)->lock); \
@@ -473,7 +474,14 @@ int panthor_fw_glb_wait_acks(struct panthor_device *ptdev, u32 req_mask, u32 *ac
 			     u32 timeout_ms);
 
 void panthor_fw_ring_csg_doorbells(struct panthor_device *ptdev, u32 csg_slot);
-void panthor_fw_sync_shared_for_cpu(struct panthor_device *ptdev,
+void panthor_fw_toggle_cs_doorbells(struct panthor_device *ptdev, u32 csg_id,
+				  u32 cs_mask);
+u32 panthor_fw_read_ack(struct panthor_device *ptdev, const u32 *ack_ptr);
+bool panthor_fw_ack_idle_event(struct panthor_device *ptdev);
+void panthor_fw_sync_output_for_cpu(struct panthor_device *ptdev,
+				    const void *output, size_t size,
+				    const char *where);
+void panthor_fw_sync_outputs_for_cpu(struct panthor_device *ptdev,
 				    const char *where);
 
 struct panthor_kernel_bo *

@@ -145,7 +145,7 @@ static int panthor_alloc_heap_chunk(struct panthor_device *ptdev,
 		return -ENOMEM;
 
 	chunk->bo = panthor_kernel_bo_create(ptdev, vm, heap->chunk_size,
-					     DRM_PANTHOR_BO_NO_MMAP,
+					     DRM_PANTHOR_BO_NO_MMAP | PANTHOR_BO_GPU_ONLY,
 					     DRM_PANTHOR_VM_BIND_OP_MAP_NOEXEC,
 					     PANTHOR_VM_KERNEL_AUTO_VA);
 	if (IS_ERR(chunk->bo)) {
@@ -173,7 +173,12 @@ static int panthor_alloc_heap_chunk(struct panthor_device *ptdev,
 			    (heap->chunk_size >> 12);
 	}
 
-	panthor_kernel_bo_vunmap(chunk->bo);
+	/* Only initialization touches a tiler chunk from the CPU. Publish its
+	 * initialized header once, then leave its contents owned by the GPU.
+	 */
+	ret = panthor_kernel_bo_handoff_to_gpu(chunk->bo);
+	if (ret)
+		goto err_destroy_bo;
 
 	mutex_lock(&heap->lock);
 	list_add(&chunk->node, &heap->chunks);

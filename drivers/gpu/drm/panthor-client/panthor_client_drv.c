@@ -7,6 +7,7 @@
  */
 
 #include <linux/bits.h>
+#include <linux/atomic.h>
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
 #include <linux/dma-fence.h>
@@ -15,6 +16,7 @@
 #include <linux/file.h>
 #include <linux/fs.h>
 #include <linux/ktime.h>
+#include <linux/kstrtox.h>
 #include <linux/limits.h>
 #include <linux/math64.h>
 #include <linux/mm.h>
@@ -76,7 +78,44 @@ struct panthor_client_bo {
 	bool destroy_pending;
 };
 
+struct panthor_client_completion_page {
+	refcount_t refs;
+	struct client_vmshm_object *object;
+	const struct panthor_vmshm_completion_page *kva;
+	/* Private local state, never stored in the shared completion page. */
+	spinlock_t retire_lock;
+	u64 session_id;
+	u64 retire_queued, retire_sent, retire_fallback;
+	u32 retired[PANTHOR_VMSHM_RETIRE_MAX];
+	u32 retire_count;
+	bool retire_enabled;
+	bool retire_closing;
+};
+
 struct panthor_client_syncobj {
+	/* Set only for immutable private snapshot wrappers. */
+	struct panthor_client_completion_page *completion_page;
+	u64 completion_cookie;
+	u32 completion_slot;
+	/* Public handles are local. A wire handle is published only once. */
+	struct mutex state_lock;
+	u32 create_flags;
+	/* Only an immutable private snapshot may back an unmaterialized object.
+	 * It has no file reference, so a same-file import cannot form a cycle.
+	 */
+	struct panthor_client_syncobj *snapshot;
+	/* Complete native timeline chain proof, protected by file->lock.
+	 * With no intervening destination write, a complete chain at P also
+	 * completes every positive earlier point. Never a last-job watermark.
+	 */
+	u64 proof_point;
+	u64 proof_cookie;
+	u64 proof_epoch;
+	u32 proof_slot;
+	/* RPC success cache remains exact-point only under sync_epoch. */
+	u64 completed_point;
+	u64 completed_epoch;
+	bool completed_valid;
 	u64 session_id;
 	u32 client_handle;
 	u32 proxy_handle;
@@ -102,22 +141,42 @@ struct panthor_client_heap {
 	u64 first_heap_chunk_gpu_va;
 };
 
+struct panthor_client_plan {
+	u64 id;
+	struct panthor_vmshm_plan_register_req shape;
+};
+
 struct panthor_client_file {
+	struct panthor_client_completion_page *completion_page;
 	u64 session_id;
+	u64 feature_bits;
+	struct mutex plan_lock;
+	struct panthor_client_plan plans[PANTHOR_VMSHM_PLAN_SLOTS];
+	u32 next_plan_slot;
+	u64 plan_hits;
+	u64 plan_misses;
 	struct mutex lock;
 	struct xarray bos;
 	struct xarray syncobjs;
 	struct xarray groups;
 	struct xarray heaps;
 	u64 next_mmap_offset;
+	/* All possible fence mutations invalidate the file-wide generation. */
+	u64 sync_epoch;
+	/* Unknown writes invalidate all public proofs; known writes clear targets. */
+	u64 proof_epoch;
+	u32 sync_mutations;
+	bool sync_epoch_wrapped;
 };
 
 struct panthor_client_sync_fence {
 	struct dma_fence base;
 	struct work_struct work;
+	struct work_struct cleanup_work;
+	bool lazy_wait;
 	spinlock_t lock;
 	u64 session_id;
-	u32 client_syncobj_handle;
+	struct panthor_client_syncobj *snapshot;
 	struct file *session_file;
 	struct mutex snapshot_lock;
 };
@@ -148,6 +207,138 @@ struct panthor_client_syncobj_timeline_wait_legacy {
 	DRM_IOWR(0xCA, struct panthor_client_syncobj_timeline_wait_legacy)
 
 static struct panthor_client_device *panthor_client;
+static unsigned int panthor_client_sync_file_poll_us = 1000;
+static bool panthor_client_fused_snapshot;
+module_param_named(fused_snapshot, panthor_client_fused_snapshot, bool, 0444);
+MODULE_PARM_DESC(fused_snapshot,
+		 "Use negotiated single-RPC sync-file snapshot creation (experimental)");
+static bool panthor_client_completed_snapshot;
+module_param_named(completed_snapshot, panthor_client_completed_snapshot, bool, 0444);
+MODULE_PARM_DESC(completed_snapshot,
+		 "Elide proxy snapshots of verified successful fences (experimental)");
+static bool panthor_client_lazy_snapshot_wait;
+module_param_named(lazy_snapshot_wait, panthor_client_lazy_snapshot_wait, bool, 0444);
+MODULE_PARM_DESC(lazy_snapshot_wait,
+                 "Start snapshot polling only when local signaling is requested (experimental)");
+static atomic64_t panthor_client_lazy_discards = ATOMIC64_INIT(0);
+static atomic64_t panthor_client_completed_exports = ATOMIC64_INIT(0);
+static atomic64_t panthor_client_sync_file_waits = ATOMIC64_INIT(0);
+static atomic64_t panthor_client_sync_file_polls = ATOMIC64_INIT(0);
+static atomic64_t panthor_client_sync_file_wait_ns = ATOMIC64_INIT(0);
+static atomic64_t panthor_client_sync_file_errors = ATOMIC64_INIT(0);
+/* Classify actual timeline RPCs before choosing a cache/notification design. */
+static atomic64_t panthor_client_timeline_wait_flags[16];
+static atomic64_t panthor_client_timeline_wait_single_nonzero[16];
+static atomic64_t panthor_client_timeline_wait_nonblock = ATOMIC64_INIT(0);
+static atomic64_t panthor_client_timeline_wait_success = ATOMIC64_INIT(0);
+static atomic64_t panthor_client_timeline_wait_pending = ATOMIC64_INIT(0);
+static bool panthor_client_completed_wait_cache;
+module_param_named(completed_wait_cache, panthor_client_completed_wait_cache, bool, 0444);
+MODULE_PARM_DESC(completed_wait_cache,
+                 "Reuse confirmed exact-point nonblocking waits between mutations (experimental)");
+static atomic64_t panthor_client_wait_cache_hits = ATOMIC64_INIT(0);
+static atomic64_t panthor_client_wait_cache_candidates = ATOMIC64_INIT(0);
+static atomic64_t panthor_client_wait_cache_records = ATOMIC64_INIT(0);
+static atomic64_t panthor_client_wait_cache_mutations = ATOMIC64_INIT(0);
+static atomic64_t panthor_client_wait_cache_miss_empty = ATOMIC64_INIT(0);
+static atomic64_t panthor_client_wait_cache_miss_point = ATOMIC64_INIT(0);
+static atomic64_t panthor_client_wait_cache_miss_epoch = ATOMIC64_INIT(0);
+static atomic64_t panthor_client_wait_cache_miss_blocked = ATOMIC64_INIT(0);
+static atomic64_t panthor_client_lazy_creates = ATOMIC64_INIT(0);
+static atomic64_t panthor_client_materialized_syncobjs = ATOMIC64_INIT(0);
+static atomic64_t panthor_client_snapshot_imports = ATOMIC64_INIT(0);
+static atomic64_t panthor_client_snapshot_waits = ATOMIC64_INIT(0);
+static atomic64_t panthor_client_point_records = ATOMIC64_INIT(0);
+static atomic64_t panthor_client_point_checks = ATOMIC64_INIT(0);
+static atomic64_t panthor_client_point_hits = ATOMIC64_INIT(0);
+static atomic64_t panthor_client_point_prefix_hits = ATOMIC64_INIT(0);
+static atomic64_t panthor_client_completion_pages = ATOMIC64_INIT(0);
+static atomic64_t panthor_client_completion_checks = ATOMIC64_INIT(0);
+static atomic64_t panthor_client_completion_hits = ATOMIC64_INIT(0);
+static atomic64_t panthor_client_completion_fallbacks = ATOMIC64_INIT(0);
+
+
+static int panthor_client_sync_file_poll_set(const char *value,
+					  const struct kernel_param *kp)
+{
+	unsigned int poll_us;
+	int ret = kstrtouint(value, 0, &poll_us);
+
+	if (ret)
+		return ret;
+	if (poll_us < 50 || poll_us > 10000)
+		return -ERANGE;
+	*(unsigned int *)kp->arg = poll_us;
+	return 0;
+}
+
+static const struct kernel_param_ops panthor_client_sync_file_poll_ops = {
+	.set = panthor_client_sync_file_poll_set,
+	.get = param_get_uint,
+};
+module_param_cb(sync_file_poll_us, &panthor_client_sync_file_poll_ops,
+		&panthor_client_sync_file_poll_us, 0444);
+MODULE_PARM_DESC(sync_file_poll_us,
+		 "Minimum sleep between pending sync-file snapshot checks, 50..10000 us");
+
+static int panthor_client_sync_file_stats_get(char *buffer,
+					    const struct kernel_param *kp)
+{
+	int len, i;
+
+	len = scnprintf(buffer, PAGE_SIZE,
+			 "poll_us=%u waits=%lld polls=%lld total_wait_ns=%lld errors=%lld completed_exports=%lld lazy_discards=%lld",
+			 panthor_client_sync_file_poll_us,
+			 atomic64_read(&panthor_client_sync_file_waits),
+			 atomic64_read(&panthor_client_sync_file_polls),
+			 atomic64_read(&panthor_client_sync_file_wait_ns),
+			 atomic64_read(&panthor_client_sync_file_errors),
+			 atomic64_read(&panthor_client_completed_exports),
+			 atomic64_read(&panthor_client_lazy_discards));
+	for (i = 0; i < ARRAY_SIZE(panthor_client_timeline_wait_flags); i++)
+		len += scnprintf(buffer + len, PAGE_SIZE - len,
+				 " timeline_flags_%x=%lld/%lld", i,
+				 atomic64_read(&panthor_client_timeline_wait_flags[i]),
+				 atomic64_read(&panthor_client_timeline_wait_single_nonzero[i]));
+	len += scnprintf(buffer + len, PAGE_SIZE - len,
+			 " timeline_nonblock=%lld timeline_success=%lld timeline_pending=%lld cache_hits=%lld cache_candidates=%lld cache_records=%lld cache_mutations=%lld cache_miss_empty=%lld cache_miss_point=%lld cache_miss_epoch=%lld cache_miss_blocked=%lld ",
+			 atomic64_read(&panthor_client_timeline_wait_nonblock),
+			 atomic64_read(&panthor_client_timeline_wait_success),
+			 atomic64_read(&panthor_client_timeline_wait_pending),
+			 atomic64_read(&panthor_client_wait_cache_hits),
+			 atomic64_read(&panthor_client_wait_cache_candidates),
+			 atomic64_read(&panthor_client_wait_cache_records),
+			 atomic64_read(&panthor_client_wait_cache_mutations),
+			 atomic64_read(&panthor_client_wait_cache_miss_empty),
+			 atomic64_read(&panthor_client_wait_cache_miss_point),
+			 atomic64_read(&panthor_client_wait_cache_miss_epoch),
+			 atomic64_read(&panthor_client_wait_cache_miss_blocked));
+	len += scnprintf(buffer + len, PAGE_SIZE - len,
+			 "lazy_creates=%lld materialized=%lld snapshot_imports=%lld snapshot_waits=%lld completion_pages=%lld completion_checks=%lld completion_hits=%lld completion_fallbacks=%lld\n",
+			 atomic64_read(&panthor_client_lazy_creates),
+			 atomic64_read(&panthor_client_materialized_syncobjs),
+			 atomic64_read(&panthor_client_snapshot_imports),
+			 atomic64_read(&panthor_client_snapshot_waits),
+			 atomic64_read(&panthor_client_completion_pages),
+			 atomic64_read(&panthor_client_completion_checks),
+			 atomic64_read(&panthor_client_completion_hits),
+			 atomic64_read(&panthor_client_completion_fallbacks));
+	len += scnprintf(buffer + len, PAGE_SIZE - len,
+			 "point_records=%lld point_checks=%lld point_hits=%lld point_prefix_hits=%lld\n",
+			 atomic64_read(&panthor_client_point_records),
+			 atomic64_read(&panthor_client_point_checks),
+			 atomic64_read(&panthor_client_point_hits),
+			 atomic64_read(&panthor_client_point_prefix_hits));
+	return len;
+}
+
+static const struct kernel_param_ops panthor_client_sync_file_stats_ops = {
+	.get = panthor_client_sync_file_stats_get,
+};
+module_param_cb(sync_file_wait_stats, &panthor_client_sync_file_stats_ops, NULL, 0444);
+MODULE_PARM_DESC(sync_file_wait_stats,
+		 "Cumulative snapshot worker wait counters; excludes time queued before worker starts");
+
 static bool panthor_client_bo_mmap_cached;
 module_param_named(bo_mmap_cached, panthor_client_bo_mmap_cached, bool, 0644);
 MODULE_PARM_DESC(bo_mmap_cached,
@@ -339,6 +530,95 @@ static void panthor_client_bos_release_local(struct panthor_client_file *pcfile)
 	xa_destroy(&pcfile->bos);
 }
 
+/* Called only after the last Client reference to a private snapshot is gone.
+ * Its already refcounted completion-page wrapper pins this bounded queue.
+ */
+static bool panthor_client_snapshot_retire(struct panthor_client_syncobj *syncobj)
+{
+	struct panthor_client_completion_page *page = syncobj->completion_page;
+	unsigned long flags;
+	bool queued = false;
+
+	if (!page || !page->retire_enabled || page->session_id != syncobj->session_id)
+		return false;
+	spin_lock_irqsave(&page->retire_lock, flags);
+	if (!page->retire_closing && page->retire_count < PANTHOR_VMSHM_RETIRE_MAX) {
+		page->retired[page->retire_count++] = syncobj->client_handle;
+		page->retire_queued++;
+		queued = true;
+	} else {
+		page->retire_fallback++;
+	}
+	spin_unlock_irqrestore(&page->retire_lock, flags);
+	return queued;
+}
+
+/* A batch is consumed once, including on an ambiguous RPC failure. Session
+ * teardown owns any unreceived retirements; never retry a capture blindly.
+ */
+static void panthor_client_snapshot_retire_take(struct panthor_client_completion_page *page,
+					      struct panthor_vmshm_snapshot_retire_req *req,
+					      bool closing)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&page->retire_lock, flags);
+	page->retire_closing |= closing;
+	req->count = page->retire_count;
+	memcpy(req->handles, page->retired, req->count * sizeof(req->handles[0]));
+	page->retire_count = 0;
+	if (!closing)
+		page->retire_sent += req->count;
+	spin_unlock_irqrestore(&page->retire_lock, flags);
+}
+
+static void panthor_client_snapshot_retire_close(struct panthor_client_completion_page *page)
+{
+	struct panthor_vmshm_snapshot_retire_req req = { 0 };
+	unsigned long flags;
+	u64 queued, sent, fallback;
+	u32 i;
+	int ret;
+
+	if (!page || !page->retire_enabled)
+		return;
+	panthor_client_snapshot_retire_take(page, &req, true);
+	for (i = 0; i < req.count; i++) {
+		ret = panthor_client_syncobj_destroy_rpc_session(page->session_id,
+							 req.handles[i], NULL);
+		if (ret)
+			pr_warn("panthor-client: retired snapshot cleanup failed session=%llu handle=%u ret=%d\n",
+				page->session_id, req.handles[i], ret);
+	}
+	spin_lock_irqsave(&page->retire_lock, flags);
+	queued = page->retire_queued;
+	sent = page->retire_sent;
+	fallback = page->retire_fallback;
+	spin_unlock_irqrestore(&page->retire_lock, flags);
+	pr_info("panthor-client: SNAPSHOT_RETIRE_STATS session=%llu queued=%llu sent=%llu fallback=%llu close=%u\n",
+		page->session_id, queued, sent, fallback, req.count);
+}
+
+static void panthor_client_completion_page_put(struct panthor_client_completion_page *page)
+{
+	if (page && refcount_dec_and_test(&page->refs)) {
+		client_vmshm_manager_put(page->object);
+		kfree(page);
+	}
+}
+
+/* Only an acquire-read matching the private expected cookie proves success.
+ * The peer publishes that cookie after the exact native snapshot completes.
+ */
+static bool panthor_client_snapshot_completed(struct panthor_client_syncobj *snapshot)
+{
+	if (!snapshot || !snapshot->completion_page || !snapshot->completion_cookie ||
+	    snapshot->completion_slot >= PANTHOR_VMSHM_COMPLETION_SLOTS)
+		return false;
+	return smp_load_acquire(&snapshot->completion_page->kva->slots[
+			snapshot->completion_slot].cookie) == snapshot->completion_cookie;
+}
+
 static void
 panthor_client_syncobj_put(struct panthor_client_syncobj *syncobj)
 {
@@ -351,7 +631,8 @@ panthor_client_syncobj_put(struct panthor_client_syncobj *syncobj)
 	if (!refcount_dec_and_test(&syncobj->refcnt))
 		return;
 
-	if (syncobj->destroy_pending) {
+	if (syncobj->destroy_pending && syncobj->client_handle &&
+	    !panthor_client_snapshot_retire(syncobj)) {
 		ret = panthor_client_syncobj_destroy_rpc_session(
 			syncobj->session_id, syncobj->client_handle,
 			&proxy_handle);
@@ -360,11 +641,14 @@ panthor_client_syncobj_put(struct panthor_client_syncobj *syncobj)
 				syncobj->session_id, syncobj->client_handle,
 				ret);
 		else
-			pr_info("panthor-client: SYNCOBJ_DESTROY session=%llu client_sync=%u proxy_sync=%u\n",
+			pr_info_once("panthor-client: SYNCOBJ_DESTROY session=%llu client_sync=%u proxy_sync=%u\n",
 				syncobj->session_id, syncobj->client_handle,
 				proxy_handle);
 	}
 
+	panthor_client_syncobj_put(syncobj->snapshot);
+	panthor_client_completion_page_put(syncobj->completion_page);
+	mutex_destroy(&syncobj->state_lock);
 	kfree(syncobj);
 }
 
@@ -484,7 +768,7 @@ panthor_client_rpc_call(u32 req_type, const void *req, u32 req_len,
 	return 0;
 }
 
-static int panthor_client_rpc_open_session(u64 *session_id)
+static int panthor_client_rpc_open_session(u64 *session_id, u64 *feature_bits)
 {
 	struct panthor_vmshm_open_session_req req = {
 		.version = PANTHOR_VMSHM_ABI_VERSION,
@@ -507,8 +791,63 @@ static int panthor_client_rpc_open_session(u64 *session_id)
 		return -EPROTO;
 
 	*session_id = rsp.session_id;
-	pr_info("panthor-client: OPEN_SESSION session=%llu\n", *session_id);
+	*feature_bits = rsp.feature_bits;
+	pr_info("panthor-client: OPEN_SESSION session=%llu features=0x%llx fused_snapshot=%u\n",
+		*session_id, *feature_bits,
+		panthor_client_fused_snapshot &&
+		!!(*feature_bits & PANTHOR_VMSHM_FEATURE_SYNCOBJ_SNAPSHOT));
 	return 0;
+}
+
+static void panthor_client_completion_page_init(struct panthor_client_file *pcfile)
+{
+	struct panthor_vmshm_completion_page_req req = { .session_id = pcfile->session_id };
+	struct panthor_vmshm_completion_page_rsp rsp = { 0 };
+	struct client_vmshm_lookup_params lookup = {
+		.lookup = VMSHM_MANAGER_LOOKUP_HANDLE,
+		.requester_vmid = client_comm_vmshm_client_vmid(),
+		.required_perms = PROXY_VMSHM_PERM_CPU_READ,
+	};
+	struct panthor_client_completion_page *page;
+	const struct vmshm_manager_desc *desc;
+	int ret;
+
+	if (!(pcfile->feature_bits & PANTHOR_VMSHM_FEATURE_SNAPSHOT_COMPLETION))
+		return;
+	ret = panthor_client_rpc_call(PANTHOR_VMSHM_MSG_COMPLETION_PAGE_REQ,
+		&req, sizeof(req), PANTHOR_VMSHM_MSG_COMPLETION_PAGE_RSP,
+		&rsp, sizeof(rsp), sizeof(rsp), NULL);
+	if (ret || rsp.ret || rsp.pad || !rsp.payload_handle ||
+	    rsp.payload_size != sizeof(struct panthor_vmshm_completion_page))
+		return;
+	page = kzalloc(sizeof(*page), GFP_KERNEL);
+	if (!page)
+		return;
+	lookup.handle = rsp.payload_handle;
+	ret = client_vmshm_manager_get(&lookup, &page->object);
+	if (ret) {
+		kfree(page);
+		return;
+	}
+	desc = client_vmshm_object_desc(page->object);
+	page->kva = client_vmshm_object_kva(page->object);
+	if (!desc || !page->kva || desc->handle != rsp.payload_handle ||
+	    desc->offset != rsp.payload_offset || desc->size != rsp.payload_size ||
+	    desc->type != PROXY_VMSHM_OBJ_FENCE_PAGE ||
+	    desc->perms != PROXY_VMSHM_PERM_CPU_READ ||
+	    !(desc->flags & VMSHM_MANAGER_DESC_F_CONTIG) ||
+	    !IS_ALIGNED((unsigned long)page->kva, sizeof(u64))) {
+		client_vmshm_manager_put(page->object);
+		kfree(page);
+		return;
+	}
+	refcount_set(&page->refs, 1);
+	spin_lock_init(&page->retire_lock);
+	page->session_id = pcfile->session_id;
+	page->retire_enabled = panthor_client_fused_snapshot &&
+		(pcfile->feature_bits & PANTHOR_VMSHM_FEATURE_SNAPSHOT_RETIRE);
+	pcfile->completion_page = page;
+	atomic64_inc(&panthor_client_completion_pages);
 }
 
 static int panthor_client_rpc_close_session(u64 session_id)
@@ -728,16 +1067,6 @@ panthor_client_rpc_group_get_state(
 					      rsp, sizeof(*rsp), sizeof(*rsp), NULL);
 }
 
-static int
-panthor_client_rpc_group_submit(
-	const struct panthor_vmshm_group_submit_req *req,
-	struct panthor_vmshm_group_submit_rsp *rsp)
-{
-	return panthor_client_rpc_call(PANTHOR_VMSHM_MSG_GROUP_SUBMIT_REQ,
-				      req, sizeof(*req),
-				      PANTHOR_VMSHM_MSG_GROUP_SUBMIT_RSP,
-				      rsp, sizeof(*rsp), sizeof(*rsp), NULL);
-}
 
 static int
 panthor_client_rpc_tiler_heap_create(
@@ -973,57 +1302,160 @@ panthor_client_syncobj_destroy_rpc_session(u64 session_id,
 	return 0;
 }
 
+static struct panthor_client_syncobj *panthor_client_syncobj_alloc(u64 session_id)
+{
+	struct panthor_client_syncobj *syncobj = kzalloc(sizeof(*syncobj), GFP_KERNEL);
+
+	if (syncobj) {
+		syncobj->session_id = session_id;
+		mutex_init(&syncobj->state_lock);
+		refcount_set(&syncobj->refcnt, 1);
+	}
+	return syncobj;
+}
+
+/* Materialization is irreversible. Waiters may retain an older immutable
+ * snapshot while a later reset/import starts using this new mutable object.
+ * Callers own a reference and never hold pcfile->lock across these RPCs.
+ */
+static int panthor_client_syncobj_materialize(struct panthor_client_syncobj *syncobj)
+{
+	struct panthor_vmshm_syncobj_create_req req = {
+		.session_id = syncobj->session_id,
+		.flags = syncobj->create_flags,
+	};
+	struct panthor_vmshm_syncobj_create_rsp rsp;
+	struct panthor_vmshm_syncobj_transfer_req transfer = {
+		.session_id = syncobj->session_id,
+	};
+	struct panthor_vmshm_syncobj_transfer_rsp transferred;
+	struct panthor_client_syncobj *snapshot = NULL;
+	int ret = 0;
+
+	mutex_lock(&syncobj->state_lock);
+	if (syncobj->client_handle)
+		goto out_unlock;
+	ret = panthor_client_rpc_syncobj_create(&req, &rsp);
+	if (ret)
+		goto out_unlock;
+	if (rsp.ret) {
+		ret = rsp.ret;
+		goto out_unlock;
+	}
+	if (!rsp.client_syncobj_handle || !rsp.proxy_syncobj_handle) {
+		ret = -EPROTO;
+		goto out_unlock;
+	}
+	if (syncobj->snapshot) {
+		transfer.src_handle = syncobj->snapshot->client_handle;
+		transfer.dst_handle = rsp.client_syncobj_handle;
+		ret = panthor_client_rpc_syncobj_transfer(&transfer, &transferred);
+		if (!ret)
+			ret = transferred.ret;
+		if (ret) {
+			panthor_client_syncobj_destroy_rpc_session(syncobj->session_id,
+							 rsp.client_syncobj_handle, NULL);
+			goto out_unlock;
+		}
+	}
+	/* Publish only a complete object. Failure leaves the old snapshot live. */
+	syncobj->proxy_handle = rsp.proxy_syncobj_handle;
+	syncobj->client_handle = rsp.client_syncobj_handle;
+	atomic64_inc(&panthor_client_materialized_syncobjs);
+	snapshot = syncobj->snapshot;
+	syncobj->snapshot = NULL;
+out_unlock:
+	mutex_unlock(&syncobj->state_lock);
+	panthor_client_syncobj_put(snapshot);
+	return ret;
+}
+
+static int panthor_client_syncobj_wait_handle(struct panthor_client_syncobj *syncobj,
+					    u32 *handle,
+					    struct panthor_client_syncobj **snapshot)
+{
+	int ret;
+
+	mutex_lock(&syncobj->state_lock);
+	if (syncobj->snapshot && panthor_client_syncobj_get(syncobj->snapshot)) {
+		*snapshot = syncobj->snapshot;
+		*handle = (*snapshot)->client_handle;
+		atomic64_inc(&panthor_client_snapshot_waits);
+		mutex_unlock(&syncobj->state_lock);
+		return 0;
+	}
+	mutex_unlock(&syncobj->state_lock);
+	/* An empty object must be materialized even for WAIT_FOR_SUBMIT, so a
+	 * concurrent signal/import can satisfy the same backend wait.
+	 */
+	ret = panthor_client_syncobj_materialize(syncobj);
+	if (!ret)
+		*handle = syncobj->client_handle;
+	return ret;
+}
+
+/* The caller holds the exported fence's snapshot_lock. This ref has no
+ * session_file, unlike the exported fence, so local imports cannot pin their
+ * own file forever. A materialized destination keeps using ordinary TRANSFER.
+ */
+static int panthor_client_syncobj_import_snapshot(struct panthor_client_syncobj *syncobj,
+						 struct panthor_client_syncobj *snapshot)
+{
+	struct panthor_vmshm_syncobj_transfer_req req = {
+		.session_id = syncobj->session_id,
+	};
+	struct panthor_vmshm_syncobj_transfer_rsp rsp;
+	struct panthor_client_syncobj *old = NULL;
+	int ret;
+
+	if (snapshot == syncobj || snapshot->session_id != syncobj->session_id ||
+	    !snapshot->client_handle || snapshot->snapshot)
+		return -EINVAL;
+	mutex_lock(&syncobj->state_lock);
+	if (!syncobj->client_handle) {
+		if (!panthor_client_syncobj_get(snapshot)) {
+			ret = -ESTALE;
+		} else {
+			old = syncobj->snapshot;
+			syncobj->snapshot = snapshot;
+			atomic64_inc(&panthor_client_snapshot_imports);
+			ret = 0;
+		}
+	} else {
+		req.src_handle = snapshot->client_handle;
+		req.dst_handle = syncobj->client_handle;
+		ret = panthor_client_rpc_syncobj_transfer(&req, &rsp);
+		if (!ret)
+			ret = rsp.ret;
+	}
+	mutex_unlock(&syncobj->state_lock);
+	panthor_client_syncobj_put(old);
+	return ret;
+}
+
 static int panthor_client_syncobj_create(struct panthor_client_file *pcfile,
 					 struct drm_syncobj_create *args)
 {
-	struct panthor_vmshm_syncobj_create_req req = { 0 };
-	struct panthor_vmshm_syncobj_create_rsp rsp;
 	struct panthor_client_syncobj *syncobj;
+	u32 handle;
 	int ret;
 
-	if (!pcfile || !args)
+	if (!pcfile || !args || args->flags & ~DRM_SYNCOBJ_CREATE_SIGNALED)
 		return -EINVAL;
-	if (args->flags & ~DRM_SYNCOBJ_CREATE_SIGNALED)
-		return -EINVAL;
-
-	req.session_id = pcfile->session_id;
-	req.flags = args->flags;
-
-	ret = panthor_client_rpc_syncobj_create(&req, &rsp);
-	if (ret)
-		return ret;
-	if (rsp.ret)
-		return rsp.ret;
-	if (!rsp.client_syncobj_handle || !rsp.proxy_syncobj_handle)
-		return -EPROTO;
-
-	syncobj = kzalloc(sizeof(*syncobj), GFP_KERNEL);
-	if (!syncobj) {
-		panthor_client_syncobj_destroy_rpc_session(
-			pcfile->session_id, rsp.client_syncobj_handle, NULL);
+	syncobj = panthor_client_syncobj_alloc(pcfile->session_id);
+	if (!syncobj)
 		return -ENOMEM;
-	}
-
-	syncobj->session_id = pcfile->session_id;
-	syncobj->client_handle = rsp.client_syncobj_handle;
-	syncobj->proxy_handle = rsp.proxy_syncobj_handle;
-	refcount_set(&syncobj->refcnt, 1);
-
+	syncobj->create_flags = args->flags;
 	mutex_lock(&pcfile->lock);
-	ret = xa_insert(&pcfile->syncobjs, rsp.client_syncobj_handle,
-			syncobj, GFP_KERNEL);
+	ret = xa_alloc(&pcfile->syncobjs, &handle, syncobj,
+		       XA_LIMIT(1, U32_MAX), GFP_KERNEL);
 	mutex_unlock(&pcfile->lock);
 	if (ret) {
-		kfree(syncobj);
-		panthor_client_syncobj_destroy_rpc_session(
-			pcfile->session_id, rsp.client_syncobj_handle, NULL);
+		panthor_client_syncobj_put(syncobj);
 		return ret;
 	}
-
-	args->handle = rsp.client_syncobj_handle;
-	pr_info("panthor-client: SYNCOBJ_CREATE session=%llu client_sync=%u proxy_sync=%u flags=0x%x\n",
-		pcfile->session_id, rsp.client_syncobj_handle,
-		rsp.proxy_syncobj_handle, args->flags);
+	args->handle = handle;
+	atomic64_inc(&panthor_client_lazy_creates);
 	return 0;
 }
 
@@ -1046,10 +1478,57 @@ static int panthor_client_syncobj_destroy(struct panthor_client_file *pcfile,
 	return 0;
 }
 
+static bool panthor_client_completion_wait(struct panthor_client_syncobj **snapshots,
+					 struct drm_syncobj_wait *args)
+{
+	bool all = args->flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL;
+	u64 deadline = ktime_get_ns() + 1000 * NSEC_PER_USEC;
+	bool any_hint = false;
+	u32 i;
+
+	for (i = 0; i < args->count_handles; i++) {
+		bool hint = snapshots[i] && snapshots[i]->completion_page &&
+			    snapshots[i]->completion_cookie;
+
+		if (all && !hint)
+			return false;
+		any_hint |= hint;
+	}
+	if (!any_hint)
+		return false;
+	atomic64_inc(&panthor_client_completion_checks);
+	if (args->timeout_nsec <= 0)
+		deadline = 0;
+	else
+		deadline = min_t(u64, deadline, args->timeout_nsec);
+	for (;;) {
+		u32 ready = 0, first = 0;
+
+		for (i = 0; i < args->count_handles; i++) {
+			if (panthor_client_snapshot_completed(snapshots[i])) {
+				if (!ready)
+					first = i;
+				ready++;
+			}
+		}
+		if ((all && ready == args->count_handles) || (!all && ready)) {
+			args->first_signaled = all ? 0 : first;
+			atomic64_inc(&panthor_client_completion_hits);
+			return true;
+		}
+		if (need_resched() || signal_pending(current) || ktime_get_ns() >= deadline)
+			break;
+		cpu_relax();
+	}
+	atomic64_inc(&panthor_client_completion_fallbacks);
+	return false;
+}
+
 static int panthor_client_syncobj_wait(struct panthor_client_file *pcfile,
 				       struct drm_syncobj_wait *args)
 {
 	struct panthor_client_syncobj *syncobjs[PANTHOR_VMSHM_MAX_SYNCOBJ_WAIT_HANDLES] = { 0 };
+	struct panthor_client_syncobj *snapshots[PANTHOR_VMSHM_MAX_SYNCOBJ_WAIT_HANDLES] = { 0 };
 	struct panthor_vmshm_syncobj_wait_req req = { 0 };
 	struct panthor_vmshm_syncobj_wait_rsp rsp = { 0 };
 	u32 handles[PANTHOR_VMSHM_MAX_SYNCOBJ_WAIT_HANDLES];
@@ -1098,10 +1577,22 @@ static int panthor_client_syncobj_wait(struct panthor_client_file *pcfile,
 		}
 
 		syncobjs[i] = syncobj;
-		req.handles[i] = syncobj->client_handle;
 	}
 	mutex_unlock(&pcfile->lock);
 
+	for (i = 0; i < args->count_handles; i++) {
+		ret = panthor_client_syncobj_wait_handle(syncobjs[i], &req.handles[i],
+						 &snapshots[i]);
+		if (ret)
+			goto out_put_syncobjs;
+	}
+	if (panthor_client_completion_wait(snapshots, args))
+		goto out_put_syncobjs;
+	/* Polling/materialization consume the user's original absolute deadline. */
+	req.timeout_rel_nsec = panthor_client_abs_timeout_to_rel_ns(args->timeout_nsec);
+	if (args->flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_DEADLINE)
+		req.deadline_rel_nsec =
+			panthor_client_abs_deadline_to_rel_ns(args->deadline_nsec);
 	ret = panthor_client_rpc_syncobj_wait(&req, &rsp);
 	if (ret)
 		goto out_put_syncobjs;
@@ -1111,7 +1602,7 @@ static int panthor_client_syncobj_wait(struct panthor_client_file *pcfile,
 	}
 
 	args->first_signaled = rsp.first_signaled;
-	pr_info_ratelimited("panthor-client: SYNCOBJ_WAIT session=%llu count=%u flags=0x%x first=%u\n",
+	pr_debug("panthor-client: SYNCOBJ_WAIT session=%llu count=%u flags=0x%x first=%u\n",
 			    pcfile->session_id, args->count_handles,
 			    args->flags, rsp.first_signaled);
 	ret = 0;
@@ -1121,8 +1612,10 @@ out_unlock:
 	mutex_unlock(&pcfile->lock);
 
 out_put_syncobjs:
-	for (i = 0; i < args->count_handles; i++)
+	for (i = 0; i < args->count_handles; i++) {
+		panthor_client_syncobj_put(snapshots[i]);
 		panthor_client_syncobj_put(syncobjs[i]);
+	}
 
 	return ret;
 }
@@ -1139,12 +1632,46 @@ panthor_client_sync_fence_timeline_name(struct dma_fence *fence)
 	return "proxy-syncobj";
 }
 
+/* release() may run in atomic context. An unused exported snapshot still
+ * owns a proxy handle and a DRM file reference, so destroy it asynchronously.
+ * A running wait worker owns a fence reference and clears the handle before
+ * dropping that reference; consequently it can never race this cleanup.
+ */
+static void panthor_client_sync_fence_cleanup(struct work_struct *work)
+{
+	struct panthor_client_sync_fence *sync_fence =
+		container_of(work, struct panthor_client_sync_fence, cleanup_work);
+
+	panthor_client_syncobj_put(sync_fence->snapshot);
+	atomic64_inc(&panthor_client_lazy_discards);
+	fput(sync_fence->session_file);
+	mutex_destroy(&sync_fence->snapshot_lock);
+	dma_fence_free(&sync_fence->base);
+}
+
+static bool panthor_client_sync_fence_enable_signaling(struct dma_fence *fence)
+{
+	struct panthor_client_sync_fence *sync_fence =
+		container_of(fence, struct panthor_client_sync_fence, base);
+
+	if (sync_fence->lazy_wait) {
+		/* Called once, with fence->lock held. Never perform an RPC here. */
+		dma_fence_get(fence);
+		queue_work(panthor_client->sync_file_wq, &sync_fence->work);
+	}
+	return true;
+}
+
 static void
 panthor_client_sync_fence_release(struct dma_fence *fence)
 {
 	struct panthor_client_sync_fence *sync_fence =
 		container_of(fence, struct panthor_client_sync_fence, base);
 
+	if (sync_fence->snapshot) {
+		queue_work(panthor_client->sync_file_wq, &sync_fence->cleanup_work);
+		return;
+	}
 	mutex_destroy(&sync_fence->snapshot_lock);
 	dma_fence_free(&sync_fence->base);
 }
@@ -1152,6 +1679,7 @@ panthor_client_sync_fence_release(struct dma_fence *fence)
 static const struct dma_fence_ops panthor_client_sync_fence_ops = {
 	.get_driver_name = panthor_client_sync_fence_driver_name,
 	.get_timeline_name = panthor_client_sync_fence_timeline_name,
+	.enable_signaling = panthor_client_sync_fence_enable_signaling,
 	.release = panthor_client_sync_fence_release,
 };
 
@@ -1172,7 +1700,7 @@ static void panthor_client_sync_fence_work(struct work_struct *work)
 	int wait_ret = 0;
 	int ret;
 
-	req.handles[0] = sync_fence->client_syncobj_handle;
+	req.handles[0] = sync_fence->snapshot->client_handle;
 
 	for (;;) {
 		/*
@@ -1184,6 +1712,10 @@ static void panthor_client_sync_fence_work(struct work_struct *work)
 		 */
 		req.timeout_rel_nsec = 0;
 		segments++;
+		if (panthor_client_snapshot_completed(sync_fence->snapshot)) {
+			ret = 0;
+			break;
+		}
 		ret = panthor_client_rpc_syncobj_wait(&req, &rsp);
 		if (!ret && !rsp.ret)
 			break;
@@ -1196,7 +1728,8 @@ static void panthor_client_sync_fence_work(struct work_struct *work)
 		    (!ret && (rsp.ret == -ETIMEDOUT || rsp.ret == -ETIME))) {
 			elapsed_ns = ktime_get_ns() - start_ns;
 			if (elapsed_ns < PANTHOR_CLIENT_SYNC_FILE_WAIT_NSEC) {
-				usleep_range(1000, 2000);
+				usleep_range(panthor_client_sync_file_poll_us,
+					     panthor_client_sync_file_poll_us * 2);
 				continue;
 			}
 		}
@@ -1206,15 +1739,21 @@ static void panthor_client_sync_fence_work(struct work_struct *work)
 		break;
 	}
 
+	atomic64_inc(&panthor_client_sync_file_waits);
+	atomic64_add(segments, &panthor_client_sync_file_polls);
+	atomic64_add(ktime_get_ns() - start_ns, &panthor_client_sync_file_wait_ns);
+	if (wait_ret)
+		atomic64_inc(&panthor_client_sync_file_errors);
+
 	if (wait_ret)
 		pr_warn_ratelimited("panthor-client: sync-file proxy wait failed session=%llu client_sync=%u ret=%d rsp_ret=%d segments=%u\n",
 				    sync_fence->session_id,
-				    sync_fence->client_syncobj_handle, ret,
+				    sync_fence->snapshot->client_handle, ret,
 				    rsp.ret, segments);
 	else
-		pr_info_ratelimited("panthor-client: SYNC_FILE_WAIT_DONE session=%llu client_sync=%u segments=%u elapsed_ms=%llu\n",
+		pr_debug("panthor-client: SYNC_FILE_WAIT_DONE session=%llu client_sync=%u segments=%u elapsed_ms=%llu\n",
 				    sync_fence->session_id,
-				    sync_fence->client_syncobj_handle,
+				    sync_fence->snapshot->client_handle,
 				    segments,
 				    (ktime_get_ns() - start_ns) / NSEC_PER_MSEC);
 	mutex_lock(&sync_fence->snapshot_lock);
@@ -1223,21 +1762,19 @@ static void panthor_client_sync_fence_work(struct work_struct *work)
 	 * This handle is a private snapshot, not the user's mutable syncobj.
 	 * Keep the DRM file/session alive until the wait and destroy complete.
 	 */
-	ret = panthor_client_syncobj_destroy_rpc_session(
-		sync_fence->session_id, sync_fence->client_syncobj_handle, NULL);
-	if (ret)
-		pr_warn("panthor-client: sync-file snapshot destroy failed session=%llu snapshot_sync=%u ret=%d\n",
-			sync_fence->session_id,
-			sync_fence->client_syncobj_handle, ret);
-	sync_fence->client_syncobj_handle = 0;
+	panthor_client_syncobj_put(sync_fence->snapshot);
+	sync_fence->snapshot = NULL;
 	mutex_unlock(&sync_fence->snapshot_lock);
 	fput(sync_fence->session_file);
 	dma_fence_put(&sync_fence->base);
 }
 
 static int
-panthor_client_syncobj_snapshot(u64 session_id, u32 source_handle,
-				u32 *snapshot_handle)
+panthor_client_syncobj_snapshot(u64 session_id, u64 feature_bits,
+				struct panthor_client_completion_page *page,
+				u32 source_handle,
+				u32 *snapshot_handle,
+				struct panthor_vmshm_snapshot_watch_rsp *watch)
 {
 	struct panthor_vmshm_syncobj_create_req create = {
 		.session_id = session_id,
@@ -1249,6 +1786,59 @@ panthor_client_syncobj_snapshot(u64 session_id, u32 source_handle,
 	};
 	struct panthor_vmshm_syncobj_transfer_rsp transferred;
 	int ret;
+
+	if (panthor_client_fused_snapshot &&
+	    (feature_bits & PANTHOR_VMSHM_FEATURE_SYNCOBJ_SNAPSHOT)) {
+		struct panthor_vmshm_syncobj_snapshot_req snapshot = {
+			.session_id = session_id,
+			.source_handle = source_handle,
+		};
+
+		if (panthor_client_completed_snapshot &&
+		    (feature_bits & PANTHOR_VMSHM_FEATURE_COMPLETED_SNAPSHOT))
+			snapshot.pad = PANTHOR_VMSHM_SNAPSHOT_ALLOW_COMPLETED;
+		if (watch) {
+			if (page && page->retire_enabled) {
+				struct panthor_vmshm_snapshot_retire_req req = { .snapshot = snapshot };
+
+				panthor_client_snapshot_retire_take(page, &req, false);
+				ret = panthor_client_rpc_call(PANTHOR_VMSHM_MSG_SNAPSHOT_RETIRE_REQ,
+					&req, sizeof(req), PANTHOR_VMSHM_MSG_SNAPSHOT_RETIRE_RSP,
+					watch, sizeof(*watch), sizeof(*watch), NULL);
+			} else {
+				ret = panthor_client_rpc_call(PANTHOR_VMSHM_MSG_SNAPSHOT_WATCH_REQ,
+					&snapshot, sizeof(snapshot), PANTHOR_VMSHM_MSG_SNAPSHOT_WATCH_RSP,
+					watch, sizeof(*watch), sizeof(*watch), NULL);
+			}
+			created = watch->snapshot;
+			if (!ret && (watch->pad ||
+			    (watch->cookie && watch->slot >= PANTHOR_VMSHM_COMPLETION_SLOTS)))
+				return -EPROTO;
+		} else {
+		ret = panthor_client_rpc_call(
+			PANTHOR_VMSHM_MSG_SYNCOBJ_SNAPSHOT_REQ,
+			&snapshot, sizeof(snapshot),
+			PANTHOR_VMSHM_MSG_SYNCOBJ_SNAPSHOT_RSP,
+			&created, sizeof(created), sizeof(created), NULL);
+		}
+		if (ret)
+			return ret;
+		if (created.ret)
+			return created.ret;
+		if (created.pad) {
+			if (created.pad != PANTHOR_VMSHM_SNAPSHOT_COMPLETED ||
+			    !snapshot.pad || created.client_syncobj_handle ||
+			    created.proxy_syncobj_handle)
+				return -EPROTO;
+			/* Zero denotes a successfully completed, handle-free snapshot. */
+			*snapshot_handle = 0;
+			return 0;
+		}
+		if (!created.client_syncobj_handle || !created.proxy_syncobj_handle)
+			return -EPROTO;
+		*snapshot_handle = created.client_syncobj_handle;
+		return 0;
+	}
 
 	ret = panthor_client_rpc_syncobj_create(&create, &created);
 	if (ret)
@@ -1282,6 +1872,7 @@ panthor_client_syncobj_export_sync_file(struct panthor_client_file *pcfile,
 					struct drm_syncobj_handle *args,
 					struct file *filp)
 {
+	struct panthor_vmshm_snapshot_watch_rsp watched = { 0 };
 	struct panthor_client_sync_fence *sync_fence;
 	struct panthor_client_syncobj *syncobj;
 	struct sync_file *sync_file;
@@ -1315,34 +1906,71 @@ panthor_client_syncobj_export_sync_file(struct panthor_client_file *pcfile,
 		goto out_put_fd;
 	}
 
+	ret = panthor_client_syncobj_materialize(syncobj);
+	if (ret) {
+		kfree(sync_fence);
+		goto out_put_fd;
+	}
 	ret = panthor_client_syncobj_snapshot(pcfile->session_id,
+					     pcfile->feature_bits, pcfile->completion_page,
 					     syncobj->client_handle,
-					     &snapshot_handle);
+					     &snapshot_handle, pcfile->completion_page ? &watched : NULL);
 	if (ret) {
 		kfree(sync_fence);
 		goto out_put_fd;
 	}
 
 	sync_fence->session_id = pcfile->session_id;
-	sync_fence->client_syncobj_handle = snapshot_handle;
-	sync_fence->session_file = get_file(filp);
+	if (snapshot_handle) {
+		sync_fence->snapshot = panthor_client_syncobj_alloc(pcfile->session_id);
+		if (!sync_fence->snapshot) {
+			panthor_client_syncobj_destroy_rpc_session(pcfile->session_id,
+							 snapshot_handle, NULL);
+			kfree(sync_fence);
+			ret = -ENOMEM;
+			goto out_put_fd;
+		}
+		sync_fence->snapshot->client_handle = snapshot_handle;
+		sync_fence->snapshot->destroy_pending = true;
+		if (pcfile->completion_page &&
+		    (watched.cookie || pcfile->completion_page->retire_enabled)) {
+			refcount_inc(&pcfile->completion_page->refs);
+			sync_fence->snapshot->completion_page = pcfile->completion_page;
+			sync_fence->snapshot->completion_cookie = watched.cookie;
+			sync_fence->snapshot->completion_slot = watched.slot;
+		}
+	}
 	mutex_init(&sync_fence->snapshot_lock);
 	spin_lock_init(&sync_fence->lock);
 	INIT_WORK(&sync_fence->work, panthor_client_sync_fence_work);
+	INIT_WORK(&sync_fence->cleanup_work, panthor_client_sync_fence_cleanup);
+	sync_fence->lazy_wait = panthor_client_lazy_snapshot_wait;
 	dma_fence_init(&sync_fence->base, &panthor_client_sync_fence_ops,
 		       &sync_fence->lock, dma_fence_context_alloc(1), 1);
 
-	/* The work item and the sync_file each own a fence reference. */
-	dma_fence_get(&sync_fence->base);
-	if (!queue_work(panthor_client->sync_file_wq, &sync_fence->work)) {
-		ret = -EWOULDBLOCK;
-		dma_fence_put(&sync_fence->base);
-		panthor_client_syncobj_destroy_rpc_session(
-			pcfile->session_id, snapshot_handle, NULL);
-		fput(sync_fence->session_file);
-		goto out_put_export_ref;
+	if (snapshot_handle) {
+		sync_fence->session_file = get_file(filp);
+		if (sync_fence->lazy_wait)
+			goto create_sync_file;
+		/* The work item and the sync_file each own a fence reference. */
+		dma_fence_get(&sync_fence->base);
+		if (!queue_work(panthor_client->sync_file_wq, &sync_fence->work)) {
+			ret = -EWOULDBLOCK;
+			dma_fence_put(&sync_fence->base);
+			panthor_client_syncobj_put(sync_fence->snapshot);
+			fput(sync_fence->session_file);
+			sync_fence->snapshot = NULL;
+			goto out_put_export_ref;
+		}
+	} else {
+		/* Keep our fence type/session identity for same-session import.
+		 * No proxy handle, worker or DRM file reference is needed after
+		 * a successful completion has been captured by the proxy.
+		 */
+		dma_fence_signal(&sync_fence->base);
 	}
 
+create_sync_file:
 	sync_file = sync_file_create(&sync_fence->base);
 	if (!sync_file) {
 		ret = -ENOMEM;
@@ -1351,7 +1979,9 @@ panthor_client_syncobj_export_sync_file(struct panthor_client_file *pcfile,
 
 	args->fd = fd;
 	fd_install(fd, sync_file->file);
-	pr_info_ratelimited("panthor-client: SYNCOBJ_EXPORT_SYNC_FILE session=%llu client_sync=%u proxy_sync=%u snapshot_sync=%u fd=%d\n",
+	if (!snapshot_handle)
+		atomic64_inc(&panthor_client_completed_exports);
+	pr_debug("panthor-client: SYNCOBJ_EXPORT_SYNC_FILE session=%llu client_sync=%u proxy_sync=%u snapshot_sync=%u fd=%d\n",
 			    pcfile->session_id, syncobj->client_handle,
 			    syncobj->proxy_handle, snapshot_handle, fd);
 	ret = 0;
@@ -1380,6 +2010,9 @@ panthor_client_syncobj_signal_proxy(u64 session_id,
 	struct panthor_vmshm_syncobj_array_rsp rsp;
 	int ret;
 
+	ret = panthor_client_syncobj_materialize(syncobj);
+	if (ret)
+		return ret;
 	req.handles[0] = syncobj->client_handle;
 	ret = panthor_client_rpc_syncobj_array(
 		PANTHOR_VMSHM_MSG_SYNCOBJ_SIGNAL_REQ,
@@ -1390,15 +2023,13 @@ panthor_client_syncobj_signal_proxy(u64 session_id,
 	return ret;
 }
 
-/* Import installs the captured proxy fence before returning to userspace. */
+/* Import publishes the captured immutable fence before returning to userspace. */
 static int
 panthor_client_syncobj_import_sync_file(struct panthor_client_file *pcfile,
 					struct drm_syncobj_handle *args)
 {
 	struct panthor_client_sync_fence *sync_fence;
 	struct panthor_client_syncobj *syncobj;
-	struct panthor_vmshm_syncobj_transfer_req req = { 0 };
-	struct panthor_vmshm_syncobj_transfer_rsp rsp;
 	struct dma_fence *fence;
 	int status;
 	int ret;
@@ -1413,6 +2044,7 @@ panthor_client_syncobj_import_sync_file(struct panthor_client_file *pcfile,
 		mutex_unlock(&pcfile->lock);
 		return -ENOENT;
 	}
+	syncobj->proof_cookie = 0;
 	mutex_unlock(&pcfile->lock);
 
 	fence = sync_file_get_fence(args->fd);
@@ -1445,15 +2077,11 @@ panthor_client_syncobj_import_sync_file(struct panthor_client_file *pcfile,
 	} else if (status == 1) {
 		ret = panthor_client_syncobj_signal_proxy(pcfile->session_id,
 							 syncobj);
-	} else if (!sync_fence->client_syncobj_handle) {
+	} else if (!sync_fence->snapshot) {
 		ret = -EPROTO;
 	} else {
-		req.session_id = pcfile->session_id;
-		req.src_handle = sync_fence->client_syncobj_handle;
-		req.dst_handle = syncobj->client_handle;
-		ret = panthor_client_rpc_syncobj_transfer(&req, &rsp);
-		if (!ret)
-			ret = rsp.ret;
+		ret = panthor_client_syncobj_import_snapshot(syncobj,
+							      sync_fence->snapshot);
 	}
 	mutex_unlock(&sync_fence->snapshot_lock);
 
@@ -1461,7 +2089,7 @@ panthor_client_syncobj_import_sync_file(struct panthor_client_file *pcfile,
 		pr_warn("panthor-client: SYNCOBJ_IMPORT_SYNC_FILE failed session=%llu client_sync=%u status=%d ret=%d\n",
 			pcfile->session_id, syncobj->client_handle, status, ret);
 	else
-		pr_info_ratelimited("panthor-client: SYNCOBJ_IMPORT_SYNC_FILE session=%llu client_sync=%u status=%d\n",
+		pr_debug("panthor-client: SYNCOBJ_IMPORT_SYNC_FILE session=%llu client_sync=%u status=%d\n",
 				    pcfile->session_id, syncobj->client_handle,
 				    status);
 
@@ -1498,8 +2126,15 @@ panthor_client_syncobj_transfer(struct panthor_client_file *pcfile,
 		ret = -ENOENT;
 		goto out_unlock;
 	}
+	dst_syncobj->proof_cookie = 0;
 	mutex_unlock(&pcfile->lock);
 
+	ret = panthor_client_syncobj_materialize(src_syncobj);
+	if (ret)
+		goto out_put_syncobjs;
+	ret = panthor_client_syncobj_materialize(dst_syncobj);
+	if (ret)
+		goto out_put_syncobjs;
 	req.session_id = pcfile->session_id;
 	req.src_handle = src_syncobj->client_handle;
 	req.dst_handle = dst_syncobj->client_handle;
@@ -1515,7 +2150,7 @@ panthor_client_syncobj_transfer(struct panthor_client_file *pcfile,
 		goto out_put_syncobjs;
 	}
 
-	pr_info("panthor-client: SYNCOBJ_TRANSFER session=%llu src=%u dst=%u src_point=%llu dst_point=%llu flags=0x%x\n",
+	pr_info_once("panthor-client: SYNCOBJ_TRANSFER session=%llu src=%u dst=%u src_point=%llu dst_point=%llu flags=0x%x\n",
 		pcfile->session_id, args->src_handle, args->dst_handle,
 		args->src_point, args->dst_point, args->flags);
 	ret = 0;
@@ -1543,6 +2178,8 @@ panthor_client_syncobj_timeline_wait(
 	u64 points[PANTHOR_VMSHM_MAX_SYNCOBJ_WAIT_HANDLES];
 	void __user *user_handles;
 	void __user *user_points;
+	u64 cache_epoch = 0;
+	bool cache_candidate, cache_record = false;
 	u32 possible_flags;
 	int ret = 0;
 	u32 i;
@@ -1581,6 +2218,13 @@ panthor_client_syncobj_timeline_wait(
 		req.deadline_rel_nsec =
 			panthor_client_abs_deadline_to_rel_ns(args->deadline_nsec);
 
+	cache_candidate = panthor_client_completed_wait_cache &&
+		args->count_handles == 1 && points[0] &&
+		args->flags == DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL &&
+		!req.timeout_rel_nsec;
+	if (cache_candidate)
+		atomic64_inc(&panthor_client_wait_cache_candidates);
+
 	mutex_lock(&pcfile->lock);
 	for (i = 0; i < args->count_handles; i++) {
 		struct panthor_client_syncobj *syncobj =
@@ -1592,12 +2236,66 @@ panthor_client_syncobj_timeline_wait(
 		}
 
 		syncobjs[i] = syncobj;
-		req.handles[i] = syncobj->client_handle;
 		req.points[i] = points[i];
+	}
+	if (cache_candidate && !pcfile->sync_mutations &&
+	    !pcfile->sync_epoch_wrapped) {
+		struct panthor_client_syncobj *syncobj = syncobjs[0];
+
+		if (pcfile->completion_page && syncobj->proof_cookie &&
+		    syncobj->proof_epoch == pcfile->proof_epoch &&
+		    syncobj->proof_point >= points[0]) {
+			atomic64_inc(&panthor_client_point_checks);
+			if (smp_load_acquire(&pcfile->completion_page->kva->slots[
+					syncobj->proof_slot].cookie) == syncobj->proof_cookie) {
+				args->first_signaled = 0;
+				atomic64_inc(&panthor_client_point_hits);
+				if (points[0] < syncobj->proof_point)
+					atomic64_inc(&panthor_client_point_prefix_hits);
+				goto out_unlock;
+			}
+		}
+		cache_epoch = pcfile->sync_epoch;
+		cache_record = true;
+		if (syncobjs[0]->completed_valid &&
+		    syncobjs[0]->completed_epoch == cache_epoch &&
+		    syncobjs[0]->completed_point == points[0]) {
+			args->first_signaled = 0;
+			atomic64_inc(&panthor_client_wait_cache_hits);
+			goto out_unlock;
+		}
+		/* Classify misses without relaxing the invalidation rules. Point
+		 * mismatch takes priority when both point and epoch changed.
+		 */
+		if (!syncobjs[0]->completed_valid)
+			atomic64_inc(&panthor_client_wait_cache_miss_empty);
+		else if (syncobjs[0]->completed_point != points[0])
+			atomic64_inc(&panthor_client_wait_cache_miss_point);
+		else
+			atomic64_inc(&panthor_client_wait_cache_miss_epoch);
+	} else if (cache_candidate) {
+		atomic64_inc(&panthor_client_wait_cache_miss_blocked);
 	}
 	mutex_unlock(&pcfile->lock);
 
+	for (i = 0; i < args->count_handles; i++) {
+		ret = panthor_client_syncobj_materialize(syncobjs[i]);
+		if (ret)
+			goto out_put_syncobjs;
+		req.handles[i] = syncobjs[i]->client_handle;
+	}
+	atomic64_inc(&panthor_client_timeline_wait_flags[args->flags]);
+	if (args->count_handles == 1 && points[0])
+		atomic64_inc(&panthor_client_timeline_wait_single_nonzero[args->flags]);
+	if (!req.timeout_rel_nsec)
+		atomic64_inc(&panthor_client_timeline_wait_nonblock);
 	ret = panthor_client_rpc_syncobj_timeline_wait(&req, &rsp);
+	if (!ret) {
+		if (!rsp.ret)
+			atomic64_inc(&panthor_client_timeline_wait_success);
+		else if (rsp.ret == -ETIME || rsp.ret == -ETIMEDOUT)
+			atomic64_inc(&panthor_client_timeline_wait_pending);
+	}
 	if (ret)
 		goto out_put_syncobjs;
 	if (rsp.ret) {
@@ -1605,8 +2303,21 @@ panthor_client_syncobj_timeline_wait(
 		goto out_put_syncobjs;
 	}
 
+	/* A concurrent mutation, even one that failed, invalidates this proof. */
+	if (cache_record && !rsp.first_signaled) {
+		mutex_lock(&pcfile->lock);
+		if (!pcfile->sync_mutations && !pcfile->sync_epoch_wrapped &&
+		    pcfile->sync_epoch == cache_epoch) {
+			syncobjs[0]->completed_point = points[0];
+			syncobjs[0]->completed_epoch = cache_epoch;
+			syncobjs[0]->completed_valid = true;
+			atomic64_inc(&panthor_client_wait_cache_records);
+		}
+		mutex_unlock(&pcfile->lock);
+	}
+
 	args->first_signaled = rsp.first_signaled;
-	pr_info_ratelimited("panthor-client: SYNCOBJ_TIMELINE_WAIT session=%llu count=%u flags=0x%x first=%u\n",
+	pr_debug("panthor-client: SYNCOBJ_TIMELINE_WAIT session=%llu count=%u flags=0x%x first=%u\n",
 			    pcfile->session_id, args->count_handles,
 			    args->flags, rsp.first_signaled);
 	ret = 0;
@@ -1646,16 +2357,19 @@ panthor_client_fill_syncobj_handles(
 		}
 
 		syncobjs[i] = syncobj;
-		out_handles[i] = syncobj->client_handle;
 	}
 
 	mutex_unlock(&pcfile->lock);
-	return ret;
+	for (i = 0; i < count_handles; i++) {
+		ret = panthor_client_syncobj_materialize(syncobjs[i]);
+		if (ret)
+			return ret; /* Caller drops every acquired reference. */
+		out_handles[i] = syncobjs[i]->client_handle;
+	}
+	return 0;
 
 out_put_syncobjs:
 	mutex_unlock(&pcfile->lock);
-	while (i--)
-		panthor_client_syncobj_put(syncobjs[i]);
 	return ret;
 }
 
@@ -1667,6 +2381,17 @@ panthor_client_put_syncobj_array(struct panthor_client_syncobj **syncobjs,
 
 	for (i = 0; i < count_handles; i++)
 		panthor_client_syncobj_put(syncobjs[i]);
+}
+
+static void panthor_client_point_invalidate(struct panthor_client_file *pcfile,
+	struct panthor_client_syncobj **syncobjs, u32 count)
+{
+	u32 i;
+
+	mutex_lock(&pcfile->lock);
+	for (i = 0; i < count; i++)
+		syncobjs[i]->proof_cookie = 0;
+	mutex_unlock(&pcfile->lock);
 }
 
 static int
@@ -1703,6 +2428,7 @@ panthor_client_syncobj_array_op(struct panthor_client_file *pcfile,
 	if (ret)
 		goto out_put_syncobjs;
 
+	panthor_client_point_invalidate(pcfile, syncobjs, args->count_handles);
 	ret = panthor_client_rpc_syncobj_array(req_type, rsp_type, &req, &rsp);
 	if (ret)
 		goto out_put_syncobjs;
@@ -1773,6 +2499,8 @@ panthor_client_syncobj_timeline_array_op(
 	if (ret)
 		goto out_put_syncobjs;
 
+	if (!copy_points_to_user)
+		panthor_client_point_invalidate(pcfile, syncobjs, args->count_handles);
 	ret = panthor_client_rpc_syncobj_timeline_array(req_type, rsp_type,
 						       &req, &rsp);
 	if (ret)
@@ -2132,6 +2860,113 @@ panthor_client_copy_group_submit(
 	return 0;
 }
 
+/* Serialize plan replacement and execution, independently of object lookup.
+ * Transport errors are never retried: the server may already have submitted.
+ */
+static int panthor_client_execute_plan(struct panthor_client_file *pcfile,
+	const struct panthor_vmshm_plan_register_req *submit,
+	const struct panthor_vmshm_plan_exec_req *patch,
+	struct panthor_vmshm_plan_exec_watch_rsp *watch)
+{
+	struct panthor_vmshm_plan_exec_rsp *rsp = &watch->result;
+	u32 rsp_size = sizeof(*rsp);
+	struct panthor_vmshm_plan_register_req shape = *submit;
+	struct panthor_vmshm_plan_exec_req exec = *patch;
+	struct panthor_vmshm_plan_register_rsp registered;
+	struct panthor_client_plan *plan;
+	u32 slot;
+	int attempt, ret;
+
+	mutex_lock(&pcfile->plan_lock);
+	for (slot = 0; slot < PANTHOR_VMSHM_PLAN_SLOTS; slot++)
+		if (pcfile->plans[slot].id &&
+		    !memcmp(&pcfile->plans[slot].shape, &shape, sizeof(shape)))
+			break;
+	if (slot == PANTHOR_VMSHM_PLAN_SLOTS) {
+		slot = pcfile->next_plan_slot++ % PANTHOR_VMSHM_PLAN_SLOTS;
+		pcfile->plans[slot].id = 0;
+		pcfile->plan_misses++;
+	} else {
+		pcfile->plan_hits++;
+	}
+	plan = &pcfile->plans[slot];
+	exec.slot = slot;
+	if (panthor_client_completed_wait_cache && pcfile->completion_page &&
+	    (pcfile->feature_bits & PANTHOR_VMSHM_FEATURE_PLAN_COMPLETION)) {
+		exec.pad = PANTHOR_VMSHM_PLAN_EXEC_WATCH;
+		rsp_size = sizeof(*watch);
+	}
+	for (attempt = 0; attempt < 2; attempt++) {
+		if (!plan->id) {
+			shape.slot = slot;
+			ret = panthor_client_rpc_call(PANTHOR_VMSHM_MSG_PLAN_REGISTER_REQ,
+				&shape, sizeof(shape), PANTHOR_VMSHM_MSG_PLAN_REGISTER_RSP,
+				&registered, sizeof(registered), sizeof(registered), NULL);
+			shape.slot = 0;
+			if (ret)
+				goto out;
+			if (registered.ret) {
+				ret = registered.ret;
+				goto out;
+			}
+			if (registered.slot != slot || !registered.plan_id) {
+				ret = -EPROTO;
+				goto out;
+			}
+			plan->shape = shape;
+			plan->id = registered.plan_id;
+		}
+		exec.plan_id = plan->id;
+		ret = panthor_client_rpc_call(PANTHOR_VMSHM_MSG_PLAN_EXEC_REQ,
+			&exec, sizeof(exec), PANTHOR_VMSHM_MSG_PLAN_EXEC_RSP,
+			watch, rsp_size, rsp_size, NULL);
+		if (ret)
+			goto out;
+		/* Only a proven pre-dispatch stale response may be retried. */
+		if (rsp->ret != -ESTALE || rsp->proxy_group_handle)
+			goto out;
+		plan->id = 0;
+	}
+	ret = -ESTALE;
+out:
+	mutex_unlock(&pcfile->plan_lock);
+	return ret;
+}
+
+static void panthor_client_plan_completion_record(struct panthor_client_file *pcfile,
+	const struct panthor_vmshm_plan_exec_watch_rsp *watch,
+	const struct panthor_vmshm_plan_register_req *req,
+	const struct panthor_vmshm_plan_exec_req *exec,
+	struct panthor_client_syncobj **syncobjs, u64 mutation_epoch,
+	u64 proof_epoch, bool proof_record)
+{
+	u32 i;
+
+	/* The submit must be the sole writer throughout capture and publication.
+	 * Malformed optional metadata is ignored, never retry submitted work.
+	 */
+	i = watch->sync_index;
+	if (proof_record && panthor_client_completed_wait_cache && pcfile->completion_page &&
+	    (pcfile->feature_bits & PANTHOR_VMSHM_FEATURE_PLAN_COMPLETION) &&
+	    watch->cookie && watch->slot < PANTHOR_VMSHM_COMPLETION_SLOTS &&
+	    i < req->sync_count && exec->timeline_values[i] &&
+	    req->syncs[i].flags == (DRM_PANTHOR_SYNC_OP_SIGNAL |
+		DRM_PANTHOR_SYNC_OP_HANDLE_TYPE_TIMELINE_SYNCOBJ)) {
+		mutex_lock(&pcfile->lock);
+		if (pcfile->sync_mutations == 1 && !pcfile->sync_epoch_wrapped &&
+		    pcfile->sync_epoch == mutation_epoch &&
+		    pcfile->proof_epoch == proof_epoch) {
+			syncobjs[i]->proof_point = exec->timeline_values[i];
+			syncobjs[i]->proof_epoch = proof_epoch;
+			syncobjs[i]->proof_slot = watch->slot;
+			syncobjs[i]->proof_cookie = watch->cookie;
+			atomic64_inc(&panthor_client_point_records);
+		}
+		mutex_unlock(&pcfile->lock);
+	}
+
+}
+
 static int
 panthor_client_group_submit(struct panthor_client_file *pcfile,
 			    struct drm_panthor_group_submit *args)
@@ -2141,8 +2976,12 @@ panthor_client_group_submit(struct panthor_client_file *pcfile,
 	struct panthor_client_syncobj *syncobjs[PANTHOR_VMSHM_MAX_GROUP_SUBMIT_SYNCS] = { 0 };
 	u32 sync_starts[PANTHOR_VMSHM_MAX_GROUP_SUBMITS] = { 0 };
 	u32 sync_counts[PANTHOR_VMSHM_MAX_GROUP_SUBMITS] = { 0 };
-	struct panthor_vmshm_group_submit_req req = { 0 };
-	struct panthor_vmshm_group_submit_rsp rsp;
+	struct panthor_vmshm_plan_register_req req = { 0 };
+	struct panthor_vmshm_plan_exec_req exec = { 0 };
+	struct panthor_vmshm_plan_exec_watch_rsp watch = { 0 };
+	struct panthor_vmshm_plan_exec_rsp *rsp = &watch.result;
+	u64 mutation_epoch = 0, proof_epoch = 0;
+	bool proof_record;
 	struct panthor_client_group *group = NULL;
 	u32 sync_count = 0;
 	u32 i;
@@ -2161,7 +3000,7 @@ panthor_client_group_submit(struct panthor_client_file *pcfile,
 		return ret;
 	}
 
-	pr_info_ratelimited(
+	pr_debug(
 		"panthor-client: GROUP_SUBMIT_DIAG stage=enter session=%llu group=%u jobs=%u job_stride=%u job_array=0x%llx\n",
 		pcfile->session_id, args->group_handle,
 		args->queue_submits.count, args->queue_submits.stride,
@@ -2182,14 +3021,15 @@ panthor_client_group_submit(struct panthor_client_file *pcfile,
 	}
 
 	req.session_id = pcfile->session_id;
+	exec.session_id = pcfile->session_id;
 	req.job_count = args->queue_submits.count;
 	req.sync_count = sync_count;
 
 	for (i = 0; i < req.job_count; i++) {
 		req.jobs[i].queue_index = jobs[i].queue_index;
-		req.jobs[i].stream_size = jobs[i].stream_size;
-		req.jobs[i].stream_addr = jobs[i].stream_addr;
-		req.jobs[i].latest_flush = jobs[i].latest_flush;
+		exec.jobs[i].stream_size = jobs[i].stream_size;
+		exec.jobs[i].stream_addr = jobs[i].stream_addr;
+		exec.jobs[i].latest_flush = jobs[i].latest_flush;
 		req.jobs[i].sync_start = sync_starts[i];
 		req.jobs[i].sync_count = sync_counts[i];
 	}
@@ -2233,54 +3073,65 @@ panthor_client_group_submit(struct panthor_client_file *pcfile,
 
 		syncobjs[i] = syncobj;
 		req.syncs[i].flags = syncs[i].flags;
-		req.syncs[i].client_syncobj_handle = syncobj->client_handle;
-		req.syncs[i].timeline_value = syncs[i].timeline_value;
+		exec.timeline_values[i] = syncs[i].timeline_value;
 	}
+	proof_record = pcfile->sync_mutations == 1;
+	mutation_epoch = pcfile->sync_epoch;
+	proof_epoch = pcfile->proof_epoch;
 	mutex_unlock(&pcfile->lock);
 
-	ret = panthor_client_rpc_group_submit(&req, &rsp);
+	for (i = 0; i < sync_count; i++) {
+		ret = panthor_client_syncobj_materialize(syncobjs[i]);
+		if (ret)
+			goto out_put_refs;
+		req.syncs[i].client_syncobj_handle = syncobjs[i]->client_handle;
+	}
+	ret = panthor_client_execute_plan(pcfile, &req, &exec, &watch);
 	if (ret) {
 		pr_info_ratelimited(
 			"panthor-client: GROUP_SUBMIT_DIAG stage=rpc ret=%d session=%llu group=%u jobs=%u syncs=%u first_queue=%u first_size=%u first_addr=0x%llx first_sync_flags=0x%x first_client_sync=%u first_sync_value=%llu\n",
 			ret, pcfile->session_id, args->group_handle,
 			req.job_count, req.sync_count,
-			req.jobs[0].queue_index, req.jobs[0].stream_size,
-			(unsigned long long)req.jobs[0].stream_addr,
+			req.jobs[0].queue_index, exec.jobs[0].stream_size,
+			(unsigned long long)exec.jobs[0].stream_addr,
 			req.sync_count ? req.syncs[0].flags : 0,
 			req.sync_count ? req.syncs[0].client_syncobj_handle : 0,
 			req.sync_count ?
-				(unsigned long long)req.syncs[0].timeline_value : 0);
+				(unsigned long long)exec.timeline_values[0] : 0);
 		goto out_put_refs;
 	}
-	if (rsp.ret) {
-		ret = rsp.ret;
+	if (rsp->ret) {
+		ret = rsp->ret;
 		pr_info_ratelimited(
 			"panthor-client: GROUP_SUBMIT_DIAG stage=proxy_rsp ret=%d session=%llu group=%u jobs=%u syncs=%u rsp_group=%u rsp_jobs=%u rsp_syncs=%u first_sync_flags=0x%x first_client_sync=%u first_sync_value=%llu\n",
 			ret, pcfile->session_id, args->group_handle,
 			req.job_count, req.sync_count,
-			rsp.proxy_group_handle, rsp.job_count, rsp.sync_count,
+			rsp->proxy_group_handle, rsp->job_count, rsp->sync_count,
 			req.sync_count ? req.syncs[0].flags : 0,
 			req.sync_count ? req.syncs[0].client_syncobj_handle : 0,
 			req.sync_count ?
-				(unsigned long long)req.syncs[0].timeline_value : 0);
+				(unsigned long long)exec.timeline_values[0] : 0);
 		goto out_put_refs;
 	}
-	if (rsp.job_count != req.job_count || rsp.sync_count != req.sync_count ||
-	    !rsp.proxy_group_handle) {
+	if (rsp->job_count != req.job_count || rsp->sync_count != req.sync_count ||
+	    !rsp->proxy_group_handle) {
 		ret = -EPROTO;
 		pr_info_ratelimited(
 			"panthor-client: GROUP_SUBMIT_DIAG stage=rsp_mismatch ret=%d session=%llu group=%u req_jobs=%u rsp_jobs=%u req_syncs=%u rsp_syncs=%u rsp_group=%u\n",
 			ret, pcfile->session_id, args->group_handle,
-			req.job_count, rsp.job_count, req.sync_count,
-			rsp.sync_count, rsp.proxy_group_handle);
+			req.job_count, rsp->job_count, req.sync_count,
+			rsp->sync_count, rsp->proxy_group_handle);
 		goto out_put_refs;
 	}
 
-	pr_info_ratelimited("panthor-client: GROUP_SUBMIT session=%llu client_group=%u proxy_group=%u jobs=%u syncs=%u first_stream=0x%llx first_size=%u first_latest_flush=0x%x\n",
+	panthor_client_plan_completion_record(pcfile, &watch, &req, &exec,
+		syncobjs, mutation_epoch, proof_epoch, proof_record);
+
+	pr_debug("panthor-client: GROUP_SUBMIT session=%llu client_group=%u proxy_group=%u jobs=%u syncs=%u first_stream=0x%llx first_size=%u first_latest_flush=0x%x\n",
 			    pcfile->session_id, args->group_handle,
-			    rsp.proxy_group_handle, req.job_count, req.sync_count,
-			    req.jobs[0].stream_addr, req.jobs[0].stream_size,
-			    req.jobs[0].latest_flush);
+			    rsp->proxy_group_handle, req.job_count, req.sync_count,
+			    exec.jobs[0].stream_addr, exec.jobs[0].stream_size,
+			    exec.jobs[0].latest_flush);
 	ret = 0;
 	goto out_put_refs;
 
@@ -2533,11 +3384,16 @@ static int panthor_client_vm_bind(struct panthor_client_file *pcfile,
 
 		syncobjs[i] = syncobj;
 		req.syncs[i].flags = syncs[i].flags;
-		req.syncs[i].client_syncobj_handle = syncobj->client_handle;
 		req.syncs[i].timeline_value = syncs[i].timeline_value;
 	}
 	mutex_unlock(&pcfile->lock);
 
+	for (i = 0; i < sync_count; i++) {
+		ret = panthor_client_syncobj_materialize(syncobjs[i]);
+		if (ret)
+			goto out_put_refs;
+		req.syncs[i].client_syncobj_handle = syncobjs[i]->client_handle;
+	}
 	ret = panthor_client_rpc_vm_bind(&req, &rsp);
 	if (ret)
 		goto out_put_refs;
@@ -2552,7 +3408,7 @@ static int panthor_client_vm_bind(struct panthor_client_file *pcfile,
 		goto out_put_refs;
 	}
 
-	pr_info_ratelimited("panthor-client: VM_BIND session=%llu client_vm=%u proxy_vm=%u ops=%u syncs=%u flags=0x%x\n",
+	pr_debug("panthor-client: VM_BIND session=%llu client_vm=%u proxy_vm=%u ops=%u syncs=%u flags=0x%x\n",
 			    pcfile->session_id, args->vm_id, rsp.proxy_vm_id,
 			    args->ops.count, sync_count, args->flags);
 	ret = 0;
@@ -2675,7 +3531,7 @@ static int panthor_client_bo_create(struct panthor_client_file *pcfile,
 	args->size = rsp.size;
 	args->handle = rsp.client_bo_handle;
 
-	pr_info_ratelimited("panthor-client: BO_CREATE session=%llu client_bo=%u proxy_bo=%u size=0x%llx payload=0x%llx payload_size=0x%llx\n",
+	pr_debug("panthor-client: BO_CREATE session=%llu client_bo=%u proxy_bo=%u size=0x%llx payload=0x%llx payload_size=0x%llx\n",
 			    pcfile->session_id, rsp.client_bo_handle,
 			    rsp.proxy_bo_handle, rsp.size, rsp.payload_handle,
 			    rsp.payload_size);
@@ -2889,7 +3745,7 @@ static int panthor_client_mmap_flush_id(struct vm_area_struct *vma)
 	return 0;
 }
 
-static long panthor_client_ioctl(struct file *filp, unsigned int cmd,
+static long panthor_client_ioctl_dispatch(struct file *filp, unsigned int cmd,
 				 unsigned long arg)
 {
 	struct drm_file *file = filp->private_data;
@@ -3126,6 +3982,88 @@ static long panthor_client_ioctl(struct file *filp, unsigned int cmd,
 	return drm_ioctl(filp, cmd, arg);
 }
 
+/* Default-deny caching across IOCTLs: anything not explicitly fence-preserving
+ * may replace a public syncobj fence, including driver VM_BIND/GROUP_SUBMIT.
+ * Do not hold the file lock across an RPC: waits and submissions may overlap.
+ */
+static bool panthor_client_wait_cache_mutation_begin(struct file *filp,
+						   unsigned int cmd)
+{
+	struct drm_file *file = filp->private_data;
+	struct panthor_client_file *pcfile = file ? file->driver_priv : NULL;
+
+	if (!panthor_client_completed_wait_cache || !pcfile)
+		return false;
+	switch (cmd) {
+	case DRM_IOCTL_GET_CAP:
+	case DRM_IOCTL_VERSION:
+	case DRM_IOCTL_PANTHOR_DEV_QUERY:
+	case DRM_IOCTL_PANTHOR_VM_GET_STATE:
+	case DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD:
+	case DRM_IOCTL_SYNCOBJ_WAIT:
+	case PANTHOR_CLIENT_IOCTL_SYNCOBJ_WAIT_LEGACY:
+	case DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT:
+	case PANTHOR_CLIENT_IOCTL_SYNCOBJ_TIMELINE_WAIT_LEGACY:
+	case DRM_IOCTL_SYNCOBJ_QUERY:
+	/* These paths only manage BO handles/payloads/mmap offsets. They never
+	 * replace a public syncobj fence, including deferred BO destruction.
+	 */
+	case DRM_IOCTL_PANTHOR_BO_CREATE:
+	case DRM_IOCTL_PANTHOR_BO_MMAP_OFFSET:
+	case DRM_IOCTL_GEM_CLOSE:
+		return false;
+	default:
+		break;
+	}
+
+	mutex_lock(&pcfile->lock);
+	if (!++pcfile->sync_epoch)
+		pcfile->sync_epoch_wrapped = true;
+	pcfile->sync_mutations++;
+	switch (cmd) {
+	/* These handlers clear only their acquired destination object(s).
+	 * CREATE has a fresh zeroed object; DESTROY removes its identity.
+	 */
+	case DRM_IOCTL_SYNCOBJ_CREATE:
+	case DRM_IOCTL_SYNCOBJ_DESTROY:
+	case DRM_IOCTL_SYNCOBJ_TRANSFER:
+	case DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE:
+	case DRM_IOCTL_SYNCOBJ_RESET:
+	case DRM_IOCTL_SYNCOBJ_SIGNAL:
+	case DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL:
+		break;
+	default:
+		/* Includes GROUP_SUBMIT, VM_BIND and all unknown/compat writes. */
+		if (!++pcfile->proof_epoch)
+			pcfile->sync_epoch_wrapped = true;
+		break;
+	}
+	mutex_unlock(&pcfile->lock);
+	atomic64_inc(&panthor_client_wait_cache_mutations);
+	return true;
+}
+
+static void panthor_client_wait_cache_mutation_end(struct file *filp)
+{
+	struct drm_file *file = filp->private_data;
+	struct panthor_client_file *pcfile = file->driver_priv;
+
+	mutex_lock(&pcfile->lock);
+	pcfile->sync_mutations--;
+	mutex_unlock(&pcfile->lock);
+}
+
+static long panthor_client_ioctl(struct file *filp, unsigned int cmd,
+				 unsigned long arg)
+{
+	bool mutation = panthor_client_wait_cache_mutation_begin(filp, cmd);
+	long ret = panthor_client_ioctl_dispatch(filp, cmd, arg);
+
+	if (mutation)
+		panthor_client_wait_cache_mutation_end(filp);
+	return ret;
+}
+
 #ifdef CONFIG_COMPAT
 static bool panthor_client_handles_core_ioctl(unsigned int cmd)
 {
@@ -3160,7 +4098,15 @@ static long panthor_client_compat_ioctl(struct file *filp, unsigned int cmd,
 	if (panthor_client_handles_core_ioctl(cmd))
 		return panthor_client_ioctl(filp, cmd, arg);
 
-	return drm_compat_ioctl(filp, cmd, arg);
+	/* Non-core compat commands bypass the ordinary IOCTL wrapper. */
+	{
+		bool mutation = panthor_client_wait_cache_mutation_begin(filp, cmd);
+		long ret = drm_compat_ioctl(filp, cmd, arg);
+
+		if (mutation)
+			panthor_client_wait_cache_mutation_end(filp);
+		return ret;
+	}
 }
 #else
 #define panthor_client_compat_ioctl NULL
@@ -3255,27 +4201,35 @@ static int panthor_client_open(struct drm_device *ddev, struct drm_file *file)
 	struct panthor_client_file *pcfile;
 	int ret;
 
+	if (!client_comm_vmshm_get())
+		return -ENODEV;
 	pcfile = kzalloc(sizeof(*pcfile), GFP_KERNEL);
-	if (!pcfile)
+	if (!pcfile) {
+		client_comm_vmshm_put();
 		return -ENOMEM;
+	}
 
 	mutex_init(&pcfile->lock);
+	mutex_init(&pcfile->plan_lock);
 	xa_init(&pcfile->bos);
-	xa_init(&pcfile->syncobjs);
+	xa_init_flags(&pcfile->syncobjs, XA_FLAGS_ALLOC);
 	xa_init(&pcfile->groups);
 	xa_init(&pcfile->heaps);
 	pcfile->next_mmap_offset = PANTHOR_CLIENT_BO_MMAP_OFFSET_BASE;
 
-	ret = panthor_client_rpc_open_session(&pcfile->session_id);
+	ret = panthor_client_rpc_open_session(&pcfile->session_id,
+					      &pcfile->feature_bits);
 	if (ret) {
 		xa_destroy(&pcfile->heaps);
 		xa_destroy(&pcfile->groups);
 		xa_destroy(&pcfile->syncobjs);
 		xa_destroy(&pcfile->bos);
 		kfree(pcfile);
+		client_comm_vmshm_put();
 		return ret;
 	}
 
+	panthor_client_completion_page_init(pcfile);
 	file->driver_priv = pcfile;
 	return 0;
 }
@@ -3289,6 +4243,9 @@ static void panthor_client_postclose(struct drm_device *ddev,
 	if (!pcfile)
 		return;
 
+	pr_info("panthor-client: TASK_PLAN_STATS session=%llu hits=%llu misses=%llu\n",
+		pcfile->session_id, pcfile->plan_hits, pcfile->plan_misses);
+	panthor_client_snapshot_retire_close(pcfile->completion_page);
 	panthor_client_groups_release_local(pcfile);
 	panthor_client_heaps_release_local(pcfile);
 	panthor_client_bos_release_local(pcfile);
@@ -3302,8 +4259,10 @@ static void panthor_client_postclose(struct drm_device *ddev,
 		pr_info("panthor-client: CLOSE_SESSION session=%llu\n",
 			pcfile->session_id);
 
+	panthor_client_completion_page_put(pcfile->completion_page);
 	kfree(pcfile);
 	file->driver_priv = NULL;
+	client_comm_vmshm_put();
 }
 
 static const struct drm_driver panthor_client_driver = {
