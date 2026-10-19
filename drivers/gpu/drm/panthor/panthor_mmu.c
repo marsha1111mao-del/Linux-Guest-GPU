@@ -120,6 +120,7 @@ struct panthor_vm_pool {
 struct panthor_vma {
 	/** @base: Inherits from drm_gpuva. */
 	struct drm_gpuva base;
+	struct list_head realm_sync_node;
 
 	/** @node: Used to implement deferred release of VMAs. */
 	struct list_head node;
@@ -291,6 +292,8 @@ struct panthor_vm {
 	 * and asynchronous VM_BIND request. This is what this lock is for.
 	 */
 	struct mutex op_lock;
+	/* Mappings requiring real cache maintenance; protected by op_lock. */
+	struct list_head realm_sync_vmas;
 
 	/**
 	 * @op_ctx: The context attached to the currently executing VM operation.
@@ -2291,6 +2294,8 @@ static void panthor_vma_link(struct panthor_vm *vm, struct panthor_vma *vma,
 
 	mutex_lock(&bo->gpuva_list_lock);
 	drm_gpuva_link(&vma->base, vm_bo);
+	if (panthor_gem_needs_realm_sync(bo))
+		list_add_tail(&vma->realm_sync_node, &vm->realm_sync_vmas);
 	drm_WARN_ON(&vm->ptdev->base, drm_gpuvm_bo_put(vm_bo));
 	mutex_unlock(&bo->gpuva_list_lock);
 }
@@ -2301,6 +2306,7 @@ static void panthor_vma_unlink(struct panthor_vm *vm, struct panthor_vma *vma)
 	struct drm_gpuvm_bo *vm_bo = drm_gpuvm_bo_get(vma->base.vm_bo);
 
 	mutex_lock(&bo->gpuva_list_lock);
+	list_del_init(&vma->realm_sync_node);
 	drm_gpuva_unlink(&vma->base);
 	mutex_unlock(&bo->gpuva_list_lock);
 
@@ -2315,6 +2321,7 @@ static void panthor_vma_unlink(struct panthor_vm *vm, struct panthor_vma *vma)
 static void panthor_vma_init(struct panthor_vma *vma, u32 flags)
 {
 	INIT_LIST_HEAD(&vma->node);
+	INIT_LIST_HEAD(&vma->realm_sync_node);
 	vma->flags = flags;
 }
 
@@ -2616,6 +2623,7 @@ struct panthor_vm *panthor_vm_create(struct panthor_device *ptdev, bool for_mcu,
 	vm->for_mcu = for_mcu;
 	vm->ptdev = ptdev;
 	mutex_init(&vm->op_lock);
+	INIT_LIST_HEAD(&vm->realm_sync_vmas);
 
 	if (for_mcu) {
 		/* CSF MCU is a cortex M7, and can only address 4G */
@@ -2990,7 +2998,7 @@ int panthor_vm_prepare_mapped_bos_resvs(struct drm_exec *exec,
 int panthor_vm_sync_mapped_bos(struct panthor_vm *vm,
 			       enum dma_data_direction dir)
 {
-	struct drm_gpuva *gpuva;
+	struct panthor_vma *vma;
 	int ret = 0;
 
 	if (!cc_platform_has(CC_ATTR_MEM_ENCRYPT))
@@ -2998,7 +3006,9 @@ int panthor_vm_sync_mapped_bos(struct panthor_vm *vm,
 
 	drm_gpuvm_resv_assert_held(&vm->base);
 
-	drm_gpuvm_for_each_va(gpuva, &vm->base) {
+	mutex_lock(&vm->op_lock);
+	list_for_each_entry(vma, &vm->realm_sync_vmas, realm_sync_node) {
+		struct drm_gpuva *gpuva = &vma->base;
 		struct panthor_gem_object *bo;
 		u64 bo_offset, range;
 
@@ -3020,11 +3030,12 @@ int panthor_vm_sync_mapped_bos(struct panthor_vm *vm,
 			drm_warn(&vm->ptdev->base,
 				 "Realm mapped BO sync failed dir=%d va=0x%llx size=0x%llx ret=%d\n",
 				 dir, gpuva->va.addr, gpuva->va.range, ret);
-			return ret;
+			break;
 		}
 	}
+	mutex_unlock(&vm->op_lock);
 
-	return 0;
+	return ret;
 }
 
 /**

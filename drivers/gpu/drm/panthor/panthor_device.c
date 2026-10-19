@@ -3,6 +3,8 @@
 /* Copyright 2019 Linaro, Ltd, Rob Herring <robh@kernel.org> */
 /* Copyright 2023 Collabora ltd. */
 
+#include <linux/arm-smccc.h>
+#include <asm/rsi_smc.h>
 #include <linux/clk.h>
 #include <linux/cc_platform.h>
 #include <linux/mm.h>
@@ -200,6 +202,15 @@ int panthor_device_init(struct panthor_device *ptdev)
 		return PTR_ERR(ptdev->iomem);
 
 	ptdev->phys_addr = res->start;
+	if (cc_platform_has(CC_ATTR_MEM_ENCRYPT)) {
+		struct arm_smccc_res result;
+
+		arm_smccc_1_1_smc(SMC_RSI_OPENCCA_GPU_CONTROL, 0, 0, 0, 0, 0, 0, 0,
+				  &result);
+		if (result.a0 != RSI_SUCCESS)
+			return dev_err_probe(ptdev->base.dev, -EPERM,
+					     "RMM rejected GPU owner claim\n");
+	}
 
 	ret = pm_runtime_set_active(ptdev->base.dev);
 	if (ret)

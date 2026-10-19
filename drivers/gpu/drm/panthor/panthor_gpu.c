@@ -3,6 +3,9 @@
 /* Copyright 2019 Linaro, Ltd., Rob Herring <robh@kernel.org> */
 /* Copyright 2019 Collabora ltd. */
 
+#include <linux/arm-smccc.h>
+#include <linux/cc_platform.h>
+#include <asm/rsi_smc.h>
 #include <linux/bitfield.h>
 #include <linux/bitmap.h>
 #include <linux/delay.h>
@@ -421,6 +424,14 @@ int panthor_gpu_soft_reset(struct panthor_device *ptdev)
 {
 	bool timedout = false;
 	unsigned long flags;
+
+	if (cc_platform_has(CC_ATTR_MEM_ENCRYPT)) {
+		struct arm_smccc_res result;
+
+		arm_smccc_1_1_smc(SMC_RSI_OPENCCA_GPU_CONTROL, 1, 0, 0, 0, 0, 0, 0,
+				  &result);
+		return result.a0 == RSI_SUCCESS ? 0 : -EIO;
+	}
 
 	spin_lock_irqsave(&ptdev->gpu->reqs_lock, flags);
 	if (!drm_WARN_ON(&ptdev->base,

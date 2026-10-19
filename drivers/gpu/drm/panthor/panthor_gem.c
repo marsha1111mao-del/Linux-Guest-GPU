@@ -117,10 +117,15 @@ panthor_gem_sync_realm_private_bo(struct panthor_gem_object *bo,
 	return 0;
 }
 
+bool panthor_gem_needs_realm_sync(struct panthor_gem_object *bo)
+{
+	return panthor_gem_realm_private_bo(bo) && !(bo->flags & PANTHOR_BO_GPU_ONLY);
+}
+
 int panthor_gem_sync_realm_bo_for_device(struct panthor_gem_object *bo,
 					 size_t offset, size_t len)
 {
-	if (!panthor_gem_realm_private_bo(bo) || (bo->flags & PANTHOR_BO_GPU_ONLY))
+	if (!panthor_gem_needs_realm_sync(bo))
 		return 0;
 
 	dma_wmb();
@@ -133,7 +138,7 @@ int panthor_gem_sync_realm_bo_for_cpu(struct panthor_gem_object *bo,
 {
 	int ret;
 
-	if (!panthor_gem_realm_private_bo(bo) || (bo->flags & PANTHOR_BO_GPU_ONLY))
+	if (!panthor_gem_needs_realm_sync(bo))
 		return 0;
 
 	ret = panthor_gem_sync_realm_private_bo(bo, offset, len,

@@ -120,6 +120,7 @@ struct panthor_gem_object *to_panthor_bo(struct drm_gem_object *obj)
 }
 
 bool panthor_gem_realm_gpu_enabled(void);
+bool panthor_gem_needs_realm_sync(struct panthor_gem_object *bo);
 int panthor_gem_sync_realm_bo_for_device(struct panthor_gem_object *bo,
 					 size_t offset, size_t len);
 int panthor_gem_sync_realm_bo_for_cpu(struct panthor_gem_object *bo,

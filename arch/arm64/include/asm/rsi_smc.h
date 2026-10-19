@@ -212,4 +212,7 @@ struct realm_config {
  */
 #define SMC_RSI_OPENCCA_GPU_REVOKE		SMC_RSI_FID(0x1ae)
 
+/* Owner-authenticated GPU control: x1=0 claim or 1 reset; x2..x7=0. */
+#define SMC_RSI_OPENCCA_GPU_CONTROL		SMC_RSI_FID(0x1b1)
+
 #endif /* __ASM_RSI_SMC_H_ */
