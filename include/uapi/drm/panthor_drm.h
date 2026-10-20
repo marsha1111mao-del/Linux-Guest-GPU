@@ -408,8 +408,10 @@ struct drm_panthor_dev_query {
 /**
  * struct drm_panthor_vm_create - Arguments passed to DRM_PANTHOR_IOCTL_VM_CREATE
  */
+#define DRM_PANTHOR_VM_CREATE_ISOLATED (1U << 0)
+
 struct drm_panthor_vm_create {
-	/** @flags: VM flags, MBZ. */
+	/** @flags: Realm proxy VM flags; native Panthor requires zero. */
 	__u32 flags;
 
 	/** @id: Returned VM ID. */

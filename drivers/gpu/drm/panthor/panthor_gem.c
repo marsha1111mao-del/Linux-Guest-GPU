@@ -241,6 +241,7 @@ static void panthor_gem_free_object(struct drm_gem_object *obj)
 {
 	struct panthor_gem_object *bo = to_panthor_bo(obj);
 	struct drm_gem_object *vm_root_gem = bo->exclusive_vm_root_gem;
+	struct drm_gem_object *vmshm_vm_root_gem = bo->vmshm_vm_root_gem;
 	struct proxy_vmshm_object *vmshm_payload = bo->vmshm_payload;
 
 	bo->vmshm_payload = NULL;
@@ -250,6 +251,7 @@ static void panthor_gem_free_object(struct drm_gem_object *obj)
 	mutex_destroy(&bo->gpuva_list_lock);
 	drm_gem_shmem_free(&bo->base);
 	drm_gem_object_put(vm_root_gem);
+	drm_gem_object_put(vmshm_vm_root_gem);
 	proxy_vmshm_unpin(vmshm_payload);
 }
 

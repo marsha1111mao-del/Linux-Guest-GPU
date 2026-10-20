@@ -94,6 +94,7 @@ size_t proxy_vmshm_obj_alloc_size(struct proxy_vmshm_object *obj);
 bool proxy_vmshm_obj_is_sg(struct proxy_vmshm_object *obj);
 bool proxy_vmshm_obj_is_contiguous(struct proxy_vmshm_object *obj);
 unsigned int proxy_vmshm_obj_nr_segments(struct proxy_vmshm_object *obj);
+int proxy_vmshm_obj_check_gpu_map(struct proxy_vmshm_object *obj, u32 perms);
 /*
  * The caller must already hold a pin on obj, or otherwise serialize with the
  * manager so the object backing cannot be released while spans are consumed.
@@ -121,6 +122,12 @@ int proxy_vmshm_grant_lookup_pin(u64 grant_id, u32 requester_vmid,
 				 struct proxy_vmshm_object **out);
 int proxy_vmshm_grant_revoke(u64 grant_id);
 #else
+static inline int proxy_vmshm_obj_check_gpu_map(struct proxy_vmshm_object *obj,
+					      u32 perms)
+{
+	return -ENODEV;
+}
+
 static inline int proxy_vmshm_manager_register_domain(u32 owner_vmid, void *base,
 						     phys_addr_t gpa, size_t size)
 {

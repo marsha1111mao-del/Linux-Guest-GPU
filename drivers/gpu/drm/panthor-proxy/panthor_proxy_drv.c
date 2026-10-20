@@ -48,6 +48,8 @@ struct panthor_proxy_vm {
 	u32 client_vm_id;
 	u32 proxy_vm_id;
 	u64 user_va_range;
+	bool group_created;
+	bool isolated;
 };
 
 struct panthor_proxy_bo {
@@ -930,13 +932,14 @@ panthor_proxy_session_vm_create(struct panthor_proxy_session *session,
 {
 	struct panthor_proxy_vm *vm;
 	struct drm_panthor_vm_create args = {
-		.flags = req->flags,
 		.user_va_range = req->user_va_range,
 	};
 	u32 client_vm_id;
 	int ret;
 
 	if (!session || !rsp)
+		return -EINVAL;
+	if (req->flags & ~DRM_PANTHOR_VM_CREATE_ISOLATED)
 		return -EINVAL;
 
 	vm = kzalloc(sizeof(*vm), GFP_KERNEL);
@@ -957,6 +960,7 @@ panthor_proxy_session_vm_create(struct panthor_proxy_session *session,
 	vm->client_vm_id = client_vm_id;
 	vm->proxy_vm_id = args.id;
 	vm->user_va_range = args.user_va_range;
+	vm->isolated = req->flags & DRM_PANTHOR_VM_CREATE_ISOLATED;
 
 	rsp->client_vm_id = client_vm_id;
 	rsp->proxy_vm_id = args.id;
@@ -978,19 +982,39 @@ panthor_proxy_session_vm_destroy(struct panthor_proxy_session *session,
 				 u32 client_vm_id, u32 *proxy_vm_id)
 {
 	struct panthor_proxy_vm *vm;
+	struct panthor_proxy_group *group;
+	struct panthor_proxy_heap *heap;
+	unsigned long index;
 	int ret;
 
 	if (!session || !client_vm_id)
 		return -EINVAL;
 
 	mutex_lock(&session->lock);
-	vm = xa_erase(&session->vms, client_vm_id);
+	vm = xa_load(&session->vms, client_vm_id);
 	if (!vm) {
 		mutex_unlock(&session->lock);
 		return -EINVAL;
 	}
+	xa_for_each(&session->groups, index, group) {
+		if (group->client_vm_id == client_vm_id) {
+			mutex_unlock(&session->lock);
+			return -EBUSY;
+		}
+	}
+	xa_for_each(&session->heaps, index, heap) {
+		if (heap->client_vm_id == client_vm_id) {
+			mutex_unlock(&session->lock);
+			return -EBUSY;
+		}
+	}
 
 	ret = panthor_vmshm_vm_destroy(session->real_session, vm->proxy_vm_id);
+	if (ret) {
+		mutex_unlock(&session->lock);
+		return ret;
+	}
+	xa_erase(&session->vms, client_vm_id);
 	if (proxy_vm_id)
 		*proxy_vm_id = vm->proxy_vm_id;
 	mutex_unlock(&session->lock);
@@ -1196,6 +1220,7 @@ panthor_proxy_session_group_create(
 {
 	struct drm_panthor_group_create args = { 0 };
 	struct panthor_proxy_group *group;
+	struct panthor_proxy_vm *vm;
 	u32 client_group_handle;
 	int ret;
 
@@ -1224,10 +1249,16 @@ panthor_proxy_session_group_create(
 	panthor_proxy_apply_group_core_partition(session, &args);
 
 	mutex_lock(&session->lock);
-	ret = panthor_proxy_session_translate_vm_locked(
-		session, req->client_vm_id, &args.vm_id);
-	if (ret)
+	vm = xa_load(&session->vms, req->client_vm_id);
+	if (!vm) {
+		ret = -EINVAL;
 		goto err_unlock;
+	}
+	if (vm->isolated && vm->group_created) {
+		ret = -EACCES;
+		goto err_unlock;
+	}
+	args.vm_id = vm->proxy_vm_id;
 
 	ret = panthor_vmshm_group_create(session->real_session, &args,
 					 req->queues);
@@ -1244,6 +1275,7 @@ panthor_proxy_session_group_create(
 	group->proxy_group_handle = args.group_handle;
 	group->client_vm_id = req->client_vm_id;
 	group->proxy_vm_id = args.vm_id;
+	vm->group_created = true;
 
 	rsp->client_group_handle = client_group_handle;
 	rsp->proxy_group_handle = args.group_handle;
@@ -1509,11 +1541,15 @@ panthor_proxy_session_syncobj_wait(
 
 	possible_flags = DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL |
 			 DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT |
-			 DRM_SYNCOBJ_WAIT_FLAGS_WAIT_DEADLINE;
+			 DRM_SYNCOBJ_WAIT_FLAGS_WAIT_DEADLINE |
+			 PANTHOR_VMSHM_SYNCOBJ_WAIT_FENCE_STATUS;
 	if (req->flags & ~possible_flags)
 		return -EINVAL;
 	if (req->count_handles > PANTHOR_VMSHM_MAX_SYNCOBJ_WAIT_HANDLES)
 		return -E2BIG;
+	if ((req->flags & PANTHOR_VMSHM_SYNCOBJ_WAIT_FENCE_STATUS) &&
+	    req->count_handles != 1)
+		return -EINVAL;
 
 	mutex_lock(&session->lock);
 	for (i = 0; i < req->count_handles; i++) {
@@ -1532,9 +1568,18 @@ panthor_proxy_session_syncobj_wait(
 
 	ret = panthor_vmshm_syncobj_wait(session->real_session, proxy_handles,
 					 req->count_handles,
-					 req->timeout_rel_nsec, req->flags,
+					 req->timeout_rel_nsec,
+					 req->flags & ~PANTHOR_VMSHM_SYNCOBJ_WAIT_FENCE_STATUS,
 					 req->deadline_rel_nsec,
 					 &rsp->first_signaled);
+	if (!ret && (req->flags & PANTHOR_VMSHM_SYNCOBJ_WAIT_FENCE_STATUS)) {
+		int status;
+
+		ret = panthor_vmshm_syncobj_status(session->real_session,
+						 proxy_handles[0], &status);
+		if (!ret)
+			ret = status < 0 ? status : status ? 0 : -ETIME;
+	}
 	goto out_put_syncobjs;
 
 out_unlock:
@@ -1839,6 +1884,7 @@ panthor_proxy_session_vm_bind(struct panthor_proxy_session *session,
 	u32 failed_op = PANTHOR_VMSHM_VM_BIND_FAILED_OP_NONE;
 	u32 proxy_vm_id = 0;
 	int ret = 0;
+	struct panthor_proxy_vm *vm;
 	u32 i;
 
 	if (!session || !req || !rsp)
@@ -1851,15 +1897,24 @@ panthor_proxy_session_vm_bind(struct panthor_proxy_session *session,
 		return -E2BIG;
 
 	mutex_lock(&session->lock);
-	ret = panthor_proxy_session_translate_vm_locked(
-		session, req->client_vm_id, &proxy_vm_id);
-	if (ret)
+	vm = xa_load(&session->vms, req->client_vm_id);
+	if (!vm) {
+		ret = -EINVAL;
 		goto out_unlock;
+	}
+	proxy_vm_id = vm->proxy_vm_id;
 
 	for (i = 0; i < req->op_count; i++) {
 		const struct panthor_vmshm_vm_bind_op *in = &req->ops[i];
 		struct drm_panthor_vm_bind_op *out = &ops[i];
 		u32 type = in->flags & DRM_PANTHOR_VM_BIND_OP_TYPE_MASK;
+
+		if (type != DRM_PANTHOR_VM_BIND_OP_TYPE_SYNC_ONLY && in->size &&
+		    (in->va >= vm->user_va_range ||
+		     in->size > vm->user_va_range - in->va)) {
+			ret = -EINVAL;
+			goto out_unlock;
+		}
 
 		out->flags = in->flags;
 		out->bo_offset = in->bo_offset;
@@ -1879,6 +1934,16 @@ panthor_proxy_session_vm_bind(struct panthor_proxy_session *session,
 
 		switch (type) {
 		case DRM_PANTHOR_VM_BIND_OP_TYPE_MAP:
+		{
+			struct panthor_proxy_bo *bo =
+				xa_load(&session->bos, in->client_bo_handle);
+
+			if (!bo ||
+			    proxy_vmshm_obj_owner_vmid(bo->payload) != session->owner_vmid ||
+			    proxy_vmshm_obj_handle(bo->payload) != bo->payload_handle) {
+				ret = -EACCES;
+				goto out_unlock;
+			}
 			ret = panthor_proxy_session_translate_bo_locked(
 				session, in->client_bo_handle,
 				&out->bo_handle);
@@ -1889,6 +1954,7 @@ panthor_proxy_session_vm_bind(struct panthor_proxy_session *session,
 				goto out_unlock;
 			}
 			break;
+		}
 
 		case DRM_PANTHOR_VM_BIND_OP_TYPE_UNMAP:
 			if (in->client_bo_handle || in->bo_offset) {

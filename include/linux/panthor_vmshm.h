@@ -311,6 +311,8 @@ struct panthor_vmshm_syncobj_destroy_rsp {
 	__u32 proxy_syncobj_handle;
 };
 
+#define PANTHOR_VMSHM_SYNCOBJ_WAIT_FENCE_STATUS (1U << 31)
+
 struct panthor_vmshm_syncobj_wait_req {
 	__u64 session_id;
 	__s64 timeout_rel_nsec;

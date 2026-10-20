@@ -1502,6 +1502,26 @@ static int panthor_vm_prepare_map_op_ctx(struct panthor_vm_op_ctx *op_ctx,
 	vmshm_backed = panthor_gem_is_vmshm_backed(bo);
 	realm_native_shmem = cc_platform_has(CC_ATTR_MEM_ENCRYPT) &&
 			     !vmshm_backed && !bo->base.base.import_attach;
+	if (vmshm_backed) {
+		u32 perms = PROXY_VMSHM_PERM_GPU_READ;
+
+		if (!(flags & DRM_PANTHOR_VM_BIND_OP_MAP_READONLY))
+			perms |= PROXY_VMSHM_PERM_GPU_WRITE;
+		ret = proxy_vmshm_obj_check_gpu_map(bo->vmshm_payload, perms);
+		if (ret)
+			return ret;
+		mutex_lock(&bo->gpuva_list_lock);
+		if (bo->vmshm_vm_root_gem &&
+		    bo->vmshm_vm_root_gem != panthor_vm_root_gem(vm)) {
+			ret = -EACCES;
+		} else if (!bo->vmshm_vm_root_gem) {
+			bo->vmshm_vm_root_gem = panthor_vm_root_gem(vm);
+			drm_gem_object_get(bo->vmshm_vm_root_gem);
+		}
+		mutex_unlock(&bo->gpuva_list_lock);
+		if (ret)
+			return ret;
+	}
 
 	ret = panthor_vm_op_ctx_prealloc_vmas(op_ctx);
 	if (ret)

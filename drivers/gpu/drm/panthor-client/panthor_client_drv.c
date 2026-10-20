@@ -1690,7 +1690,8 @@ static void panthor_client_sync_fence_work(struct work_struct *work)
 	struct panthor_vmshm_syncobj_wait_req req = {
 		.session_id = sync_fence->session_id,
 		.count_handles = 1,
-		.flags = DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL,
+		.flags = DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL |
+			 PANTHOR_VMSHM_SYNCOBJ_WAIT_FENCE_STATUS,
 		.timeout_rel_nsec = PANTHOR_CLIENT_SYNC_FILE_WAIT_NSEC,
 	};
 	struct panthor_vmshm_syncobj_wait_rsp rsp = { 0 };
@@ -1746,7 +1747,7 @@ static void panthor_client_sync_fence_work(struct work_struct *work)
 		atomic64_inc(&panthor_client_sync_file_errors);
 
 	if (wait_ret)
-		pr_warn_ratelimited("panthor-client: sync-file proxy wait failed session=%llu client_sync=%u ret=%d rsp_ret=%d segments=%u\n",
+		pr_debug("panthor-client: sync-file proxy wait failed session=%llu client_sync=%u ret=%d rsp_ret=%d segments=%u\n",
 				    sync_fence->session_id,
 				    sync_fence->snapshot->client_handle, ret,
 				    rsp.ret, segments);
@@ -2538,7 +2539,7 @@ static int panthor_client_vm_create(struct panthor_client_file *pcfile,
 
 	if (!pcfile)
 		return -EINVAL;
-	if (args->flags)
+	if (args->flags & ~DRM_PANTHOR_VM_CREATE_ISOLATED)
 		return -EINVAL;
 
 	memset(&req, 0, sizeof(req));

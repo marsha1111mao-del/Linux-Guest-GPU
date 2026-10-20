@@ -1955,6 +1955,28 @@ static int proxy_vmshm_obj_translate_sg(struct proxy_vmshm_object *obj,
 	return 0;
 }
 
+int proxy_vmshm_obj_check_gpu_map(struct proxy_vmshm_object *obj, u32 perms)
+{
+	struct proxy_vmshm_manager *mgr = &proxy_vmshm_mgr;
+	int ret = 0;
+
+	if (!obj || !(perms & PROXY_VMSHM_PERM_GPU_READ) ||
+	    (perms & ~(PROXY_VMSHM_PERM_GPU_READ | PROXY_VMSHM_PERM_GPU_WRITE)))
+		return -EINVAL;
+
+	mutex_lock(&mgr->lock);
+	if (!mgr->ready || !proxy_vmshm_object_state_usable(obj) ||
+	    obj->backing_released || !atomic_read(&obj->pin_count))
+		ret = -ENOENT;
+	else if ((obj->type != PROXY_VMSHM_OBJ_GPU_BO &&
+		  obj->type != PROXY_VMSHM_OBJ_COMMAND_BO) ||
+		 (perms & ~obj->perms))
+		ret = -EACCES;
+	mutex_unlock(&mgr->lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(proxy_vmshm_obj_check_gpu_map);
+
 int proxy_vmshm_obj_translate(struct proxy_vmshm_object *obj,
 			      u64 logical_off, size_t len,
 			      struct proxy_vmshm_span *spans,

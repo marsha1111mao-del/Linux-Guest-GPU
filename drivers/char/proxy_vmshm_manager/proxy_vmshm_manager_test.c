@@ -16,6 +16,7 @@
 #include <linux/proxy_vmshm.h>
 #include <linux/slab.h>
 #include <linux/sizes.h>
+#include <linux/string.h>
 
 #include "proxy_vmshm_manager.h"
 
@@ -44,6 +45,106 @@ static int proxy_vmshm_test_expect_err(const char *name, int ret, int expected)
 	pr_err("proxy_manager_vmshm_test: %s expected %d got %d\n",
 	       name, expected, ret);
 	return -EINVAL;
+}
+
+static int proxy_vmshm_selftest_gpu_lifetime(u32 owner)
+{
+	struct proxy_vmshm_alloc_params params =
+		proxy_vmshm_test_params(PAGE_SIZE, PAGE_SIZE, owner);
+	struct proxy_vmshm_object *obj, *replacement = NULL, *lookup = NULL;
+	u64 old_handle, old_offset;
+	bool pinned = false, revoked = false;
+	int ret;
+
+	params.type = PROXY_VMSHM_OBJ_GPU_BO;
+	params.flags = PROXY_VMSHM_F_CONTIG;
+	params.perms = PROXY_VMSHM_PERM_GPU_READ;
+	obj = proxy_vmshm_alloc_ext(&params, GFP_KERNEL);
+	if (IS_ERR(obj))
+		return PTR_ERR(obj);
+	old_handle = proxy_vmshm_obj_handle(obj);
+	old_offset = proxy_vmshm_obj_offset(obj);
+	ret = proxy_vmshm_pin(obj);
+	if (ret)
+		goto out;
+	pinned = true;
+	ret = proxy_vmshm_obj_check_gpu_map(obj, PROXY_VMSHM_PERM_GPU_READ);
+	if (ret)
+		goto out;
+	ret = proxy_vmshm_test_expect_err("GPU write escalation",
+		proxy_vmshm_obj_check_gpu_map(obj, PROXY_VMSHM_PERM_GPU_READ |
+					    PROXY_VMSHM_PERM_GPU_WRITE), -EACCES);
+	if (ret)
+		goto out;
+	ret = proxy_vmshm_lookup_pin(old_handle, owner + 1,
+				     PROXY_VMSHM_PERM_GPU_READ, &lookup);
+	if (!ret)
+		proxy_vmshm_unpin(lookup);
+	ret = proxy_vmshm_test_expect_err("foreign GPU owner", ret, -EACCES);
+	if (ret)
+		goto out;
+	memset(proxy_vmshm_obj_kva(obj), 0xa5, PAGE_SIZE);
+	proxy_vmshm_free(obj);
+	revoked = true;
+	ret = proxy_vmshm_test_expect_err("revoked GPU mapping",
+		proxy_vmshm_obj_check_gpu_map(obj, PROXY_VMSHM_PERM_GPU_READ), -ENOENT);
+	if (ret)
+		goto out;
+	replacement = proxy_vmshm_alloc_ext(&params, GFP_KERNEL);
+	if (IS_ERR(replacement)) {
+		ret = PTR_ERR(replacement);
+		replacement = NULL;
+		goto out;
+	}
+	if (proxy_vmshm_obj_offset(replacement) == old_offset) {
+		pr_err("proxy_manager_vmshm_test: pinned GPU backing was reused\n");
+		ret = -EINVAL;
+		goto out;
+	}
+	ret = proxy_vmshm_lookup_pin(old_handle, owner,
+				     PROXY_VMSHM_PERM_GPU_READ, &lookup);
+	if (!ret)
+		proxy_vmshm_unpin(lookup);
+	ret = proxy_vmshm_test_expect_err("recycled GPU handle", ret, -ESTALE);
+	if (ret)
+		goto out;
+	proxy_vmshm_free(replacement);
+	replacement = NULL;
+	proxy_vmshm_unpin(obj);
+	pinned = false;
+	obj = NULL;
+	replacement = proxy_vmshm_alloc_ext(&params, GFP_KERNEL);
+	if (IS_ERR(replacement))
+		return PTR_ERR(replacement);
+	if (proxy_vmshm_obj_offset(replacement) != old_offset ||
+	    memchr_inv(proxy_vmshm_obj_kva(replacement), 0, PAGE_SIZE)) {
+		pr_err("proxy_manager_vmshm_test: GPU backing reuse/zero mismatch old=%llu new=%llu\n",
+			old_offset, proxy_vmshm_obj_offset(replacement));
+		ret = -EINVAL;
+		goto out;
+	}
+	proxy_vmshm_free(replacement);
+	params.type = PROXY_VMSHM_OBJ_FENCE_PAGE;
+	replacement = proxy_vmshm_alloc_ext(&params, GFP_KERNEL);
+	if (IS_ERR(replacement))
+		return PTR_ERR(replacement);
+	ret = proxy_vmshm_pin(replacement);
+	if (ret)
+		goto out;
+	ret = proxy_vmshm_test_expect_err("GPU control-page alias",
+		proxy_vmshm_obj_check_gpu_map(replacement, PROXY_VMSHM_PERM_GPU_READ),
+		-EACCES);
+	proxy_vmshm_unpin(replacement);
+out:
+	proxy_vmshm_free(replacement);
+	if (obj && !revoked)
+		proxy_vmshm_free(obj);
+	if (pinned)
+		proxy_vmshm_unpin(obj);
+	if (!ret)
+		pr_info("proxy_manager_vmshm_test: GPU isolation PASS owner=%u permissions=1 control=1 stale=1 pin_reuse=1 zero=1\n",
+			owner);
+	return ret;
 }
 
 int proxy_vmshm_manager_selftest_permissions(u32 owner)
@@ -115,6 +216,8 @@ out:
 	if (grant)
 		proxy_vmshm_grant_revoke(grant);
 	proxy_vmshm_free(obj);
+	if (!ret)
+		ret = proxy_vmshm_selftest_gpu_lifetime(owner);
 	if (!ret)
 		pr_info("proxy_manager_vmshm_test: permissions PASS owner=%u\n", owner);
 	return ret;

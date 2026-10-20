@@ -79,6 +79,7 @@ struct panthor_gem_object {
 	 * GEM page list. The object is pinned for the GEM lifetime.
 	 */
 	struct proxy_vmshm_object *vmshm_payload;
+	struct drm_gem_object *vmshm_vm_root_gem;
 };
 
 /**
