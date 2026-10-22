@@ -14,6 +14,9 @@
 #include <linux/miscdevice.h>
 #include <linux/platform_device.h>
 #include <linux/module.h>
+#include <linux/debugfs.h>
+#include <linux/seq_file.h>
+#include <linux/vmalloc.h>
 #include <linux/uaccess.h>
 #include <linux/realm_xshm.h>
 #include <linux/client_vmshm.h>
@@ -30,6 +33,85 @@
 static DEFINE_MUTEX(pool_lock);
 static DEFINE_SPINLOCK(event_lock);
 static bool event_irq_ready;
+static bool notify_trace;
+module_param(notify_trace, bool, 0444);
+MODULE_PARM_DESC(notify_trace, "Record bounded physical-counter notification and receive timings");
+static bool notify_timing_supported;
+#define REALM_XSHM_TRACE_MAX 32768U
+struct realm_xshm_trace_record {
+	u64 channel, sequence;
+	u64 ticks[5];
+	u32 kind, type, flags;
+	s32 status;
+};
+static struct realm_xshm_trace_record *trace_records;
+static DEFINE_SPINLOCK(trace_lock);
+static u32 trace_count;
+static u64 trace_dropped;
+
+bool realm_xshm_trace_enabled(void)
+{
+	return trace_records != NULL;
+}
+EXPORT_SYMBOL_GPL(realm_xshm_trace_enabled);
+
+u64 realm_xshm_counter(void)
+{
+	isb();
+	return read_sysreg(cntpct_el0);
+}
+EXPORT_SYMBOL_GPL(realm_xshm_counter);
+
+static void realm_xshm_trace_record(const struct realm_xshm_trace_record *record)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&trace_lock, flags);
+	if (trace_count < REALM_XSHM_TRACE_MAX)
+		trace_records[trace_count++] = *record;
+	else
+		trace_dropped++;
+	spin_unlock_irqrestore(&trace_lock, flags);
+}
+
+void realm_xshm_trace_receive(u64 channel, u64 sequence, u32 type, u64 irq, u64 work)
+{
+	struct realm_xshm_trace_record record = {
+		.kind = 2, .channel = channel, .sequence = sequence, .type = type,
+		.ticks = { irq, work, realm_xshm_counter() },
+	};
+
+	if (realm_xshm_trace_enabled())
+		realm_xshm_trace_record(&record);
+}
+EXPORT_SYMBOL_GPL(realm_xshm_trace_receive);
+
+static int realm_xshm_trace_show(struct seq_file *stream, void *data)
+{
+	struct realm_xshm_trace_record record;
+	unsigned long flags;
+	u32 count, index;
+	u64 dropped;
+
+	spin_lock_irqsave(&trace_lock, flags);
+	count = trace_count;
+	dropped = trace_dropped;
+	spin_unlock_irqrestore(&trace_lock, flags);
+	seq_printf(stream, "XSHM_TRACE clock=cntpct freq=%llu supported=%u count=%u dropped=%llu\n",
+		   read_sysreg(cntfrq_el0), notify_timing_supported, count, dropped);
+	seq_puts(stream, "kind channel sequence type flags status tick0 tick1 tick2 tick3 tick4\n");
+	for (index = 0; index < count; index++) {
+		spin_lock_irqsave(&trace_lock, flags);
+		record = trace_records[index];
+		spin_unlock_irqrestore(&trace_lock, flags);
+		seq_printf(stream, "%u %llu %llu %u %u %d %llu %llu %llu %llu %llu\n",
+			record.kind, record.channel, record.sequence, record.type,
+			record.flags, record.status, record.ticks[0], record.ticks[1],
+			record.ticks[2], record.ticks[3], record.ticks[4]);
+	}
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(realm_xshm_trace);
 struct realm_xshm_pool_state {
 	struct page *pages;
 	size_t size;
@@ -116,14 +198,36 @@ static void xshm_call(u64 command, u64 id, struct arm_smccc_1_2_regs *output)
 	arm_smccc_1_2_smc(&input, output);
 }
 
-static void realm_xshm_notify(u64 channel)
+static void realm_xshm_notify(u64 channel, u32 type, u64 sequence)
 {
 	struct arm_smccc_1_2_regs output;
+	struct realm_xshm_trace_record record = {
+		.kind = 1, .channel = channel, .sequence = sequence, .type = type,
+	};
+	bool trace = realm_xshm_trace_enabled();
 
 	/* Queue publication precedes this coalesced event. A failed hint must
 	 * never cause replay of a published request.
 	 */
-	xshm_call(REALM_XSHM_NOTIFY, channel, &output);
+	if (trace)
+		record.ticks[0] = realm_xshm_counter();
+	xshm_call(trace && notify_timing_supported ? REALM_XSHM_NOTIFY_TIMED :
+		  REALM_XSHM_NOTIFY, channel, &output);
+	if (trace) {
+		record.ticks[1] = realm_xshm_counter();
+		record.status = output.a0;
+		if (notify_timing_supported && !output.a0) {
+			record.ticks[2] = output.a1;
+			record.ticks[3] = output.a2;
+			record.ticks[4] = output.a3;
+			record.flags = (u32)output.a4;
+			if ((output.a4 >> 32) != read_sysreg(cntfrq_el0))
+				record.flags |= 2U;
+		} else {
+			record.flags = 4U;
+		}
+		realm_xshm_trace_record(&record);
+	}
 	if (output.a0)
 		pr_warn_ratelimited("realm-xshm: notify channel=%llu status=%lu\n",
 				    channel, output.a0);
@@ -221,6 +325,8 @@ static int __init realm_xshm_irq_init(void)
 	int ret;
 
 	xshm_call(REALM_XSHM_REGISTER, 0, &output);
+	if (!output.a0)
+		notify_timing_supported = !!(output.a3 & REALM_XSHM_CAP_NOTIFY_TIMING);
 	if (output.a0 || !(output.a3 & REALM_XSHM_CAP_EVENT_IRQ))
 		return 0;
 	if (!(output.a3 & REALM_XSHM_CAP_ACK_ARM))
@@ -559,7 +665,7 @@ static long realm_xshm_ioctl(struct file *file, unsigned int cmd,
 		return -ENOTTY;
 	if (copy_from_user(&call, (void __user *)arg, sizeof(call)))
 		return -EFAULT;
-	if (call.command > REALM_XSHM_ACK_ARM ||
+	if (call.command > REALM_XSHM_NOTIFY_TIMED ||
 	    (call.command != REALM_XSHM_MEM_OFFER && call.size))
 		return -EINVAL;
 	input.a0 = SMC_RSI_OPENCCA_XSHM;
@@ -635,6 +741,8 @@ static struct miscdevice realm_xshm_device = {
 
 static int __init realm_xshm_init(void)
 {
+	struct dentry *directory = NULL;
+	struct dentry *trace_file;
 	int ret;
 
 	if (!is_realm_world())
@@ -642,7 +750,31 @@ static int __init realm_xshm_init(void)
 	ret = realm_xshm_irq_init();
 	if (ret)
 		return ret;
-	return misc_register(&realm_xshm_device);
+	if (notify_trace) {
+		trace_records = vzalloc(array_size(REALM_XSHM_TRACE_MAX, sizeof(*trace_records)));
+		if (!trace_records)
+			return -ENOMEM;
+		directory = debugfs_create_dir("realm_xshm", NULL);
+		if (IS_ERR(directory)) {
+			ret = PTR_ERR(directory);
+			goto out_free_trace;
+		}
+		trace_file = debugfs_create_file("notify_trace", 0400, directory,
+						NULL, &realm_xshm_trace_fops);
+		if (IS_ERR(trace_file)) {
+			ret = PTR_ERR(trace_file);
+			goto out_remove_trace;
+		}
+	}
+	ret = misc_register(&realm_xshm_device);
+	if (!ret)
+		return 0;
+out_remove_trace:
+	debugfs_remove_recursive(directory);
+out_free_trace:
+	vfree(trace_records);
+	trace_records = NULL;
+	return ret;
 }
 
 module_init(realm_xshm_init);

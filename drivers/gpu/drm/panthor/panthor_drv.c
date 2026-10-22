@@ -1821,6 +1821,38 @@ int panthor_vmshm_syncobj_transfer(struct panthor_vmshm_session *session,
 }
 EXPORT_SYMBOL_GPL(panthor_vmshm_syncobj_transfer);
 
+int panthor_vmshm_syncobj_transfer_capture(struct panthor_vmshm_session *session,
+	struct drm_syncobj_transfer *args, __u32 snapshot_handle)
+{
+	struct drm_syncobj *destination, *snapshot;
+	struct dma_fence *fence;
+	int ret;
+
+	if (!session || !session->pfile || !args || args->pad ||
+	    args->dst_point || !snapshot_handle || snapshot_handle == args->dst_handle)
+		return -EINVAL;
+	destination = drm_syncobj_find(&session->file, args->dst_handle);
+	if (!destination)
+		return -ENOENT;
+	snapshot = drm_syncobj_find(&session->file, snapshot_handle);
+	if (!snapshot) {
+		ret = -ENOENT;
+		goto out_destination;
+	}
+	ret = drm_syncobj_find_fence(&session->file, args->src_handle,
+				     args->src_point, args->flags, &fence);
+	if (!ret) {
+		drm_syncobj_replace_fence(destination, fence);
+		drm_syncobj_replace_fence(snapshot, fence);
+		dma_fence_put(fence);
+	}
+	drm_syncobj_put(snapshot);
+out_destination:
+	drm_syncobj_put(destination);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(panthor_vmshm_syncobj_transfer_capture);
+
 int panthor_vmshm_syncobj_fence_get_at(struct panthor_vmshm_session *session,
 				    __u32 handle, __u64 point, struct dma_fence **fence)
 {

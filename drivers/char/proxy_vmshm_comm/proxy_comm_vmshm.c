@@ -66,6 +66,8 @@ struct proxy_comm_vmshm_dev {
 	u64 perf_noop_count;
 	u64 realm_response_notifies;
 	u64 realm_response_suppressed;
+	atomic64_t trace_irq;
+	u64 trace_work_irq, trace_work_start;
 	dev_t devt;
 	struct cdev cdev;
 	struct device *dev;
@@ -990,7 +992,8 @@ static bool proxy_comm_vmshm_ready_locked(struct proxy_comm_vmshm_dev *d)
 		       PROXY_COMM_VMSHM_STATUS_READY;
 }
 
-static void proxy_comm_vmshm_kick_client(struct proxy_comm_vmshm_dev *d)
+static void proxy_comm_vmshm_kick_client(struct proxy_comm_vmshm_dev *d,
+					const struct vmshm_comm_tx *tx)
 {
 	if (d->realm) {
 		struct proxy_comm_vmshm_queue_object *q =
@@ -1005,7 +1008,7 @@ static void proxy_comm_vmshm_kick_client(struct proxy_comm_vmshm_dev *d)
 			return;
 		}
 		d->realm_response_notifies++;
-		d->realm->notify(d->realm->channel);
+		d->realm->notify(d->realm->channel, tx->type, tx->reply_to);
 	}
 }
 
@@ -1103,7 +1106,7 @@ int proxy_comm_vmshm_send_to_channel(struct proxy_comm_vmshm_channel *channel,
 	ret = proxy_comm_vmshm_queue_send(d, PROXY_COMM_VMSHM_Q_PROXY_TO_CLIENT,
 					  tx);
 	if (!ret)
-		proxy_comm_vmshm_kick_client(d);
+		proxy_comm_vmshm_kick_client(d, tx);
 
 out_unlock:
 	mutex_unlock(&d->lock);
@@ -1164,6 +1167,9 @@ static int proxy_comm_vmshm_dispatch_one(struct proxy_comm_vmshm_dev *d)
 		up_read(&proxy_comm_vmshm_handler_rwsem);
 		return ret;
 	}
+	if (realm_xshm_trace_enabled())
+		realm_xshm_trace_receive(d->realm->channel, rx.seq, rx.type,
+					 d->trace_work_irq, d->trace_work_start);
 
 	for (i = 0; i < PROXY_COMM_VMSHM_MAX_HANDLERS; i++) {
 		if (proxy_comm_vmshm_handlers[i].handler &&
@@ -1227,6 +1233,10 @@ static void proxy_comm_vmshm_rx_work(struct work_struct *work)
 	struct proxy_comm_vmshm_dev *d =
 		container_of(work, struct proxy_comm_vmshm_dev, rx_work);
 
+	if (realm_xshm_trace_enabled()) {
+		d->trace_work_start = realm_xshm_counter();
+		d->trace_work_irq = atomic64_xchg(&d->trace_irq, 0);
+	}
 	proxy_comm_vmshm_drain_rx(d);
 }
 
@@ -1234,6 +1244,8 @@ static void proxy_comm_vmshm_receive(void *data)
 {
 	struct proxy_comm_vmshm_dev *d = data;
 
+	if (realm_xshm_trace_enabled())
+		atomic64_set(&d->trace_irq, realm_xshm_counter());
 	proxy_comm_vmshm_queue_rx(d);
 }
 
@@ -1692,6 +1704,7 @@ static int proxy_comm_vmshm_probe(struct platform_device *pdev)
 	mutex_init(&d->lock);
 	refcount_set(&d->users, 1);
 	INIT_WORK(&d->rx_work, proxy_comm_vmshm_rx_work);
+	atomic64_set(&d->trace_irq, 0);
 	platform_set_drvdata(pdev, d);
 
 	if (d->size < sizeof(struct proxy_comm_vmshm_header)) {

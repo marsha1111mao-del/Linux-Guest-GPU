@@ -1604,10 +1604,13 @@ out_put_syncobjs:
 static int
 panthor_proxy_session_syncobj_transfer(
 	struct panthor_proxy_session *session,
-	const struct panthor_vmshm_syncobj_transfer_req *req)
+	const struct panthor_vmshm_syncobj_transfer_req *req,
+	struct panthor_vmshm_snapshot_watch_rsp *capture)
 {
 	struct panthor_proxy_syncobj *src_syncobj = NULL;
 	struct panthor_proxy_syncobj *dst_syncobj = NULL;
+	struct panthor_vmshm_syncobj_create_req create = { 0 };
+	struct panthor_vmshm_syncobj_create_rsp snapshot = { 0 };
 	struct drm_syncobj_transfer args = { 0 };
 	int ret = 0;
 
@@ -1639,7 +1642,30 @@ panthor_proxy_session_syncobj_transfer(
 	args.dst_point = req->dst_point;
 	args.flags = req->flags;
 
-	ret = panthor_vmshm_syncobj_transfer(session->real_session, &args);
+	if (capture && !req->dst_point) {
+		create.session_id = req->session_id;
+		capture->snapshot.ret = panthor_proxy_session_syncobj_create(
+			session, &create, &snapshot, true);
+	}
+	if (snapshot.client_syncobj_handle) {
+		ret = panthor_vmshm_syncobj_transfer_capture(session->real_session,
+			&args, snapshot.proxy_syncobj_handle);
+		if (ret) {
+			panthor_proxy_session_syncobj_destroy(session,
+				snapshot.client_syncobj_handle, NULL);
+		} else {
+			struct panthor_proxy_syncobj *captured;
+
+			capture->snapshot = snapshot;
+			mutex_lock(&session->lock);
+			captured = xa_load(&session->syncobjs, snapshot.client_syncobj_handle);
+			if (captured)
+				panthor_proxy_snapshot_watch(session, captured, capture);
+			mutex_unlock(&session->lock);
+		}
+	} else {
+		ret = panthor_vmshm_syncobj_transfer(session->real_session, &args);
+	}
 	goto out_put_syncobjs;
 
 out_unlock:
@@ -2319,7 +2345,8 @@ panthor_proxy_handle_open_session(struct proxy_comm_vmshm_channel *channel,
 			   PANTHOR_VMSHM_FEATURE_TASK_PLAN |
 			   PANTHOR_VMSHM_FEATURE_SNAPSHOT_COMPLETION |
 			   PANTHOR_VMSHM_FEATURE_PLAN_COMPLETION |
-			   PANTHOR_VMSHM_FEATURE_SNAPSHOT_RETIRE;
+			   PANTHOR_VMSHM_FEATURE_SNAPSHOT_RETIRE |
+			   PANTHOR_VMSHM_FEATURE_TRANSFER_CAPTURE;
 	ret = panthor_proxy_session_create(channel, owner_vmid, &rsp.session_id);
 	if (ret)
 		rsp.ret = ret;
@@ -2728,6 +2755,40 @@ out_unlock:
 }
 
 static void
+panthor_proxy_handle_transfer_capture(struct proxy_comm_vmshm_channel *channel,
+	const struct vmshm_comm_rx *rx, const void *payload)
+{
+	const struct panthor_vmshm_transfer_capture_req *req = payload;
+	struct panthor_vmshm_transfer_capture_rsp rsp = { 0 };
+	struct panthor_proxy_session *session;
+	int ret;
+
+	if (req->transfer.dst_point || req->transfer.pad ||
+	    req->retire.snapshot.session_id != req->transfer.session_id ||
+	    req->retire.snapshot.source_handle != req->transfer.src_handle ||
+	    req->retire.snapshot.pad) {
+		rsp.transfer.ret = -EINVAL;
+		goto out_send;
+	}
+	session = panthor_proxy_session_lookup(req->transfer.session_id,
+		proxy_comm_vmshm_channel_client_vmid(channel));
+	if (!session) {
+		rsp.transfer.ret = -ENOENT;
+		goto out_send;
+	}
+	rsp.transfer.ret = panthor_proxy_snapshot_retire(session, &req->retire);
+	if (!rsp.transfer.ret)
+		rsp.transfer.ret = panthor_proxy_session_syncobj_transfer(session,
+			&req->transfer, &rsp.watch);
+	panthor_proxy_session_put(session);
+out_send:
+	ret = panthor_proxy_send_rsp(channel, rx->seq,
+		PANTHOR_VMSHM_MSG_TRANSFER_CAPTURE_RSP, rsp.transfer.ret, &rsp, sizeof(rsp));
+	if (ret)
+		pr_warn_ratelimited("panthor-proxy: TRANSFER_CAPTURE response send failed (%d)\n", ret);
+}
+
+static void
 panthor_proxy_handle_syncobj_snapshot(struct proxy_comm_vmshm_channel *channel,
 				      const struct vmshm_comm_rx *rx,
 				      const void *payload)
@@ -2959,7 +3020,7 @@ panthor_proxy_handle_syncobj_transfer(struct proxy_comm_vmshm_channel *channel,
 		goto out_send;
 	}
 
-	rsp.ret = panthor_proxy_session_syncobj_transfer(session, req);
+	rsp.ret = panthor_proxy_session_syncobj_transfer(session, req, NULL);
 	panthor_proxy_session_put(session);
 	if (rsp.ret)
 		pr_warn_ratelimited("panthor-proxy: SYNCOBJ_TRANSFER failed session=%llu src=%u dst=%u ret=%d\n",
@@ -3337,6 +3398,13 @@ out_send:
 }
 
 static const struct panthor_proxy_msg_handler panthor_proxy_handlers[] = {
+	{
+		.req_type = PANTHOR_VMSHM_MSG_TRANSFER_CAPTURE_REQ,
+		.rsp_type = PANTHOR_VMSHM_MSG_TRANSFER_CAPTURE_RSP,
+		.req_size = sizeof(struct panthor_vmshm_transfer_capture_req),
+		.name = "TRANSFER_CAPTURE",
+		.handler = panthor_proxy_handle_transfer_capture,
+	},
 	{
 		.req_type = PANTHOR_VMSHM_MSG_SNAPSHOT_RETIRE_REQ,
 		.rsp_type = PANTHOR_VMSHM_MSG_SNAPSHOT_RETIRE_RSP,

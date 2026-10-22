@@ -83,6 +83,9 @@
 #define PANTHOR_VMSHM_MSG_SNAPSHOT_RETIRE_REQ 0x50547852U
 #define PANTHOR_VMSHM_MSG_SNAPSHOT_RETIRE_RSP 0x50547853U
 #define PANTHOR_VMSHM_RETIRE_MAX 8
+#define PANTHOR_VMSHM_FEATURE_TRANSFER_CAPTURE (1ULL << 8)
+#define PANTHOR_VMSHM_MSG_TRANSFER_CAPTURE_REQ 0x50547952U
+#define PANTHOR_VMSHM_MSG_TRANSFER_CAPTURE_RSP 0x50547953U
 
 /* Each slot publishes one non-reused cookie, never a completion watermark.
  * Zero means no proof. Slot reuse first drains the previous native callback.
@@ -536,6 +539,16 @@ struct panthor_vmshm_snapshot_watch_rsp {
 	__u32 slot;
 	__u32 pad;
 };
+struct panthor_vmshm_transfer_capture_req {
+	struct panthor_vmshm_syncobj_transfer_req transfer;
+	struct panthor_vmshm_snapshot_retire_req retire;
+};
+struct panthor_vmshm_transfer_capture_rsp {
+	struct panthor_vmshm_syncobj_transfer_rsp transfer;
+	struct panthor_vmshm_snapshot_watch_rsp watch;
+};
+static_assert(sizeof(struct panthor_vmshm_transfer_capture_req) <=
+	      PANTHOR_VMSHM_COMM_PAYLOAD_LIMIT);
 static_assert(sizeof(struct panthor_vmshm_completion_page) == 4096);
 struct dma_fence;
 struct panthor_vmshm_session;
@@ -575,6 +588,8 @@ int panthor_vmshm_syncobj_wait(struct panthor_vmshm_session *session,
 			       __u64 deadline_nsec, __u32 *first_signaled);
 int panthor_vmshm_syncobj_transfer(struct panthor_vmshm_session *session,
 				   struct drm_syncobj_transfer *args);
+int panthor_vmshm_syncobj_transfer_capture(struct panthor_vmshm_session *session,
+	struct drm_syncobj_transfer *args, __u32 snapshot_handle);
 int panthor_vmshm_syncobj_status(struct panthor_vmshm_session *session,
 				 __u32 handle, int *status);
 int panthor_vmshm_syncobj_timeline_wait(
@@ -715,6 +730,13 @@ panthor_vmshm_syncobj_transfer(struct panthor_vmshm_session *session,
 static inline int
 panthor_vmshm_syncobj_status(struct panthor_vmshm_session *session,
 			    __u32 handle, int *status)
+{
+	return -ENODEV;
+}
+
+static inline int
+panthor_vmshm_syncobj_transfer_capture(struct panthor_vmshm_session *session,
+	struct drm_syncobj_transfer *args, __u32 snapshot_handle)
 {
 	return -ENODEV;
 }

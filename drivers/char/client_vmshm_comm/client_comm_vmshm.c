@@ -175,6 +175,8 @@ static const char *client_comm_vmshm_req_name(u32 type)
 		return "BO_DESTROY";
 	case PANTHOR_VMSHM_MSG_SNAPSHOT_RETIRE_REQ:
 		return "SNAPSHOT_RETIRE";
+	case PANTHOR_VMSHM_MSG_TRANSFER_CAPTURE_REQ:
+		return "TRANSFER_CAPTURE";
 	case PANTHOR_VMSHM_MSG_SYNCOBJ_SNAPSHOT_REQ:
 		return "SYNCOBJ_SNAPSHOT";
 	case PANTHOR_VMSHM_MSG_SYNCOBJ_CREATE_REQ:
@@ -807,9 +809,10 @@ client_comm_vmshm_record_irq_work_latency(struct client_comm_vmshm_dev *d)
 	d->irq_work_samples++;
 }
 
-static void client_comm_vmshm_kick_proxy(struct client_comm_vmshm_dev *d)
+static void client_comm_vmshm_kick_proxy(struct client_comm_vmshm_dev *d,
+					const struct vmshm_comm_tx *tx)
 {
-	d->realm->notify(d->realm->channel);
+	d->realm->notify(d->realm->channel, tx->type, tx->seq);
 }
 
 static bool client_comm_vmshm_ready(void)
@@ -844,7 +847,7 @@ static int client_comm_vmshm_send_to_proxy(const struct vmshm_comm_tx *tx,
 		sample->queue_ns += ktime_get_ns() - start_ns;
 	if (!ret) {
 		start_ns = sample ? ktime_get_ns() : 0;
-		client_comm_vmshm_kick_proxy(d);
+		client_comm_vmshm_kick_proxy(d, tx);
 		if (sample)
 			sample->notify_ns += ktime_get_ns() - start_ns;
 	}

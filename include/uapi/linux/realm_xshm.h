@@ -27,6 +27,7 @@ enum realm_xshm_command {
 	REALM_XSHM_IRQ_BIND,
 	/* Acknowledge current events and arm atomically; recheck the queue after. */
 	REALM_XSHM_ACK_ARM,
+	REALM_XSHM_NOTIFY_TIMED,
 };
 
 /* Experimental RMM ABI; REGISTER capabilities describe supported operations.
@@ -52,6 +53,7 @@ struct realm_xshm_call {
 #define REALM_XSHM_CAP_MEMORY_IDENTITY 8U
 #define REALM_XSHM_CAP_EVENT_IRQ 16U
 #define REALM_XSHM_CAP_ACK_ARM 32U
+#define REALM_XSHM_CAP_NOTIFY_TIMING 64U
 #define REALM_XSHM_IRQ_INTID 127U
 
 enum realm_xshm_pool_operation {

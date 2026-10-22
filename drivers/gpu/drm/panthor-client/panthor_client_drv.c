@@ -104,6 +104,8 @@ struct panthor_client_syncobj {
 	 * It has no file reference, so a same-file import cannot form a cycle.
 	 */
 	struct panthor_client_syncobj *snapshot;
+	struct panthor_client_syncobj *export_snapshot;
+	u64 capture_epoch;
 	/* Complete native timeline chain proof, protected by file->lock.
 	 * With no intervening destination write, a complete chain at P also
 	 * completes every positive earlier point. Never a last-job watermark.
@@ -212,6 +214,15 @@ static bool panthor_client_fused_snapshot;
 module_param_named(fused_snapshot, panthor_client_fused_snapshot, bool, 0444);
 MODULE_PARM_DESC(fused_snapshot,
 		 "Use negotiated single-RPC sync-file snapshot creation (experimental)");
+static bool panthor_client_transfer_capture;
+module_param_named(transfer_capture, panthor_client_transfer_capture, bool, 0444);
+MODULE_PARM_DESC(transfer_capture, "Capture reusable sync-file snapshots during binary transfers");
+static atomic64_t panthor_client_capture_calls = ATOMIC64_INIT(0);
+static atomic64_t panthor_client_capture_records = ATOMIC64_INIT(0);
+static atomic64_t panthor_client_capture_hits = ATOMIC64_INIT(0);
+static atomic64_t panthor_client_capture_discarded = ATOMIC64_INIT(0);
+static atomic64_t panthor_client_transfer_binary = ATOMIC64_INIT(0);
+static atomic64_t panthor_client_transfer_timeline = ATOMIC64_INIT(0);
 static bool panthor_client_completed_snapshot;
 module_param_named(completed_snapshot, panthor_client_completed_snapshot, bool, 0444);
 MODULE_PARM_DESC(completed_snapshot,
@@ -287,6 +298,14 @@ static int panthor_client_sync_file_stats_get(char *buffer,
 	int len, i;
 
 	len = scnprintf(buffer, PAGE_SIZE,
+			 "capture_calls=%lld capture_records=%lld capture_hits=%lld capture_discarded=%lld transfer_binary=%lld transfer_timeline=%lld ",
+			 atomic64_read(&panthor_client_capture_calls),
+			 atomic64_read(&panthor_client_capture_records),
+			 atomic64_read(&panthor_client_capture_hits),
+			 atomic64_read(&panthor_client_capture_discarded),
+			 atomic64_read(&panthor_client_transfer_binary),
+			 atomic64_read(&panthor_client_transfer_timeline));
+	len += scnprintf(buffer + len, PAGE_SIZE - len,
 			 "poll_us=%u waits=%lld polls=%lld total_wait_ns=%lld errors=%lld completed_exports=%lld lazy_discards=%lld",
 			 panthor_client_sync_file_poll_us,
 			 atomic64_read(&panthor_client_sync_file_waits),
@@ -647,6 +666,7 @@ panthor_client_syncobj_put(struct panthor_client_syncobj *syncobj)
 	}
 
 	panthor_client_syncobj_put(syncobj->snapshot);
+	panthor_client_syncobj_put(syncobj->export_snapshot);
 	panthor_client_completion_page_put(syncobj->completion_page);
 	mutex_destroy(&syncobj->state_lock);
 	kfree(syncobj);
@@ -1907,6 +1927,18 @@ panthor_client_syncobj_export_sync_file(struct panthor_client_file *pcfile,
 		goto out_put_fd;
 	}
 
+	mutex_lock(&pcfile->lock);
+	if (panthor_client_transfer_capture && !pcfile->sync_mutations &&
+	    !pcfile->sync_epoch_wrapped && syncobj->capture_epoch == pcfile->sync_epoch &&
+	    panthor_client_syncobj_get(syncobj->export_snapshot)) {
+		sync_fence->snapshot = syncobj->export_snapshot;
+		atomic64_inc(&panthor_client_capture_hits);
+	}
+	mutex_unlock(&pcfile->lock);
+	if (sync_fence->snapshot) {
+		snapshot_handle = sync_fence->snapshot->client_handle;
+		goto init_export;
+	}
 	ret = panthor_client_syncobj_materialize(syncobj);
 	if (ret) {
 		kfree(sync_fence);
@@ -1921,7 +1953,6 @@ panthor_client_syncobj_export_sync_file(struct panthor_client_file *pcfile,
 		goto out_put_fd;
 	}
 
-	sync_fence->session_id = pcfile->session_id;
 	if (snapshot_handle) {
 		sync_fence->snapshot = panthor_client_syncobj_alloc(pcfile->session_id);
 		if (!sync_fence->snapshot) {
@@ -1941,6 +1972,8 @@ panthor_client_syncobj_export_sync_file(struct panthor_client_file *pcfile,
 			sync_fence->snapshot->completion_slot = watched.slot;
 		}
 	}
+init_export:
+	sync_fence->session_id = pcfile->session_id;
 	mutex_init(&sync_fence->snapshot_lock);
 	spin_lock_init(&sync_fence->lock);
 	INIT_WORK(&sync_fence->work, panthor_client_sync_fence_work);
@@ -2109,6 +2142,8 @@ panthor_client_syncobj_transfer(struct panthor_client_file *pcfile,
 	struct panthor_client_syncobj *dst_syncobj = NULL;
 	struct panthor_vmshm_syncobj_transfer_req req = { 0 };
 	struct panthor_vmshm_syncobj_transfer_rsp rsp;
+	struct panthor_client_syncobj *captured = NULL, *old_capture = NULL;
+	u64 capture_epoch = 0;
 	int ret = 0;
 
 	if (!pcfile || !args || args->pad || !args->src_handle ||
@@ -2128,7 +2163,11 @@ panthor_client_syncobj_transfer(struct panthor_client_file *pcfile,
 		goto out_unlock;
 	}
 	dst_syncobj->proof_cookie = 0;
+	old_capture = dst_syncobj->export_snapshot;
+	dst_syncobj->export_snapshot = NULL;
+	capture_epoch = pcfile->sync_epoch;
 	mutex_unlock(&pcfile->lock);
+	panthor_client_syncobj_put(old_capture);
 
 	ret = panthor_client_syncobj_materialize(src_syncobj);
 	if (ret)
@@ -2143,7 +2182,55 @@ panthor_client_syncobj_transfer(struct panthor_client_file *pcfile,
 	req.dst_point = args->dst_point;
 	req.flags = args->flags;
 
-	ret = panthor_client_rpc_syncobj_transfer(&req, &rsp);
+	if (args->dst_point)
+		atomic64_inc(&panthor_client_transfer_timeline);
+	else
+		atomic64_inc(&panthor_client_transfer_binary);
+	if (panthor_client_transfer_capture && !args->dst_point &&
+	    pcfile->completion_page && pcfile->completion_page->retire_enabled &&
+	    (pcfile->feature_bits & PANTHOR_VMSHM_FEATURE_TRANSFER_CAPTURE))
+		captured = panthor_client_syncobj_alloc(pcfile->session_id);
+	if (captured) {
+		struct panthor_vmshm_transfer_capture_req capture = { .transfer = req };
+		struct panthor_vmshm_transfer_capture_rsp response = { 0 };
+
+		capture.retire.snapshot.session_id = req.session_id;
+		capture.retire.snapshot.source_handle = req.src_handle;
+		panthor_client_snapshot_retire_take(pcfile->completion_page,
+						    &capture.retire, false);
+		atomic64_inc(&panthor_client_capture_calls);
+		ret = panthor_client_rpc_call(PANTHOR_VMSHM_MSG_TRANSFER_CAPTURE_REQ,
+			&capture, sizeof(capture), PANTHOR_VMSHM_MSG_TRANSFER_CAPTURE_RSP,
+			&response, sizeof(response), sizeof(response), NULL);
+		rsp = response.transfer;
+		if (!ret && !rsp.ret && !response.watch.snapshot.ret &&
+		    response.watch.snapshot.client_syncobj_handle) {
+			captured->client_handle = response.watch.snapshot.client_syncobj_handle;
+			captured->proxy_handle = response.watch.snapshot.proxy_syncobj_handle;
+			captured->destroy_pending = true;
+			refcount_inc(&pcfile->completion_page->refs);
+			captured->completion_page = pcfile->completion_page;
+			if (response.watch.cookie &&
+			    response.watch.slot < PANTHOR_VMSHM_COMPLETION_SLOTS) {
+				captured->completion_cookie = response.watch.cookie;
+				captured->completion_slot = response.watch.slot;
+			}
+			mutex_lock(&pcfile->lock);
+			if (pcfile->sync_mutations == 1 && !pcfile->sync_epoch_wrapped &&
+			    pcfile->sync_epoch == capture_epoch &&
+			    !dst_syncobj->export_snapshot && !dst_syncobj->destroy_pending) {
+				dst_syncobj->capture_epoch = capture_epoch;
+				dst_syncobj->export_snapshot = captured;
+				captured = NULL;
+				atomic64_inc(&panthor_client_capture_records);
+			} else {
+				atomic64_inc(&panthor_client_capture_discarded);
+			}
+			mutex_unlock(&pcfile->lock);
+		}
+	} else {
+		ret = panthor_client_rpc_syncobj_transfer(&req, &rsp);
+	}
 	if (ret)
 		goto out_put_syncobjs;
 	if (rsp.ret) {
@@ -2162,6 +2249,7 @@ out_unlock:
 	goto out_put_syncobjs;
 
 out_put_syncobjs:
+	panthor_client_syncobj_put(captured);
 	panthor_client_syncobj_put(dst_syncobj);
 	panthor_client_syncobj_put(src_syncobj);
 	return ret;
@@ -3993,7 +4081,7 @@ static bool panthor_client_wait_cache_mutation_begin(struct file *filp,
 	struct drm_file *file = filp->private_data;
 	struct panthor_client_file *pcfile = file ? file->driver_priv : NULL;
 
-	if (!panthor_client_completed_wait_cache || !pcfile)
+	if ((!panthor_client_completed_wait_cache && !panthor_client_transfer_capture) || !pcfile)
 		return false;
 	switch (cmd) {
 	case DRM_IOCTL_GET_CAP:
