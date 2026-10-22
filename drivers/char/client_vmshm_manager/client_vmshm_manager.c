@@ -14,14 +14,16 @@
 #include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/proxy_vmshm.h>
 #include <linux/refcount.h>
 #include <linux/slab.h>
 #include <linux/vmshm_comm.h>
 
 struct client_vmshm_object {
 	struct vmshm_manager_desc desc;
+	struct vmshm_manager_segment *segments;
 	void *kva;
-	phys_addr_t gpa;
+	phys_addr_t pool_gpa;
 	refcount_t refcnt;
 };
 
@@ -92,16 +94,69 @@ static bool client_vmshm_range_valid(struct client_vmshm_manager_dev *d,
 static int client_vmshm_validate_desc(struct client_vmshm_manager_dev *d,
 				      const struct vmshm_manager_desc *desc)
 {
-	if (!(desc->flags & VMSHM_MANAGER_DESC_F_CONTIG))
+	if (desc->flags & ~VMSHM_MANAGER_DESC_F_CONTIG)
 		return -EOPNOTSUPP;
-	if (desc->nr_segments != 1)
-		return -EOPNOTSUPP;
-	if (desc->size > desc->alloc_size)
+	if (!desc->nr_segments || desc->nr_segments > VMSHM_MANAGER_MAX_SEGMENTS ||
+	    !desc->size || desc->size > desc->alloc_size)
 		return -EINVAL;
-	if (!client_vmshm_range_valid(d, desc->offset, desc->alloc_size))
-		return -ERANGE;
+	if (desc->flags & VMSHM_MANAGER_DESC_F_CONTIG) {
+		if (desc->nr_segments != 1)
+			return -EINVAL;
+		if (!client_vmshm_range_valid(d, desc->offset, desc->alloc_size))
+			return -ERANGE;
+	} else if (desc->type != PROXY_VMSHM_OBJ_GPU_BO ||
+		   !PAGE_ALIGNED(desc->alloc_size) || desc->alloc_size > d->size) {
+		return -EINVAL;
+	}
 
 	return 0;
+}
+
+static int client_vmshm_request_segment(const struct vmshm_manager_get_object_req *req,
+				      struct vmshm_manager_get_object_rsp *rsp)
+{
+	struct vmshm_comm_rx rx;
+	int ret;
+
+	ret = client_comm_vmshm_call(VMSHM_MANAGER_MSG_GET_OBJECT_REQ, 0,
+				     req, sizeof(*req),
+				     VMSHM_MANAGER_MSG_GET_OBJECT_RSP,
+				     rsp, sizeof(*rsp), &rx);
+	if (ret)
+		return ret;
+	if (rx.len != sizeof(*rsp))
+		return -EPROTO;
+	return rsp->ret;
+}
+
+static int client_vmshm_validate_segments(struct client_vmshm_manager_dev *d,
+					const struct client_vmshm_object *obj)
+{
+	u64 total = 0;
+	unsigned int index, previous;
+
+	if (obj->segments[0].offset != obj->desc.offset)
+		return -EINVAL;
+	for (index = 0; index < obj->desc.nr_segments; index++) {
+		const struct vmshm_manager_segment *segment = &obj->segments[index];
+
+		if (!segment->size || !client_vmshm_range_valid(d, segment->offset,
+							      segment->size) ||
+		    segment->size > obj->desc.alloc_size - total)
+			return -ERANGE;
+		if (!(obj->desc.flags & VMSHM_MANAGER_DESC_F_CONTIG) &&
+		    (!PAGE_ALIGNED(segment->offset) || !PAGE_ALIGNED(segment->size)))
+			return -EINVAL;
+		for (previous = 0; previous < index; previous++) {
+			const struct vmshm_manager_segment *other = &obj->segments[previous];
+
+			if (segment->offset < other->offset + other->size &&
+			    other->offset < segment->offset + segment->size)
+				return -EINVAL;
+		}
+		total += segment->size;
+	}
+	return total == obj->desc.alloc_size ? 0 : -EINVAL;
 }
 
 int client_vmshm_manager_get(const struct client_vmshm_lookup_params *params,
@@ -110,11 +165,11 @@ int client_vmshm_manager_get(const struct client_vmshm_lookup_params *params,
 	struct client_vmshm_manager_dev *d = &client_vmshm_mgr;
 	struct vmshm_manager_get_object_req req;
 	struct vmshm_manager_get_object_rsp rsp;
-	struct vmshm_comm_rx rx;
 	struct client_vmshm_object *obj;
+	unsigned int index;
 	int ret;
 
-	if (!params || !out)
+	if (!params || !out || params->flags)
 		return -EINVAL;
 	if (params->lookup != VMSHM_MANAGER_LOOKUP_HANDLE &&
 	    params->lookup != VMSHM_MANAGER_LOOKUP_GRANT)
@@ -134,22 +189,9 @@ int client_vmshm_manager_get(const struct client_vmshm_lookup_params *params,
 	req.lookup = params->lookup;
 	req.requester_vmid = params->requester_vmid ?: d->client_vmid;
 	req.required_perms = params->required_perms;
-	req.flags = params->flags;
-
-	ret = client_comm_vmshm_call(VMSHM_MANAGER_MSG_GET_OBJECT_REQ, 0,
-				     &req, sizeof(req),
-				     VMSHM_MANAGER_MSG_GET_OBJECT_RSP,
-				     &rsp, sizeof(rsp), &rx);
+	ret = client_vmshm_request_segment(&req, &rsp);
 	if (ret)
 		goto out_unlock;
-	if (rx.len != sizeof(rsp)) {
-		ret = -EPROTO;
-		goto out_unlock;
-	}
-	if (rsp.ret) {
-		ret = rsp.ret;
-		goto out_unlock;
-	}
 
 	ret = client_vmshm_validate_desc(d, &rsp.desc);
 	if (ret)
@@ -162,13 +204,37 @@ int client_vmshm_manager_get(const struct client_vmshm_lookup_params *params,
 	}
 
 	obj->desc = rsp.desc;
-	obj->desc.gpa = d->gpa + rsp.desc.offset;
-	obj->kva = (void *)((u8 *)d->base + rsp.desc.offset);
-	obj->gpa = d->gpa + rsp.desc.offset;
+	obj->segments = kcalloc(obj->desc.nr_segments, sizeof(*obj->segments), GFP_KERNEL);
+	if (!obj->segments) {
+		ret = -ENOMEM;
+		goto out_free_object;
+	}
+	obj->segments[0] = rsp.segment;
+	for (index = 1; index < obj->desc.nr_segments; index++) {
+		req.segment_index = index;
+		ret = client_vmshm_request_segment(&req, &rsp);
+		if (ret)
+			goto out_free_object;
+		if (memcmp(&obj->desc, &rsp.desc, sizeof(rsp.desc))) {
+			ret = -ESTALE;
+			goto out_free_object;
+		}
+		obj->segments[index] = rsp.segment;
+	}
+	ret = client_vmshm_validate_segments(d, obj);
+	if (ret)
+		goto out_free_object;
+	obj->desc.gpa = d->gpa + obj->desc.offset;
+	if (obj->desc.flags & VMSHM_MANAGER_DESC_F_CONTIG)
+		obj->kva = (u8 *)d->base + obj->desc.offset;
+	obj->pool_gpa = d->gpa;
 	refcount_set(&obj->refcnt, 1);
 	*out = obj;
 	mutex_unlock(&d->lock);
 	return 0;
+out_free_object:
+	kfree(obj->segments);
+	kfree(obj);
 out_unlock:
 	mutex_unlock(&d->lock);
 	client_comm_vmshm_put();
@@ -179,6 +245,7 @@ EXPORT_SYMBOL_GPL(client_vmshm_manager_get);
 void client_vmshm_manager_put(struct client_vmshm_object *obj)
 {
 	if (obj && refcount_dec_and_test(&obj->refcnt)) {
+		kfree(obj->segments);
 		kfree(obj);
 		client_comm_vmshm_put();
 	}
@@ -192,11 +259,40 @@ client_vmshm_object_desc(const struct client_vmshm_object *obj)
 }
 EXPORT_SYMBOL_GPL(client_vmshm_object_desc);
 
-phys_addr_t client_vmshm_object_gpa(const struct client_vmshm_object *obj)
+int client_vmshm_object_mmap(const struct client_vmshm_object *obj,
+			    struct vm_area_struct *vma, u64 offset)
 {
-	return obj ? obj->gpa : 0;
+	u64 size = vma->vm_end - vma->vm_start;
+	u64 logical = 0, end;
+	unsigned int index;
+	int ret;
+
+	if (!obj || obj->desc.type != PROXY_VMSHM_OBJ_GPU_BO ||
+	    !(obj->desc.perms & PROXY_VMSHM_PERM_MMAP) || !size ||
+	    !PAGE_ALIGNED(offset) || offset > obj->desc.alloc_size ||
+	    size > obj->desc.alloc_size - offset)
+		return -EINVAL;
+	end = offset + size;
+	for (index = 0; index < obj->desc.nr_segments; index++) {
+		const struct vmshm_manager_segment *segment = &obj->segments[index];
+		u64 start = max(offset, logical);
+		u64 stop = min(end, logical + segment->size);
+		phys_addr_t gpa = obj->pool_gpa + segment->offset + start - logical;
+
+		if (stop > start) {
+			ret = remap_pfn_range(vma, vma->vm_start + start - offset,
+					      gpa >> PAGE_SHIFT, stop - start,
+					      vma->vm_page_prot);
+			if (ret)
+				return ret;
+		}
+		logical += segment->size;
+		if (logical >= end)
+			break;
+	}
+	return 0;
 }
-EXPORT_SYMBOL_GPL(client_vmshm_object_gpa);
+EXPORT_SYMBOL_GPL(client_vmshm_object_mmap);
 
 const void *client_vmshm_object_kva(const struct client_vmshm_object *obj)
 {

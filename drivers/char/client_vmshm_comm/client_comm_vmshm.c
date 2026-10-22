@@ -105,6 +105,11 @@ struct client_comm_vmshm_rpc_stat {
 	u64 poll_recv_ns;
 	u64 poll_recv_max_ns;
 	u64 poll_sleeps;
+	u64 queue_ns;
+	u64 notify_ns;
+	u64 reply_poll_ns;
+	u64 arm_ns;
+	u64 completion_wait_ns;
 };
 
 struct client_comm_vmshm_rpc_sample {
@@ -116,6 +121,11 @@ struct client_comm_vmshm_rpc_sample {
 	u64 wait_ns;
 	u64 poll_recv_ns;
 	u64 poll_sleeps;
+	u64 queue_ns;
+	u64 notify_ns;
+	u64 reply_poll_ns;
+	u64 arm_ns;
+	u64 completion_wait_ns;
 };
 
 static struct client_comm_vmshm_dev client_comm_vmshm_dev = {
@@ -255,6 +265,11 @@ client_comm_vmshm_rpc_stats_record(const struct client_comm_vmshm_rpc_sample *sa
 		if (sample->poll_recv_ns > stat->poll_recv_max_ns)
 			stat->poll_recv_max_ns = sample->poll_recv_ns;
 		stat->poll_sleeps += sample->poll_sleeps;
+		stat->queue_ns += sample->queue_ns;
+		stat->notify_ns += sample->notify_ns;
+		stat->reply_poll_ns += sample->reply_poll_ns;
+		stat->arm_ns += sample->arm_ns;
+		stat->completion_wait_ns += sample->completion_wait_ns;
 	}
 	spin_unlock_irqrestore(&client_comm_vmshm_rpc_stats_lock, flags);
 }
@@ -282,7 +297,7 @@ client_comm_vmshm_rpc_stats_dump_snapshot(
 		avg_wait = div64_u64(stat->wait_ns, stat->calls);
 		avg_poll_recv = div64_u64(stat->poll_recv_ns, stat->calls);
 
-		pr_info("client_comm_vmshm: [MZH][CLIENT_COMM_RPC_STATS] op=%s type=0x%x calls=%llu errors=%llu timeouts=%llu total_ns=%llu avg_ns=%llu max_ns=%llu lock_wait_avg_ns=%llu lock_wait_max_ns=%llu send_avg_ns=%llu send_max_ns=%llu wait_avg_ns=%llu wait_max_ns=%llu poll_recv_avg_ns=%llu poll_recv_max_ns=%llu poll_sleeps=%llu\n",
+		pr_info("client_comm_vmshm: [MZH][CLIENT_COMM_RPC_STATS] op=%s type=0x%x calls=%llu errors=%llu timeouts=%llu total_ns=%llu avg_ns=%llu max_ns=%llu lock_wait_avg_ns=%llu lock_wait_max_ns=%llu send_avg_ns=%llu send_max_ns=%llu wait_avg_ns=%llu wait_max_ns=%llu poll_recv_avg_ns=%llu poll_recv_max_ns=%llu poll_sleeps=%llu queue_avg_ns=%llu notify_avg_ns=%llu reply_poll_avg_ns=%llu arm_avg_ns=%llu completion_wait_avg_ns=%llu\n",
 			client_comm_vmshm_req_name(stat->req_type), stat->req_type,
 			stat->calls, stat->errors, stat->timeouts,
 			stat->total_ns, avg_total, stat->total_max_ns,
@@ -290,7 +305,12 @@ client_comm_vmshm_rpc_stats_dump_snapshot(
 			avg_send, stat->send_max_ns,
 			avg_wait, stat->wait_max_ns,
 			avg_poll_recv, stat->poll_recv_max_ns,
-			stat->poll_sleeps);
+			stat->poll_sleeps,
+			div64_u64(stat->queue_ns, stat->calls),
+			div64_u64(stat->notify_ns, stat->calls),
+			div64_u64(stat->reply_poll_ns, stat->calls),
+			div64_u64(stat->arm_ns, stat->calls),
+			div64_u64(stat->completion_wait_ns, stat->calls));
 	}
 }
 
@@ -803,9 +823,11 @@ u32 client_comm_vmshm_client_vmid(void)
 }
 EXPORT_SYMBOL_GPL(client_comm_vmshm_client_vmid);
 
-static int client_comm_vmshm_send_to_proxy(const struct vmshm_comm_tx *tx)
+static int client_comm_vmshm_send_to_proxy(const struct vmshm_comm_tx *tx,
+					 struct client_comm_vmshm_rpc_sample *sample)
 {
 	struct client_comm_vmshm_dev *d = &client_comm_vmshm_dev;
+	u64 start_ns;
 	int ret;
 
 	mutex_lock(&d->lock);
@@ -814,11 +836,18 @@ static int client_comm_vmshm_send_to_proxy(const struct vmshm_comm_tx *tx)
 		goto out_unlock;
 	}
 
+	start_ns = sample ? ktime_get_ns() : 0;
 	ret = client_comm_vmshm_queue_send(d,
 					   PROXY_COMM_VMSHM_Q_CLIENT_TO_PROXY,
 					   tx);
-	if (!ret)
+	if (sample)
+		sample->queue_ns += ktime_get_ns() - start_ns;
+	if (!ret) {
+		start_ns = sample ? ktime_get_ns() : 0;
 		client_comm_vmshm_kick_proxy(d);
+		if (sample)
+			sample->notify_ns += ktime_get_ns() - start_ns;
+	}
 
 out_unlock:
 	mutex_unlock(&d->lock);
@@ -1028,7 +1057,7 @@ int client_comm_vmshm_call(u32 req_type, u32 req_flags,
 	bool stats_enabled = client_comm_vmshm_rpc_stats_is_enabled();
 	bool serialize = !client_comm_vmshm_concurrent_rpc;
 	u64 total_start_ns = 0, lock_start_ns = 0, send_start_ns;
-	u64 wait_start_ns;
+	u64 wait_start_ns, phase_start_ns;
 	struct client_comm_vmshm_rpc_sample sample = {
 		.req_type = req_type,
 	};
@@ -1090,7 +1119,7 @@ int client_comm_vmshm_call(u32 req_type, u32 req_flags,
 		spin_unlock(&d->waiters_lock);
 
 		send_start_ns = stats_enabled ? ktime_get_ns() : 0;
-		ret = client_comm_vmshm_send_to_proxy(&tx);
+		ret = client_comm_vmshm_send_to_proxy(&tx, stats_enabled ? &sample : NULL);
 		if (stats_enabled)
 			sample.send_ns += ktime_get_ns() - send_start_ns;
 		if (ret) {
@@ -1105,9 +1134,19 @@ int client_comm_vmshm_call(u32 req_type, u32 req_flags,
 		expires = jiffies + timeout;
 		wait_start_ns = stats_enabled ? ktime_get_ns() : 0;
 		client_comm_vmshm_poll_response(d, &waiter);
+		if (stats_enabled) {
+			phase_start_ns = ktime_get_ns();
+			sample.reply_poll_ns += phase_start_ns - wait_start_ns;
+		}
 		client_comm_vmshm_prepare_response_wait(d, &waiter);
+		if (stats_enabled)
+			sample.arm_ns += ktime_get_ns() - phase_start_ns;
 		timeout = time_before(jiffies, expires) ? expires - jiffies : 0;
-		if (!wait_for_completion_timeout(&waiter.done, timeout)) {
+		phase_start_ns = stats_enabled ? ktime_get_ns() : 0;
+		timeout = wait_for_completion_timeout(&waiter.done, timeout);
+		if (stats_enabled)
+			sample.completion_wait_ns += ktime_get_ns() - phase_start_ns;
+		if (!timeout) {
 			bool completed;
 
 			if (stats_enabled)

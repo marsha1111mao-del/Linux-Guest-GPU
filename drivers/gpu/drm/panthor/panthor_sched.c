@@ -12,6 +12,7 @@
 #include <linux/clk.h>
 #include <linux/cc_platform.h>
 #include <linux/delay.h>
+#include <linux/dma-fence-chain.h>
 #include <linux/dma-mapping.h>
 #include <linux/dma-resv.h>
 #include <linux/firmware.h>
@@ -97,6 +98,11 @@
 #define MAX_CSG_PRIO				0xf
 #define NUM_INSTRS_PER_SLOT			16
 
+static unsigned int panthor_max_inflight_jobs;
+module_param_named(max_inflight_jobs, panthor_max_inflight_jobs, uint, 0444);
+MODULE_PARM_DESC(max_inflight_jobs,
+		 "Maximum admitted GPU jobs (0 uses normal queue limits)");
+
 static unsigned int panthor_sched_tick_ms = 10;
 module_param_named(sched_tick_ms, panthor_sched_tick_ms, uint, 0644);
 MODULE_PARM_DESC(sched_tick_ms,
@@ -176,6 +182,8 @@ enum panthor_csg_priority {
 struct panthor_scheduler {
 	/** @ptdev: Device. */
 	struct panthor_device *ptdev;
+	struct mutex admission_lock;
+	struct dma_fence *admission_fences[MAX_CSGS];
 
 	/**
 	 * @wq: Workqueue used by our internal scheduler logic and
@@ -969,6 +977,8 @@ struct panthor_job {
 
 	/** @done_fence: Fence signaled when the job is finished or cancelled. */
 	struct dma_fence *done_fence;
+	struct dma_fence_chain *admission_fence;
+	bool admission_reserved;
 };
 
 static const char *panthor_group_state_name(enum panthor_group_state state)
@@ -3742,7 +3752,39 @@ static void queue_free_job(struct drm_sched_job *sched_job)
 	panthor_job_put(sched_job);
 }
 
+static struct dma_fence *queue_prepare_job(struct drm_sched_job *sched_job,
+					 struct drm_sched_entity *entity)
+{
+	struct panthor_job *job = container_of(sched_job, struct panthor_job, base);
+	struct panthor_scheduler *sched = job->group->ptdev->scheduler;
+	unsigned int limit = min_t(unsigned int, panthor_max_inflight_jobs, MAX_CSGS);
+	struct dma_fence *dependency = NULL;
+	unsigned int slot;
+
+	if (!limit || !job->call_info.size || job->admission_reserved)
+		return NULL;
+
+	mutex_lock(&sched->admission_lock);
+	for (slot = 0; slot < limit; slot++) {
+		if (!sched->admission_fences[slot] ||
+		    dma_fence_is_signaled(sched->admission_fences[slot])) {
+			dma_fence_put(sched->admission_fences[slot]);
+			dma_fence_chain_init(job->admission_fence, NULL,
+					dma_fence_get(&sched_job->s_fence->finished), 1);
+			sched->admission_fences[slot] = dma_fence_get(&job->admission_fence->base);
+			job->admission_reserved = true;
+			break;
+		}
+	}
+	if (slot == limit)
+		dependency = dma_fence_get(sched->admission_fences[0]);
+	mutex_unlock(&sched->admission_lock);
+
+	return dependency;
+}
+
 static const struct drm_sched_backend_ops panthor_queue_sched_ops = {
+	.prepare_job = queue_prepare_job,
 	.run_job = queue_run_job,
 	.timedout_job = queue_timedout_job,
 	.free_job = queue_free_job,
@@ -4067,6 +4109,10 @@ static void job_release(struct kref *ref)
 	struct panthor_job *job = container_of(ref, struct panthor_job, refcount);
 
 	drm_WARN_ON(&job->group->ptdev->base, !list_empty(&job->node));
+	if (job->admission_reserved)
+		dma_fence_put(&job->admission_fence->base);
+	else
+		dma_fence_chain_free(job->admission_fence);
 
 	if (job->base.s_fence)
 		drm_sched_job_cleanup(&job->base);
@@ -4172,6 +4218,14 @@ panthor_job_create(struct panthor_file *pfile,
 		}
 	}
 
+	if (panthor_max_inflight_jobs && job->call_info.size) {
+		job->admission_fence = dma_fence_chain_alloc();
+		if (!job->admission_fence) {
+			ret = -ENOMEM;
+			goto err_put_job;
+		}
+	}
+
 	ret = drm_sched_job_init(&job->base,
 				 &job->group->queues[job->queue_idx]->entity,
 				 1, job->group);
@@ -4222,6 +4276,8 @@ static void panthor_sched_fini(struct drm_device *ddev, void *res)
 
 	if (sched->heap_alloc_wq)
 		destroy_workqueue(sched->heap_alloc_wq);
+	for (unsigned int slot = 0; slot < MAX_CSGS; slot++)
+		dma_fence_put(sched->admission_fences[slot]);
 
 	for (prio = PANTHOR_CSG_PRIORITY_COUNT - 1; prio >= 0; prio--) {
 		drm_WARN_ON(ddev, !list_empty(&sched->groups.runnable[prio]));
@@ -4270,6 +4326,9 @@ int panthor_sched_init(struct panthor_device *ptdev)
 	}
 
 	sched->ptdev = ptdev;
+	ret = drmm_mutex_init(&ptdev->base, &sched->admission_lock);
+	if (ret)
+		return ret;
 	sched->sb_slot_count = CS_FEATURES_SCOREBOARDS(cs_iface->control->features);
 	sched->csg_slot_count = num_groups;
 	sched->cs_slot_count = csg_iface->control->stream_num;

@@ -12,6 +12,12 @@
 #define VMSHM_MANAGER_LOOKUP_GRANT		2
 
 #define VMSHM_MANAGER_DESC_F_CONTIG		BIT(0)
+#define VMSHM_MANAGER_MAX_SEGMENTS		256
+
+struct vmshm_manager_segment {
+	__u64 offset;
+	__u64 size;
+};
 
 struct vmshm_manager_desc {
 	__u64 handle;
@@ -33,13 +39,14 @@ struct vmshm_manager_get_object_req {
 	__u32 lookup;
 	__u32 requester_vmid;
 	__u32 required_perms;
-	__u32 flags;
+	__u32 segment_index;
 };
 
 struct vmshm_manager_get_object_rsp {
 	__s32 ret;
 	__u32 reserved;
 	struct vmshm_manager_desc desc;
+	struct vmshm_manager_segment segment;
 };
 
 #endif /* _LINUX_VMSHM_MANAGER_H */

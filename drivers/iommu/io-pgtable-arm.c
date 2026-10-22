@@ -522,6 +522,8 @@ static int panthor_gpa_to_hpa_batch(struct arm_lpae_io_pgtable *data,
 	if (ret) {
 		pr_err("[MZH][GPA2HPA] translation failed ret=%ld gpa=%pa entries=%d realm=%d\n",
 		       ret, &gpa, miss_count, panthor_rmm_gpa_to_hpa_enabled());
+		if (ret > 0)
+			ret = -EACCES;
 		goto out_unlock_ret;
 	}
 
@@ -852,6 +854,7 @@ static int arm_panthor_lpae_init_2m_block_or_pages(
 	phys_addr_t *hpas, hpa_base;
 	arm_lpae_iopte curr, pte;
 	bool block_ok = true;
+	bool translated = false;
 	bool timing = panthor_pt_timing_active();
 	u64 total_start = panthor_pt_timing_start(timing);
 	u64 phase_start;
@@ -904,6 +907,7 @@ static int arm_panthor_lpae_init_2m_block_or_pages(
 	if (ret)
 		goto out_free_hpas;
 
+	translated = true;
 	phase_start = panthor_pt_timing_start(timing);
 	hpa_base = hpas[0];
 	if (!IS_ALIGNED(hpa_base, SZ_2M)) {
@@ -992,7 +996,7 @@ static int arm_panthor_lpae_init_2m_block_or_pages(
 	}
 
 out_free_hpas:
-	if (ret)
+	if (ret && translated)
 		panthor_realm_gpu_revoke_hpas(data, hpas, pages_per_block);
 	phase_start = panthor_pt_timing_start(timing);
 	kfree(hpas);
@@ -1038,6 +1042,7 @@ static int __arm_panthor_lpae_init_pte(struct arm_lpae_io_pgtable *data,
 	struct io_pgtable_cfg *cfg = &data->iop.cfg;
 	phys_addr_t *hpas;
 	int ret;
+	bool translated = false;
 	bool timing = panthor_pt_timing_active();
 	u64 total_start = panthor_pt_timing_start(timing);
 	u64 phase_start;
@@ -1064,6 +1069,7 @@ static int __arm_panthor_lpae_init_pte(struct arm_lpae_io_pgtable *data,
 	if (ret)
 		goto out_free_hpas;
 
+	translated = true;
 	phase_start = panthor_pt_timing_start(timing);
 	for (i = 0; i < num_entries; i++) {
 		u64 raw_hpa = hpas[i]; // 原始的 Host Physical Address (HPA)
@@ -1087,7 +1093,7 @@ static int __arm_panthor_lpae_init_pte(struct arm_lpae_io_pgtable *data,
 				phase_start);
 
 out_free_hpas:
-	if (ret)
+	if (ret && translated)
 		panthor_realm_gpu_revoke_hpas(data, hpas, num_entries);
 	phase_start = panthor_pt_timing_start(timing);
 	kfree(hpas);

@@ -8,6 +8,7 @@
 #include <linux/vmshm_manager.h>
 
 struct client_vmshm_object;
+struct vm_area_struct;
 
 struct client_vmshm_lookup_params {
 	u64 handle;
@@ -27,7 +28,8 @@ int client_vmshm_manager_get(const struct client_vmshm_lookup_params *params,
 void client_vmshm_manager_put(struct client_vmshm_object *obj);
 const struct vmshm_manager_desc *
 client_vmshm_object_desc(const struct client_vmshm_object *obj);
-phys_addr_t client_vmshm_object_gpa(const struct client_vmshm_object *obj);
+int client_vmshm_object_mmap(const struct client_vmshm_object *obj,
+			    struct vm_area_struct *vma, u64 offset);
 const void *client_vmshm_object_kva(const struct client_vmshm_object *obj);
 #else
 static inline int client_vmshm_manager_bind(void *base, phys_addr_t gpa,
@@ -58,10 +60,11 @@ static inline const void *client_vmshm_object_kva(const struct client_vmshm_obje
 	return NULL;
 }
 
-static inline phys_addr_t
-client_vmshm_object_gpa(const struct client_vmshm_object *obj)
+static inline int
+client_vmshm_object_mmap(const struct client_vmshm_object *obj,
+			 struct vm_area_struct *vma, u64 offset)
 {
-	return 0;
+	return -ENODEV;
 }
 
 #endif

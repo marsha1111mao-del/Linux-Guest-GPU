@@ -147,7 +147,122 @@ out:
 	return ret;
 }
 
-int proxy_vmshm_manager_selftest_permissions(u32 owner)
+static int proxy_vmshm_selftest_gpu_fragmentation(u32 owner, size_t capacity)
+{
+	struct proxy_vmshm_alloc_params params =
+		proxy_vmshm_test_params(PAGE_SIZE, PAGE_SIZE, owner);
+	struct proxy_vmshm_object *objects[4] = {};
+	struct proxy_vmshm_object *replacement = NULL;
+	struct proxy_vmshm_span segment;
+	size_t half = ((capacity >> PAGE_SHIFT) - 2) / 2 * PAGE_SIZE;
+	size_t sizes[] = { half, PAGE_SIZE, capacity - half - 2 * PAGE_SIZE, PAGE_SIZE };
+	u64 total = 0;
+	unsigned int index, segments = 0;
+	bool pinned = false, revoked = false;
+	int ret = 0;
+
+	params.type = PROXY_VMSHM_OBJ_GPU_BO;
+	params.flags = PROXY_VMSHM_F_CONTIG;
+	params.perms = PROXY_VMSHM_PERM_CPU_READ | PROXY_VMSHM_PERM_CPU_WRITE |
+		PROXY_VMSHM_PERM_MMAP | PROXY_VMSHM_PERM_GPU_READ;
+	for (index = 0; index < ARRAY_SIZE(sizes); index++) {
+		params.size = sizes[index];
+		objects[index] = proxy_vmshm_alloc_ext(&params, GFP_KERNEL);
+		if (IS_ERR(objects[index])) {
+			ret = PTR_ERR(objects[index]);
+			objects[index] = NULL;
+			goto out;
+		}
+	}
+	proxy_vmshm_free(objects[0]);
+	objects[0] = NULL;
+	proxy_vmshm_free(objects[2]);
+	objects[2] = NULL;
+	params.size = capacity - 2 * PAGE_SIZE;
+	replacement = proxy_vmshm_alloc_ext(&params, GFP_KERNEL);
+	if (!IS_ERR(replacement)) {
+		ret = -EINVAL;
+		goto out;
+	}
+	ret = proxy_vmshm_test_expect_err("fragmented contiguous BO",
+					 PTR_ERR(replacement), -ENOMEM);
+	replacement = NULL;
+	if (ret)
+		goto out;
+	params.flags = PROXY_VMSHM_F_ALLOW_SG;
+	replacement = proxy_vmshm_alloc_ext(&params, GFP_KERNEL);
+	if (IS_ERR(replacement)) {
+		ret = PTR_ERR(replacement);
+		replacement = NULL;
+		goto out;
+	}
+	segments = proxy_vmshm_obj_nr_segments(replacement);
+	if (!proxy_vmshm_obj_is_sg(replacement) || segments < 2 ||
+	    proxy_vmshm_obj_alloc_size(replacement) != params.size) {
+		ret = -EINVAL;
+		goto out;
+	}
+	ret = proxy_vmshm_pin(replacement);
+	if (ret)
+		goto out;
+	pinned = true;
+	ret = proxy_vmshm_obj_check_gpu_map(replacement, PROXY_VMSHM_PERM_GPU_READ);
+	if (ret)
+		goto out;
+	for (index = 0; index < segments; index++) {
+		ret = proxy_vmshm_obj_get_segment(replacement, index, &segment);
+		if (ret)
+			goto out;
+		if (segment.logical_offset != total || !segment.size ||
+		    segment.size > params.size - total) {
+			ret = -EINVAL;
+			goto out;
+		}
+		memset(segment.kva, 0xa5, segment.size);
+		total += segment.size;
+	}
+	if (total != params.size) {
+		ret = -EINVAL;
+		goto out;
+	}
+	proxy_vmshm_free(replacement);
+	revoked = true;
+	ret = proxy_vmshm_test_expect_err("revoked SG mapping",
+		proxy_vmshm_obj_check_gpu_map(replacement, PROXY_VMSHM_PERM_GPU_READ), -ENOENT);
+	proxy_vmshm_unpin(replacement);
+	pinned = false;
+	replacement = NULL;
+	if (ret)
+		goto out;
+	proxy_vmshm_free(objects[1]);
+	objects[1] = NULL;
+	proxy_vmshm_free(objects[3]);
+	objects[3] = NULL;
+	params.flags = PROXY_VMSHM_F_CONTIG;
+	params.size = capacity;
+	replacement = proxy_vmshm_alloc_ext(&params, GFP_KERNEL);
+	if (IS_ERR(replacement)) {
+		ret = PTR_ERR(replacement);
+		replacement = NULL;
+		goto out;
+	}
+	revoked = false;
+	if (memchr_inv(proxy_vmshm_obj_kva(replacement), 0, capacity))
+		ret = -EINVAL;
+out:
+	if (!revoked)
+		proxy_vmshm_free(replacement);
+	if (pinned)
+		proxy_vmshm_unpin(replacement);
+	for (index = 0; index < ARRAY_SIZE(sizes); index++)
+		proxy_vmshm_free(objects[index]);
+	if (!ret)
+		pr_info("proxy_manager_vmshm_test: GPU SG fragmentation PASS owner=%u segments=%u zero=1 revoke=1\n",
+			owner, segments);
+	return ret;
+}
+
+int proxy_vmshm_manager_selftest_permissions(u32 owner, size_t capacity)
 {
 	struct proxy_vmshm_alloc_params params;
 	struct proxy_vmshm_object *obj, *pinned;
@@ -218,6 +333,8 @@ out:
 	proxy_vmshm_free(obj);
 	if (!ret)
 		ret = proxy_vmshm_selftest_gpu_lifetime(owner);
+	if (!ret)
+		ret = proxy_vmshm_selftest_gpu_fragmentation(owner, capacity);
 	if (!ret)
 		pr_info("proxy_manager_vmshm_test: permissions PASS owner=%u\n", owner);
 	return ret;

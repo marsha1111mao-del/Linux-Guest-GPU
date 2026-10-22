@@ -154,6 +154,10 @@ struct panthor_proxy_rpc_stats {
 	u64 bad_rx;
 	u64 unknown_type;
 	u64 bad_len;
+	u64 response_calls;
+	u64 response_errors;
+	u64 response_ns;
+	u64 response_max_ns;
 	struct panthor_proxy_rpc_stat op[PANTHOR_PROXY_RPC_STATS_MAX];
 };
 
@@ -1097,7 +1101,7 @@ panthor_proxy_session_bo_create(struct panthor_proxy_session *session,
 	u64 payload_size;
 	struct proxy_vmshm_alloc_params payload_params = {
 		.type = PROXY_VMSHM_OBJ_GPU_BO,
-		.flags = PROXY_VMSHM_F_CONTIG,
+		.flags = PROXY_VMSHM_F_ALLOW_SG,
 		.perms = PROXY_VMSHM_PERM_CPU_READ |
 			 PROXY_VMSHM_PERM_CPU_WRITE |
 			 PROXY_VMSHM_PERM_MMAP |
@@ -1110,6 +1114,7 @@ panthor_proxy_session_bo_create(struct panthor_proxy_session *session,
 		.flags = req->flags,
 	};
 	struct panthor_proxy_bo *bo;
+	struct proxy_vmshm_span first;
 	u32 client_bo_handle;
 	int ret;
 
@@ -1143,6 +1148,10 @@ panthor_proxy_session_bo_create(struct panthor_proxy_session *session,
 		goto err_unlock;
 	}
 
+	ret = proxy_vmshm_obj_get_segment(bo->payload, 0, &first);
+	if (ret)
+		goto err_free_payload;
+
 	ret = panthor_vmshm_bo_create_from_payload(session->real_session, &args,
 						   bo->payload);
 	if (ret)
@@ -1157,7 +1166,7 @@ panthor_proxy_session_bo_create(struct panthor_proxy_session *session,
 	bo->client_bo_handle = client_bo_handle;
 	bo->proxy_bo_handle = args.handle;
 	bo->payload_handle = proxy_vmshm_obj_handle(bo->payload);
-	bo->payload_offset = proxy_vmshm_obj_offset(bo->payload);
+	bo->payload_offset = first.offset;
 	bo->payload_size = proxy_vmshm_obj_alloc_size(bo->payload);
 
 	rsp->client_bo_handle = client_bo_handle;
@@ -2259,18 +2268,34 @@ panthor_proxy_send_rsp(struct proxy_comm_vmshm_channel *channel,
 		.payload = payload,
 		.len = len,
 	};
+	bool stats_enabled = panthor_proxy_rpc_stats_is_enabled();
+	u64 start_ns = stats_enabled ? ktime_get_ns() : 0;
 	int ret, i;
 
 	for (i = 0; i < PANTHOR_PROXY_SEND_RETRIES; i++) {
 		ret = proxy_comm_vmshm_send_to_channel(channel, &tx);
 		if (ret != -EAGAIN)
-			return ret;
+			break;
 
 		usleep_range(PANTHOR_PROXY_SEND_WAIT_US,
 			     PANTHOR_PROXY_SEND_WAIT_US * 2);
 	}
 
-	return -ETIMEDOUT;
+	if (i == PANTHOR_PROXY_SEND_RETRIES)
+		ret = -ETIMEDOUT;
+	if (stats_enabled) {
+		u64 elapsed_ns = ktime_get_ns() - start_ns;
+		unsigned long flags;
+
+		spin_lock_irqsave(&panthor_proxy_rpc_stats_lock, flags);
+		panthor_proxy_rpc_stats_data.response_calls++;
+		panthor_proxy_rpc_stats_data.response_errors += !!ret;
+		panthor_proxy_rpc_stats_data.response_ns += elapsed_ns;
+		panthor_proxy_rpc_stats_data.response_max_ns = max(
+			panthor_proxy_rpc_stats_data.response_max_ns, elapsed_ns);
+		spin_unlock_irqrestore(&panthor_proxy_rpc_stats_lock, flags);
+	}
+	return ret;
 }
 
 static void
@@ -3547,6 +3572,11 @@ panthor_proxy_rpc_stats_dump_snapshot(const struct panthor_proxy_rpc_stats *stat
 
 	pr_info("panthor-proxy: [MZH][PANTHOR_PROXY_RPC_STATS_SUMMARY] bad_rx=%llu unknown_type=%llu bad_len=%llu\n",
 		stats->bad_rx, stats->unknown_type, stats->bad_len);
+	if (stats->response_calls)
+		pr_info("panthor-proxy: [MZH][PANTHOR_PROXY_RESPONSE_STATS] calls=%llu errors=%llu total_ns=%llu avg_ns=%llu max_ns=%llu\n",
+			stats->response_calls, stats->response_errors, stats->response_ns,
+			div64_u64(stats->response_ns, stats->response_calls),
+			stats->response_max_ns);
 
 	for (i = 0; i < ARRAY_SIZE(panthor_proxy_handlers) &&
 		    i < PANTHOR_PROXY_RPC_STATS_MAX; i++) {

@@ -4121,7 +4121,6 @@ static int panthor_client_mmap(struct file *filp, struct vm_area_struct *vma)
 	u64 offset = (u64)vma->vm_pgoff << PAGE_SHIFT;
 	u64 bo_offset = 0;
 	u64 map_size = vma->vm_end - vma->vm_start;
-	phys_addr_t gpa;
 	int ret;
 
 	if (!pcfile)
@@ -4159,23 +4158,21 @@ static int panthor_client_mmap(struct file *filp, struct vm_area_struct *vma)
 		goto out_put_bo;
 	}
 
-	gpa = client_vmshm_object_gpa(bo->payload_obj) + bo_offset;
 	vm_flags_set(vma, VM_IO | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP);
 	if (!panthor_client_bo_mmap_cached)
 		vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
 	vma->vm_private_data = bo;
 	vma->vm_ops = &panthor_client_bo_vm_ops;
 
-	ret = remap_pfn_range(vma, vma->vm_start, gpa >> PAGE_SHIFT,
-			      map_size, vma->vm_page_prot);
+	ret = client_vmshm_object_mmap(bo->payload_obj, vma, bo_offset);
 	if (ret) {
 		vma->vm_private_data = NULL;
 		goto out_put_bo;
 	}
 
-	pr_info("panthor-client: MMAP session=%llu client_bo=%u offset=0x%llx bo_offset=0x%llx size=0x%llx payload_gpa=%pa attr=%s\n",
+	pr_info("panthor-client: MMAP session=%llu client_bo=%u offset=0x%llx bo_offset=0x%llx size=0x%llx segments=%u attr=%s\n",
 		pcfile->session_id, bo->client_handle, offset, bo_offset,
-		map_size, &gpa,
+		map_size, bo->payload_desc.nr_segments,
 		panthor_client_bo_mmap_cached ? "WB" : "WC");
 	return 0;
 

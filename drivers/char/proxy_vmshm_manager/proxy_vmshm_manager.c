@@ -44,7 +44,7 @@
 #define PROXY_VMSHM_ZERO_INLINE_MAX	SZ_64K
 #define PROXY_VMSHM_MAX_ALIGN		SZ_2M
 #define PROXY_VMSHM_SLAB_MAX_SIZE	SZ_2K
-#define PROXY_VMSHM_SG_MAX_SEGS		256
+#define PROXY_VMSHM_SG_MAX_SEGS		VMSHM_MANAGER_MAX_SEGMENTS
 #define PROXY_VMSHM_MANAGER_SEND_RETRIES	1000
 #define PROXY_VMSHM_MANAGER_SEND_WAIT_US	1000
 #define PROXY_VMSHM_DEFAULT_OWNER_VMID		1
@@ -999,7 +999,7 @@ static int proxy_vmshm_extent_alloc_locked(struct proxy_vmshm_domain *domain,
 		i = next;
 	}
 	if (run < needed) {
-		pr_warn_ratelimited("proxy_manager_vmshm: BO fragmentation owner=%u request=%zu free=%lu largest=%lu total=%lu pages\n",
+		pr_debug("proxy_manager_vmshm: BO fragmentation owner=%u request=%zu free=%lu largest=%lu total=%lu pages\n",
 				    domain->owner_vmid, size, buddy->free_pages,
 				    largest, buddy->nr_pages);
 		return -ENOMEM;
@@ -1058,7 +1058,8 @@ static bool proxy_vmshm_params_allow_sg(const struct proxy_vmshm_alloc_params *p
 	if (params->align > PAGE_SIZE)
 		return false;
 
-	if (params->perms & PROXY_VMSHM_PERM_MMAP)
+	if ((params->perms & PROXY_VMSHM_PERM_MMAP) &&
+	    params->type != PROXY_VMSHM_OBJ_GPU_BO)
 		return false;
 
 	return true;
@@ -1079,9 +1080,15 @@ static int proxy_vmshm_alloc_backing_locked(struct proxy_vmshm_manager *mgr,
 	if (ret != -ENOENT)
 		return ret;
 
-	if (params->type == PROXY_VMSHM_OBJ_GPU_BO)
-		return proxy_vmshm_extent_alloc_locked(domain, params->size,
-						      params->align, backing);
+	if (params->type == PROXY_VMSHM_OBJ_GPU_BO) {
+		ret = proxy_vmshm_extent_alloc_locked(domain, params->size,
+						     params->align, backing);
+		if (ret != -ENOMEM || !proxy_vmshm_params_allow_sg(params))
+			return ret;
+		return proxy_vmshm_sg_alloc_backing_locked(mgr, domain,
+							 params->size, params->align,
+							 backing, gfp);
+	}
 
 	buddy_ret = proxy_vmshm_buddy_alloc_backing_locked(domain, params->size,
 							   params->align,
@@ -1493,7 +1500,7 @@ int proxy_vmshm_manager_register_domain(u32 owner_vmid, void *base,
 
 	mutex_unlock(&mgr->lock);
 	mutex_unlock(&proxy_vmshm_init_lock);
-	ret = proxy_vmshm_manager_selftest_permissions(owner_vmid);
+	ret = proxy_vmshm_manager_selftest_permissions(owner_vmid, buddy_size);
 	if (ret)
 		WARN_ON(proxy_vmshm_manager_unregister_domain(owner_vmid, base));
 	return ret;
@@ -1813,16 +1820,6 @@ void *proxy_vmshm_obj_kva(struct proxy_vmshm_object *obj)
 	return obj ? obj->kva : NULL;
 }
 EXPORT_SYMBOL_GPL(proxy_vmshm_obj_kva);
-
-static phys_addr_t proxy_vmshm_obj_gpa(struct proxy_vmshm_object *obj)
-{
-	if (obj && obj->backing_kind == PROXY_VMSHM_BACKING_SG) {
-		WARN_ON_ONCE(1);
-		return 0;
-	}
-
-	return obj ? obj->gpa : 0;
-}
 
 u64 proxy_vmshm_obj_offset(struct proxy_vmshm_object *obj)
 {
@@ -2220,20 +2217,25 @@ static int
 proxy_vmshm_manager_fill_desc(struct proxy_vmshm_object *obj,
 			      struct vmshm_manager_desc *desc)
 {
-	if (!proxy_vmshm_obj_is_contiguous(obj))
-		return -EOPNOTSUPP;
+	struct proxy_vmshm_span first;
+	int ret;
+
+	ret = proxy_vmshm_obj_get_segment(obj, 0, &first);
+	if (ret)
+		return ret;
 
 	desc->handle = proxy_vmshm_obj_handle(obj);
 	desc->id = proxy_vmshm_obj_id(obj);
 	desc->generation = proxy_vmshm_obj_generation(obj);
 	desc->type = proxy_vmshm_obj_type(obj);
 	desc->perms = proxy_vmshm_obj_perms(obj);
-	desc->offset = proxy_vmshm_obj_offset(obj);
+	desc->offset = first.offset;
 	desc->size = proxy_vmshm_obj_size(obj);
 	desc->alloc_size = proxy_vmshm_obj_alloc_size(obj);
-	desc->gpa = proxy_vmshm_obj_gpa(obj);
-	desc->flags = VMSHM_MANAGER_DESC_F_CONTIG;
-	desc->nr_segments = 1;
+	desc->gpa = first.gpa;
+	desc->flags = proxy_vmshm_obj_is_contiguous(obj) ?
+		VMSHM_MANAGER_DESC_F_CONTIG : 0;
+	desc->nr_segments = proxy_vmshm_obj_nr_segments(obj);
 	return 0;
 }
 
@@ -2243,6 +2245,7 @@ proxy_vmshm_manager_handle_object_req(
 	struct vmshm_manager_get_object_rsp *rsp)
 {
 	struct proxy_vmshm_object *obj = NULL;
+	struct proxy_vmshm_span segment;
 	int ret;
 
 	switch (req->lookup) {
@@ -2264,6 +2267,12 @@ proxy_vmshm_manager_handle_object_req(
 		return ret;
 
 	ret = proxy_vmshm_manager_fill_desc(obj, &rsp->desc);
+	if (!ret)
+		ret = proxy_vmshm_obj_get_segment(obj, req->segment_index, &segment);
+	if (!ret) {
+		rsp->segment.offset = segment.offset;
+		rsp->segment.size = segment.size;
+	}
 	proxy_vmshm_unpin(obj);
 	return ret;
 }
