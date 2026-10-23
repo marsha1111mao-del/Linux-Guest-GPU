@@ -31,6 +31,7 @@
 #include <linux/vmshm_comm.h>
 #include <linux/workqueue.h>
 #include <linux/panthor_vmshm.h>
+#include <linux/realm_xshm.h>
 #include <linux/xarray.h>
 
 #include <drm/drm_drv.h>
@@ -90,6 +91,9 @@ struct panthor_client_completion_page {
 	u32 retire_count;
 	bool retire_enabled;
 	bool retire_closing;
+	bool timing_enabled;
+	spinlock_t observation_lock;
+	u64 observed_cookies[PANTHOR_VMSHM_COMPLETION_SLOTS];
 };
 
 struct panthor_client_syncobj {
@@ -215,6 +219,15 @@ module_param_named(fused_snapshot, panthor_client_fused_snapshot, bool, 0444);
 MODULE_PARM_DESC(fused_snapshot,
 		 "Use negotiated single-RPC sync-file snapshot creation (experimental)");
 static bool panthor_client_transfer_capture;
+static bool panthor_client_completion_trace;
+module_param_named(completion_trace, panthor_client_completion_trace, bool, 0444);
+MODULE_PARM_DESC(completion_trace, "Record the first physical-counter observation of each completion cookie");
+static atomic64_t completion_first_seen = ATOMIC64_INIT(0);
+static atomic64_t completion_unsampled = ATOMIC64_INIT(0);
+static atomic64_t completion_samples = ATOMIC64_INIT(0);
+static atomic64_t completion_metadata_errors = ATOMIC64_INIT(0);
+static atomic64_t completion_rpc_successes = ATOMIC64_INIT(0);
+static atomic64_t completion_rpc_without_proof = ATOMIC64_INIT(0);
 module_param_named(transfer_capture, panthor_client_transfer_capture, bool, 0444);
 MODULE_PARM_DESC(transfer_capture, "Capture reusable sync-file snapshots during binary transfers");
 static atomic64_t panthor_client_capture_calls = ATOMIC64_INIT(0);
@@ -348,6 +361,11 @@ static int panthor_client_sync_file_stats_get(char *buffer,
 			 atomic64_read(&panthor_client_point_checks),
 			 atomic64_read(&panthor_client_point_hits),
 			 atomic64_read(&panthor_client_point_prefix_hits));
+	len += scnprintf(buffer + len, PAGE_SIZE - len,
+			 "first_seen=%lld unsampled=%lld completion_samples=%lld metadata_errors=%lld rpc_successes=%lld rpc_without_proof=%lld\n",
+			 atomic64_read(&completion_first_seen), atomic64_read(&completion_unsampled),
+			 atomic64_read(&completion_samples), atomic64_read(&completion_metadata_errors),
+			 atomic64_read(&completion_rpc_successes), atomic64_read(&completion_rpc_without_proof));
 	return len;
 }
 
@@ -629,13 +647,63 @@ static void panthor_client_completion_page_put(struct panthor_client_completion_
 /* Only an acquire-read matching the private expected cookie proves success.
  * The peer publishes that cookie after the exact native snapshot completes.
  */
-static bool panthor_client_snapshot_completed(struct panthor_client_syncobj *snapshot)
+static bool panthor_client_cookie_completed(struct panthor_client_completion_page *page,
+					    u32 slot, u64 cookie, u32 path)
+{
+	const struct panthor_vmshm_completion_slot *record;
+	u64 ticks[5];
+	unsigned long flags;
+	u32 kind;
+
+	if (!page || !cookie || slot >= PANTHOR_VMSHM_COMPLETION_SLOTS)
+		return false;
+	record = &page->kva->slots[slot];
+	if (!page->timing_enabled)
+		return smp_load_acquire(&record->cookie) == cookie;
+	spin_lock_irqsave(&page->observation_lock, flags);
+	if (smp_load_acquire(&record->cookie) != cookie)
+		goto not_completed;
+	if (page->observed_cookies[slot] >= cookie) {
+		spin_unlock_irqrestore(&page->observation_lock, flags);
+		return true;
+	}
+	ticks[2] = realm_xshm_counter();
+	ticks[0] = READ_ONCE(record->completed_counter);
+	ticks[1] = READ_ONCE(record->published_counter);
+	kind = READ_ONCE(record->observation_kind);
+	ticks[4] = READ_ONCE(record->counter_frequency);
+	smp_rmb();
+	ticks[3] = realm_xshm_counter();
+	if (smp_load_acquire(&record->cookie) != cookie)
+		goto not_completed;
+	page->observed_cookies[slot] = cookie;
+	spin_unlock_irqrestore(&page->observation_lock, flags);
+	atomic64_inc(&completion_first_seen);
+	if (!kind) {
+		atomic64_inc(&completion_unsampled);
+		return true;
+	}
+	if ((kind != 1 && kind != 2) || !ticks[0] || ticks[1] < ticks[0] ||
+	    ticks[2] < ticks[1] || !ticks[4]) {
+		atomic64_inc(&completion_metadata_errors);
+		return true;
+	}
+	atomic64_inc(&completion_samples);
+	realm_xshm_trace_completion(page->session_id, cookie, path, kind, ticks);
+	return true;
+not_completed:
+	spin_unlock_irqrestore(&page->observation_lock, flags);
+	return false;
+}
+
+static bool panthor_client_snapshot_completed(struct panthor_client_syncobj *snapshot,
+					       u32 path)
 {
 	if (!snapshot || !snapshot->completion_page || !snapshot->completion_cookie ||
 	    snapshot->completion_slot >= PANTHOR_VMSHM_COMPLETION_SLOTS)
 		return false;
-	return smp_load_acquire(&snapshot->completion_page->kva->slots[
-			snapshot->completion_slot].cookie) == snapshot->completion_cookie;
+	return panthor_client_cookie_completed(snapshot->completion_page,
+		snapshot->completion_slot, snapshot->completion_cookie, path);
 }
 
 static void
@@ -863,7 +931,10 @@ static void panthor_client_completion_page_init(struct panthor_client_file *pcfi
 	}
 	refcount_set(&page->refs, 1);
 	spin_lock_init(&page->retire_lock);
+	spin_lock_init(&page->observation_lock);
 	page->session_id = pcfile->session_id;
+	page->timing_enabled = panthor_client_completion_trace && realm_xshm_trace_enabled() &&
+		(pcfile->feature_bits & PANTHOR_VMSHM_FEATURE_COMPLETION_TIMING);
 	page->retire_enabled = panthor_client_fused_snapshot &&
 		(pcfile->feature_bits & PANTHOR_VMSHM_FEATURE_SNAPSHOT_RETIRE);
 	pcfile->completion_page = page;
@@ -1525,7 +1596,7 @@ static bool panthor_client_completion_wait(struct panthor_client_syncobj **snaps
 		u32 ready = 0, first = 0;
 
 		for (i = 0; i < args->count_handles; i++) {
-			if (panthor_client_snapshot_completed(snapshots[i])) {
+			if (panthor_client_snapshot_completed(snapshots[i], 3)) {
 				if (!ready)
 					first = i;
 				ready++;
@@ -1622,6 +1693,17 @@ static int panthor_client_syncobj_wait(struct panthor_client_file *pcfile,
 	}
 
 	args->first_signaled = rsp.first_signaled;
+	if (panthor_client_completion_trace) {
+		bool all = args->flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL;
+
+		for (i = 0; i < args->count_handles; i++) {
+			if (!all && i != rsp.first_signaled)
+				continue;
+			atomic64_inc(&completion_rpc_successes);
+			if (!panthor_client_snapshot_completed(snapshots[i], 6))
+				atomic64_inc(&completion_rpc_without_proof);
+		}
+	}
 	pr_debug("panthor-client: SYNCOBJ_WAIT session=%llu count=%u flags=0x%x first=%u\n",
 			    pcfile->session_id, args->count_handles,
 			    args->flags, rsp.first_signaled);
@@ -1733,13 +1815,19 @@ static void panthor_client_sync_fence_work(struct work_struct *work)
 		 */
 		req.timeout_rel_nsec = 0;
 		segments++;
-		if (panthor_client_snapshot_completed(sync_fence->snapshot)) {
+		if (panthor_client_snapshot_completed(sync_fence->snapshot, 1)) {
 			ret = 0;
 			break;
 		}
 		ret = panthor_client_rpc_syncobj_wait(&req, &rsp);
-		if (!ret && !rsp.ret)
+		if (!ret && !rsp.ret) {
+			if (panthor_client_completion_trace) {
+				atomic64_inc(&completion_rpc_successes);
+				if (!panthor_client_snapshot_completed(sync_fence->snapshot, 4))
+					atomic64_inc(&completion_rpc_without_proof);
+			}
 			break;
+		}
 
 		/*
 		 * An unsignaled snapshot returns -ETIME. Transport timeouts
@@ -2335,8 +2423,8 @@ panthor_client_syncobj_timeline_wait(
 		    syncobj->proof_epoch == pcfile->proof_epoch &&
 		    syncobj->proof_point >= points[0]) {
 			atomic64_inc(&panthor_client_point_checks);
-			if (smp_load_acquire(&pcfile->completion_page->kva->slots[
-					syncobj->proof_slot].cookie) == syncobj->proof_cookie) {
+			if (panthor_client_cookie_completed(pcfile->completion_page,
+					syncobj->proof_slot, syncobj->proof_cookie, 2)) {
 				args->first_signaled = 0;
 				atomic64_inc(&panthor_client_point_hits);
 				if (points[0] < syncobj->proof_point)
@@ -2390,6 +2478,25 @@ panthor_client_syncobj_timeline_wait(
 	if (rsp.ret) {
 		ret = rsp.ret;
 		goto out_put_syncobjs;
+	}
+
+	if (panthor_client_completion_trace) {
+		bool proved = false;
+
+		atomic64_inc(&completion_rpc_successes);
+		if (args->count_handles == 1 && !rsp.first_signaled && points[0]) {
+			struct panthor_client_syncobj *syncobj = syncobjs[0];
+
+			mutex_lock(&pcfile->lock);
+			if (!pcfile->sync_mutations && !pcfile->sync_epoch_wrapped &&
+			    syncobj->proof_epoch == pcfile->proof_epoch &&
+			    syncobj->proof_point >= points[0])
+				proved = panthor_client_cookie_completed(pcfile->completion_page,
+					syncobj->proof_slot, syncobj->proof_cookie, 5);
+			mutex_unlock(&pcfile->lock);
+		}
+		if (!proved)
+			atomic64_inc(&completion_rpc_without_proof);
 	}
 
 	/* A concurrent mutation, even one that failed, invalidates this proof. */

@@ -29,11 +29,15 @@ bool realm_xshm_trace_enabled(void);
 u64 realm_xshm_counter(void);
 void realm_xshm_trace_receive(u64 channel, u64 sequence, u32 type,
 			      u64 irq, u64 work);
+void realm_xshm_trace_completion(u64 session, u64 cookie, u32 path, u32 kind,
+				const u64 ticks[5]);
 #else
 static inline bool realm_xshm_trace_enabled(void) { return false; }
 static inline u64 realm_xshm_counter(void) { return 0; }
 static inline void realm_xshm_trace_receive(u64 channel, u64 sequence, u32 type,
 					  u64 irq, u64 work) { }
+static inline void realm_xshm_trace_completion(u64 session, u64 cookie, u32 path,
+					     u32 kind, const u64 ticks[5]) { }
 #endif
 
 #endif

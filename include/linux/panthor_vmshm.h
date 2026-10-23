@@ -86,13 +86,18 @@
 #define PANTHOR_VMSHM_FEATURE_TRANSFER_CAPTURE (1ULL << 8)
 #define PANTHOR_VMSHM_MSG_TRANSFER_CAPTURE_REQ 0x50547952U
 #define PANTHOR_VMSHM_MSG_TRANSFER_CAPTURE_RSP 0x50547953U
+#define PANTHOR_VMSHM_FEATURE_COMPLETION_TIMING (1ULL << 9)
 
 /* Each slot publishes one non-reused cookie, never a completion watermark.
  * Zero means no proof. Slot reuse first drains the previous native callback.
  */
 struct panthor_vmshm_completion_slot {
 	__u64 cookie;
-	__u8 reserved[56];
+	__u64 completed_counter;
+	__u64 published_counter;
+	__u64 counter_frequency;
+	__u32 observation_kind;
+	__u8 reserved[28];
 };
 struct panthor_vmshm_completion_page {
 	struct panthor_vmshm_completion_slot slots[PANTHOR_VMSHM_COMPLETION_SLOTS];

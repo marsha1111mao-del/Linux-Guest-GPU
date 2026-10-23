@@ -37,7 +37,8 @@ static bool notify_trace;
 module_param(notify_trace, bool, 0444);
 MODULE_PARM_DESC(notify_trace, "Record bounded physical-counter notification and receive timings");
 static bool notify_timing_supported;
-#define REALM_XSHM_TRACE_MAX 32768U
+static u64 trace_period_ticks, trace_window_ticks;
+#define REALM_XSHM_TRACE_MAX 65536U
 struct realm_xshm_trace_record {
 	u64 channel, sequence;
 	u64 ticks[5];
@@ -62,6 +63,11 @@ u64 realm_xshm_counter(void)
 }
 EXPORT_SYMBOL_GPL(realm_xshm_counter);
 
+static bool realm_xshm_trace_sample(u64 tick)
+{
+	return tick % trace_period_ticks < trace_window_ticks;
+}
+
 static void realm_xshm_trace_record(const struct realm_xshm_trace_record *record)
 {
 	unsigned long flags;
@@ -81,10 +87,25 @@ void realm_xshm_trace_receive(u64 channel, u64 sequence, u32 type, u64 irq, u64 
 		.ticks = { irq, work, realm_xshm_counter() },
 	};
 
-	if (realm_xshm_trace_enabled())
+	if (realm_xshm_trace_enabled() && realm_xshm_trace_sample(record.ticks[2]))
 		realm_xshm_trace_record(&record);
 }
 EXPORT_SYMBOL_GPL(realm_xshm_trace_receive);
+
+void realm_xshm_trace_completion(u64 session, u64 cookie, u32 path, u32 kind,
+				const u64 ticks[5])
+{
+	struct realm_xshm_trace_record record = {
+		.kind = 3, .channel = session, .sequence = cookie,
+		.type = path, .flags = kind,
+	};
+
+	if (!realm_xshm_trace_enabled())
+		return;
+	memcpy(record.ticks, ticks, sizeof(record.ticks));
+	realm_xshm_trace_record(&record);
+}
+EXPORT_SYMBOL_GPL(realm_xshm_trace_completion);
 
 static int realm_xshm_trace_show(struct seq_file *stream, void *data)
 {
@@ -97,8 +118,9 @@ static int realm_xshm_trace_show(struct seq_file *stream, void *data)
 	count = trace_count;
 	dropped = trace_dropped;
 	spin_unlock_irqrestore(&trace_lock, flags);
-	seq_printf(stream, "XSHM_TRACE clock=cntpct freq=%llu supported=%u count=%u dropped=%llu\n",
-		   read_sysreg(cntfrq_el0), notify_timing_supported, count, dropped);
+	seq_printf(stream, "XSHM_TRACE clock=cntpct freq=%llu supported=%u count=%u dropped=%llu period=%llu window=%llu\n",
+		   read_sysreg(cntfrq_el0), notify_timing_supported, count, dropped,
+		   trace_period_ticks, trace_window_ticks);
 	seq_puts(stream, "kind channel sequence type flags status tick0 tick1 tick2 tick3 tick4\n");
 	for (index = 0; index < count; index++) {
 		spin_lock_irqsave(&trace_lock, flags);
@@ -209,8 +231,10 @@ static void realm_xshm_notify(u64 channel, u32 type, u64 sequence)
 	/* Queue publication precedes this coalesced event. A failed hint must
 	 * never cause replay of a published request.
 	 */
-	if (trace)
+	if (trace) {
 		record.ticks[0] = realm_xshm_counter();
+		trace = realm_xshm_trace_sample(record.ticks[0]);
+	}
 	xshm_call(trace && notify_timing_supported ? REALM_XSHM_NOTIFY_TIMED :
 		  REALM_XSHM_NOTIFY, channel, &output);
 	if (trace) {
@@ -751,6 +775,10 @@ static int __init realm_xshm_init(void)
 	if (ret)
 		return ret;
 	if (notify_trace) {
+		trace_period_ticks = read_sysreg(cntfrq_el0) / 10;
+		trace_window_ticks = read_sysreg(cntfrq_el0) / 500;
+		if (!trace_window_ticks)
+			return -EINVAL;
 		trace_records = vzalloc(array_size(REALM_XSHM_TRACE_MAX, sizeof(*trace_records)));
 		if (!trace_records)
 			return -ENOMEM;
